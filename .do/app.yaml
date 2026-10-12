@@ -6,7 +6,7 @@ region: nyc
 services:
   - name: web
     github:
-      repo: YOUR_GITHUB_ORG/do-anatomy-demo
+      repo: a4sr3s/do-anatomy-demo
       branch: main
       deploy_on_push: true
     environment_slug: node-js
@@ -23,9 +23,10 @@ services:
         value: production
       - key: PORT
         value: "8080"
-      # mock needs no credentials. Switch to "real" and fill the secrets below.
+      # mock needs no credentials. "real" needs the SECRET values below; with
+      # REPLAY_FALLBACK=true a failing real stage replays a recording instead.
       - key: PIPELINE_MODE
-        value: mock
+        value: real
       - key: REPLAY_FALLBACK
         value: "true"
       - key: MOCK_DELAY_SCALE
@@ -40,12 +41,13 @@ services:
       - key: DO_SPACES_REGION
         value: nyc3
       - key: DO_SPACES_BUCKET
-        value: anatomy-demo
+        value: alexis-anatomy-demo
       - key: DATABASE_URL
         value: ""
         type: SECRET
       - key: DO_INFERENCE_URL
         value: https://inference.do-ai.run/v1
+      # Model Access Key (control panel only). Optional when DO_AGENT_ENDPOINT is set.
       - key: DO_INFERENCE_KEY
         value: ""
         type: SECRET
@@ -55,8 +57,12 @@ services:
         value: ""
       - key: VECTOR_DIM
         value: "128"
+      # Managed Agent: when set, questions are answered through the agent
+      # (pgvector retrieval still runs first). Kept SECRET so the endpoint
+      # hostname does not leak through the spec or deploy logs.
       - key: DO_AGENT_ENDPOINT
         value: ""
+        type: SECRET
       - key: DO_AGENT_KEY
         value: ""
         type: SECRET

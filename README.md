@@ -49,16 +49,32 @@ No credentials. Each stage is simulated with realistic timing (`MOCK_DELAY_SCALE
 
 ### `real`
 
-Stub wired for DigitalOcean. Dependencies are imported lazily, so mock mode never loads them.
+Wired for DigitalOcean. Dependencies are imported lazily, so mock mode never loads them.
 
 | Stage | Service | Implementation |
 | --- | --- | --- |
 | Spaces | `@aws-sdk/client-s3` | `PutObject` of the fact as `facts/<ts>-<id>.txt` |
 | Functions | `DO_FUNCTION_URL` (optional) | POST `{key, text}` expecting `{chunks, embeddings}`; if unset the server chunks and embeds in-process |
 | Vector DB | `pg` + pgvector | `CREATE EXTENSION vector`, table auto-created, `INSERT ... ::vector`, `ORDER BY embedding <=> $1` |
-| Knowledge Base / Agent | GenAI Platform (`DO_AGENT_ENDPOINT`, optional) | If set, questions go to the Managed Agent's chat completions endpoint and its retrieval info is shown as sources; otherwise in-process RAG over pgvector |
-| Inference | Serverless Inference (`DO_INFERENCE_URL`) | OpenAI-compatible `/chat/completions` with `stream: true`; tokens are forwarded as `progress` events |
-| Embeddings | `DO_EMBEDDING_MODEL` (optional) | OpenAI-compatible `/embeddings`; leave empty to use the local embedder (`VECTOR_DIM=128`) |
+| Knowledge Base | pgvector, always | Every question is embedded and searched (cosine, top 3) against our own table first, so a fact you just submitted is answerable instantly. If a Managed Agent answers and its own Knowledge Base returns chunks, those are merged in as extra sources |
+| Agent | GenAI Platform Managed Agent (`DO_AGENT_ENDPOINT` + `DO_AGENT_KEY`) | Preferred when set: POST `<endpoint>/api/v1/chat/completions` with `stream: true`, `include_retrieval_info: true`, the grounding guidance, retrieved context and question folded into one user message. `reasoning_content` deltas are ignored, only `content` is streamed |
+| Inference | Serverless Inference (`DO_INFERENCE_URL` + `DO_INFERENCE_KEY`) | Used directly when no agent endpoint is set: OpenAI-compatible `/chat/completions` with `stream: true`. In both paths tokens are forwarded as `inference` `progress` events `{token, index}` |
+| Embeddings | `DO_EMBEDDING_MODEL` (optional, needs `DO_INFERENCE_KEY`) | OpenAI-compatible `/embeddings`; leave empty to use the local embedder (`VECTOR_DIM=128`), which needs no key at all |
+
+How a question is answered, in order:
+
+1. Retrieve from pgvector (stages `kb` → `vectordb` → `kb`).
+2. If `DO_AGENT_ENDPOINT` is set: stage `agent` "Managed Agent (KB + model) answering", stage `inference` "Serverless inference via agent", tokens stream.
+3. Else if `DO_INFERENCE_KEY` is set: existing direct Serverless Inference path.
+4. Else the query fails with a clear error; with `REPLAY_FALLBACK=true` the server replays the last good query recording instead.
+
+`GET /api/health` reports which one is active as `pipeline.inferenceVia`: `"agent"`, `"serverless"` or `null`.
+
+Getting the credentials:
+
+- **Model Access Keys** (`DO_INFERENCE_KEY`) can only be created in the control panel under *GenAI Platform → Model access keys*; `doctl` and the API cannot mint them. If your account has none, skip it and use an agent.
+- **Managed Agent**: create an agent in *GenAI Platform*, copy its endpoint URL (`https://<id>.agents.do-ai.run`) into `DO_AGENT_ENDPOINT` and create an endpoint access key for `DO_AGENT_KEY`. Optionally give the agent a **Knowledge Base that indexes the Spaces bucket's `facts/` prefix** (data source: Spaces, bucket `alexis-anatomy-demo`, path `facts/`), then re-index after a demo run. KB indexing is periodic, which is exactly why pgvector retrieval always runs first.
+- **Spaces** key pair and a Managed Postgres `DATABASE_URL` (pgvector is enabled automatically on first use).
 
 ### Replay
 
@@ -105,7 +121,7 @@ doctl apps create --spec .do/app.yaml
 doctl apps update <APP_ID> --spec .do/app.yaml
 ```
 
-Mock mode works with zero secrets. For real mode set `PIPELINE_MODE=real` and fill the `SECRET` env vars (Spaces key pair, `DATABASE_URL` of a Managed Postgres with pgvector, `DO_INFERENCE_KEY`). You can also attach a Managed Postgres component in the spec and bind `DATABASE_URL` to `${db.DATABASE_URL}`.
+The committed spec targets `a4sr3s/do-anatomy-demo`, runs `PIPELINE_MODE=real` with `REPLAY_FALLBACK=true`, Spaces bucket `alexis-anatomy-demo` in `nyc3`, and leaves every `SECRET` value empty. Fill the secrets in the control panel (or with `doctl apps update`): the Spaces key pair, `DATABASE_URL` of a Managed Postgres with pgvector, and either `DO_AGENT_ENDPOINT` + `DO_AGENT_KEY` (agent path) or `DO_INFERENCE_KEY` (a Model Access Key, control panel only). `DO_AGENT_ENDPOINT` is stored as a secret too. If a real stage fails the server falls back to replaying a recording, so the stage demo never goes dark. You can also attach a Managed Postgres component in the spec and bind `DATABASE_URL` to `${db.DATABASE_URL}`.
 
 Note: App Platform's filesystem is ephemeral, so recordings made in production live until the next deploy. Commit any recording you want to keep (the bundled `sample-*.json` files are committed; `auto-*.json` snapshots are git-ignored).
 

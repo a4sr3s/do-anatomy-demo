@@ -45,8 +45,16 @@ export class RealPipeline {
       database: Boolean(this.cfg.databaseUrl),
       inference: Boolean(this.cfg.inference.key),
       agent: Boolean(this.cfg.agent.endpoint),
+      inferenceVia: this.inferenceVia(),
       embedding: this.cfg.inference.embeddingModel || 'local-hash',
     };
+  }
+
+  /** Which service answers questions: a Managed Agent, direct Serverless Inference, or nothing configured. */
+  inferenceVia() {
+    if (this.cfg.agent.endpoint) return 'agent';
+    if (this.cfg.inference.key) return 'serverless';
+    return null;
   }
 
   // ---- lazy clients -------------------------------------------------------
@@ -140,56 +148,72 @@ export class RealPipeline {
   }
 
   // ---- query --------------------------------------------------------------
+  /**
+   * Answer a question. Retrieval always runs against pgvector first so a fact
+   * submitted seconds ago is answerable immediately, even when a Managed Agent
+   * (with its own, periodically indexed Knowledge Base) produces the answer.
+   * Generation goes through DO_AGENT_ENDPOINT when set, otherwise directly to
+   * Serverless Inference with DO_INFERENCE_KEY.
+   */
   async ask(question) {
     const jobId = randomUUID();
     const ev = this.bus.forJob(jobId, 'query');
     ev.job('start', { input: question });
     try {
-      let sources = [];
-      let answer;
-      if (this.cfg.agent.endpoint) {
-        ev.stage('kb', 'start', 'Managed Agent queries its Knowledge Base', { question });
-        ev.stage('agent', 'start', 'Calling GenAI Platform agent', {});
-        const res = await fetch(`${this.cfg.agent.endpoint}/api/v1/chat/completions`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', authorization: `Bearer ${this.cfg.agent.key}` },
-          body: JSON.stringify({ messages: [{ role: 'user', content: question }], include_retrieval_info: true }),
-        });
-        if (!res.ok) throw new Error(`Agent returned ${res.status}`);
-        const json = await res.json();
-        const retrieved = json.retrieval?.retrieved_data || [];
-        ev.stage('kb', 'done', `${retrieved.length} chunks retrieved by agent KB`, { hits: retrieved.length });
-        sources = retrieved.map((r, i) => ({ id: r.id || i, chunk: r.text || r.content || '', score: r.score ?? null }));
-        ev.stage('agent', 'done', 'Agent responded', {});
-        ev.stage('inference', 'start', 'Inference (via agent)', { model: json.model });
-        answer = json.choices?.[0]?.message?.content || '';
-        ev.stage('inference', 'done', 'Completed', {});
-      } else {
-        ev.stage('kb', 'start', 'Knowledge Base received query', { question });
-        const [qvec] = await this.embed([question]);
-        ev.stage('kb', 'progress', 'Query embedded', { step: 'embed' });
-        ev.stage('vectordb', 'start', 'pgvector cosine search, top 3', { op: 'search' });
-        const pool = await this.db();
-        const r = await pool.query(
-          `SELECT id, chunk, 1 - (embedding <=> $1::vector) AS score FROM ${this.cfg.table} ORDER BY embedding <=> $1::vector LIMIT 3`,
-          [this.toVector(qvec)]
-        );
-        sources = r.rows.filter((x) => x.score > 0.08).map((x) => ({ id: x.id, chunk: x.chunk, score: Number(Number(x.score).toFixed(3)) }));
-        ev.stage('vectordb', 'done', `${sources.length} relevant chunks retrieved`, { count: this.count, hits: sources.map((s) => ({ id: s.id, score: s.score })), op: 'search' });
-        ev.stage('kb', 'done', `Context assembled from ${sources.length} chunks`, { hits: sources.length });
+      const via = this.inferenceVia();
+      if (!via) throw new Error('DO_INFERENCE_KEY missing and no DO_AGENT_ENDPOINT configured: set a Managed Agent endpoint + key, or a Model Access Key');
+      if (via === 'agent' && !this.cfg.agent.key) throw new Error('DO_AGENT_KEY missing (required with DO_AGENT_ENDPOINT)');
 
-        ev.stage('agent', 'start', 'Composing grounded prompt', { contextChunks: sources.length });
-        const context = sources.map((s, i) => `[${i + 1}] ${s.chunk}`).join('\n');
+      // 1. retrieval over our own vector store, always
+      const sources = await this.retrieve(question, ev);
+      const context = sources.map((s, i) => `[${i + 1}] ${s.chunk}`).join('\n');
+      const guidance = 'Answer using only the provided context. If the context is empty or does not cover the question, say you do not know yet. Be concise.';
+      const onToken = (token, index) => ev.stage('inference', 'progress', '', { token, index });
+      let answer;
+
+      if (via === 'agent') {
+        // 2. Managed Agent: it owns a Knowledge Base and calls the model for us.
+        const { endpoint, key } = this.cfg.agent;
+        ev.stage('agent', 'start', 'Managed Agent (KB + model) answering', { contextChunks: sources.length, via });
+        // Agent endpoints apply their own system instructions, so the grounding guidance travels inside the user turn.
+        const messages = [{ role: 'user', content: `${guidance}\n\nContext:\n${context || '(none)'}\n\nQuestion: ${question}` }];
+        ev.stage('inference', 'start', 'Serverless inference via agent', { via });
+        const agentSources = [];
+        const onRetrieval = (retrieved) => {
+          const extra = retrieved
+            .map((r, i) => ({ id: r.id ?? `kb-${agentSources.length + i + 1}`, chunk: r.text || r.content || r.chunk || '', score: r.score ?? null, origin: 'agent-kb' }))
+            .filter((r) => r.chunk);
+          if (!extra.length) return;
+          agentSources.push(...extra);
+          ev.stage('kb', 'progress', `Agent Knowledge Base returned ${agentSources.length} chunk${agentSources.length === 1 ? '' : 's'}`, { step: 'agent-kb', hits: agentSources.length });
+        };
+        const out = await this.streamChat(messages, onToken, {
+          url: `${endpoint}/api/v1`,
+          key,
+          model: null,
+          body: { include_retrieval_info: true },
+          onRetrieval,
+        });
+        answer = out.text;
+        // merge agent KB hits after our own pgvector hits, skipping duplicate text
+        const seen = new Set(sources.map((s) => s.chunk.trim()));
+        for (const s of agentSources) if (!seen.has(s.chunk.trim())) { seen.add(s.chunk.trim()); sources.push(s); }
+        ev.stage('inference', 'done', 'Completed', { model: out.model || undefined, tokens: out.tokens, via });
+        ev.stage('agent', 'done', `Agent responded with ${agentSources.length} KB chunk${agentSources.length === 1 ? '' : 's'}`, { kbHits: agentSources.length });
+      } else {
+        // 3. direct Serverless Inference with a Model Access Key
+        ev.stage('agent', 'start', 'Composing grounded prompt', { contextChunks: sources.length, via });
         const messages = [
-          { role: 'system', content: 'Answer using only the provided context. If the context is empty, say you do not know yet.' },
+          { role: 'system', content: guidance },
           { role: 'user', content: `Context:\n${context || '(none)'}\n\nQuestion: ${question}` },
         ];
         ev.stage('agent', 'done', 'Prompt ready; calling serverless inference', {});
-
-        ev.stage('inference', 'start', `Serverless inference: ${this.cfg.inference.model}`, { model: this.cfg.inference.model });
-        answer = await this.streamChat(messages, (token, i) => ev.stage('inference', 'progress', '', { token, index: i }));
-        ev.stage('inference', 'done', 'Completed', {});
+        ev.stage('inference', 'start', `Serverless inference: ${this.cfg.inference.model}`, { model: this.cfg.inference.model, via });
+        const out = await this.streamChat(messages, onToken);
+        answer = out.text;
+        ev.stage('inference', 'done', 'Completed', { model: out.model || this.cfg.inference.model, tokens: out.tokens, via });
       }
+
       ev.answer(answer, sources);
       ev.job('done', { answer, sources });
       return { jobId, answer, sources };
@@ -199,41 +223,79 @@ export class RealPipeline {
     }
   }
 
-  /** OpenAI-compatible streaming chat completion. */
-  async streamChat(messages, onToken) {
-    const { url, key, model } = this.cfg.inference;
-    if (!key) throw new Error('DO_INFERENCE_KEY missing');
+  /** Embed the question and run a cosine top-3 search in pgvector, emitting kb/vectordb stage events. */
+  async retrieve(question, ev) {
+    ev.stage('kb', 'start', 'Knowledge Base received query', { question });
+    const [qvec] = await this.embed([question]);
+    ev.stage('kb', 'progress', 'Query embedded', { step: 'embed' });
+    ev.stage('vectordb', 'start', 'pgvector cosine search, top 3', { op: 'search' });
+    const pool = await this.db();
+    const r = await pool.query(
+      `SELECT id, chunk, 1 - (embedding <=> $1::vector) AS score FROM ${this.cfg.table} ORDER BY embedding <=> $1::vector LIMIT 3`,
+      [this.toVector(qvec)]
+    );
+    const sources = r.rows.filter((x) => x.score > 0.08).map((x) => ({ id: x.id, chunk: x.chunk, score: Number(Number(x.score).toFixed(3)) }));
+    ev.stage('vectordb', 'done', `${sources.length} relevant chunk${sources.length === 1 ? '' : 's'} retrieved`, { count: this.count, hits: sources.map((s) => ({ id: s.id, score: s.score })), op: 'search' });
+    ev.stage('kb', 'done', `Context assembled from ${sources.length} chunk${sources.length === 1 ? '' : 's'}`, { hits: sources.length });
+    return sources;
+  }
+
+  /**
+   * OpenAI-compatible streaming chat completion (SSE). Works against Serverless
+   * Inference (default) or a Managed Agent endpoint via `opts`:
+   *   url    base URL ending in /v1 (default DO_INFERENCE_URL)
+   *   key    bearer token (default DO_INFERENCE_KEY)
+   *   model  model id; null omits the field (agents pick their own model)
+   *   body   extra request fields, e.g. { include_retrieval_info: true }
+   *   onRetrieval(retrieved_data[]) called when a chunk carries agent KB retrieval info
+   * Only `delta.content` is streamed; `delta.reasoning_content` from reasoning
+   * models is ignored. Resolves { text, model, tokens }.
+   */
+  async streamChat(messages, onToken, opts = {}) {
+    const url = (opts.url || this.cfg.inference.url).replace(/\/$/, '');
+    const key = opts.key ?? this.cfg.inference.key;
+    const model = opts.model === undefined ? this.cfg.inference.model : opts.model;
+    if (!key) throw new Error(opts.url ? 'DO_AGENT_KEY missing' : 'DO_INFERENCE_KEY missing');
+    const payload = { messages, stream: true, temperature: 0.2, ...(model ? { model } : {}), ...(opts.body || {}) };
     const res = await fetch(`${url}/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-      body: JSON.stringify({ model, messages, stream: true, temperature: 0.2 }),
+      body: JSON.stringify(payload),
     });
-    if (!res.ok) throw new Error(`Inference request failed: ${res.status} ${await res.text()}`);
+    if (!res.ok) throw new Error(`${opts.url ? 'Agent' : 'Inference'} request failed: ${res.status} ${await res.text()}`);
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
     let text = '';
+    let modelSeen = '';
     let i = 0;
+    const handle = (line) => {
+      const m = line.match(/^data:\s*(.*)$/);
+      if (!m || m[1].trim() === '[DONE]' || !m[1].trim()) return;
+      let json;
+      try {
+        json = JSON.parse(m[1]);
+      } catch {
+        return; /* ignore partial / non-JSON lines */
+      }
+      if (json.model && !modelSeen) modelSeen = json.model;
+      const retrieved = json.retrieval?.retrieved_data;
+      if (Array.isArray(retrieved) && retrieved.length && opts.onRetrieval) opts.onRetrieval(retrieved);
+      const delta = json.choices?.[0]?.delta?.content;
+      if (typeof delta === 'string' && delta) {
+        text += delta;
+        onToken(delta, i++);
+      }
+    };
     for (;;) {
       const { value, done } = await reader.read();
       if (done) break;
       buf += decoder.decode(value, { stream: true });
       const lines = buf.split('\n');
       buf = lines.pop();
-      for (const line of lines) {
-        const m = line.match(/^data:\s*(.*)$/);
-        if (!m || m[1] === '[DONE]') continue;
-        try {
-          const delta = JSON.parse(m[1]).choices?.[0]?.delta?.content;
-          if (delta) {
-            text += delta;
-            onToken(delta, i++);
-          }
-        } catch {
-          /* ignore partial lines */
-        }
-      }
+      for (const line of lines) handle(line);
     }
-    return text;
+    if (buf) handle(buf);
+    return { text, model: modelSeen, tokens: i };
   }
 }

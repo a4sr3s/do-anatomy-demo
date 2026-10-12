@@ -13,7 +13,7 @@
     "dev:client": "vite",
     "build": "vite build",
     "start": "node server/index.js",
-    "test": "node --test test/mock-pipeline.test.js test/recorder.test.js",
+    "test": "node --test test/mock-pipeline.test.js test/recorder.test.js test/real-pipeline.test.js",
     "record:samples": "node scripts/record-samples.js"
   },
   "dependencies": {
