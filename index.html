@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Anatomy of a DigitalOcean Data Pipeline</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="scene"></div>
+
+    <header id="topbar">
+      <div class="brand">
+        <span class="dot"></span>
+        <strong>Anatomy of a Data Pipeline</strong>
+        <span class="muted">DigitalOcean Solutions</span>
+      </div>
+      <div class="status">
+        <span id="mode-badge" class="badge">connecting…</span>
+        <span id="conn-badge" class="badge dim">SSE</span>
+      </div>
+      <div class="replay" id="replay-controls">
+        <button id="rec-btn" class="ghost" title="Record live events to recordings/*.json">● Record</button>
+        <select id="rec-select" title="Saved recordings"></select>
+        <select id="rec-speed" title="Replay speed">
+          <option value="0.5">0.5×</option>
+          <option value="1" selected>1×</option>
+          <option value="2">2×</option>
+          <option value="4">4×</option>
+        </select>
+        <button id="play-btn" class="ghost">▶ Replay</button>
+        <button id="stop-btn" class="ghost" hidden>■ Stop</button>
+      </div>
+    </header>
+
+    <aside id="left">
+      <section class="panel">
+        <h2>Submit a fact</h2>
+        <p class="hint">Spaces → Functions (chunk + embed) → pgvector</p>
+        <textarea id="fact-input" rows="3" placeholder="e.g. Our Q3 launch event is in Austin on October 22nd."></textarea>
+        <div class="row">
+          <button id="fact-btn" class="primary">Ingest fact</button>
+          <span id="fact-status" class="muted"></span>
+        </div>
+      </section>
+      <section class="panel">
+        <h2>Ask a question</h2>
+        <p class="hint">Knowledge Base → Agent → Serverless Inference</p>
+        <input id="ask-input" type="text" placeholder="e.g. Where is the Q3 launch event?" />
+        <div class="row">
+          <button id="ask-btn" class="primary">Ask</button>
+          <span id="ask-status" class="muted"></span>
+        </div>
+      </section>
+      <section class="panel answer" id="answer-panel">
+        <h2>Answer</h2>
+        <div id="answer-text" class="answer-text muted">Ask something to see the agent answer stream in here.</div>
+        <div id="answer-sources" class="sources"></div>
+      </section>
+    </aside>
+
+    <aside id="right">
+      <section class="panel" id="explainer">
+        <h2 id="explainer-title">Hover or click a component</h2>
+        <p id="explainer-sub" class="muted">Drag to rotate · wheel to zoom · right-drag to pan</p>
+        <p id="explainer-body"></p>
+        <p id="explainer-status" class="stage-status"></p>
+      </section>
+      <section class="panel log">
+        <h2>Live events <span id="log-count" class="muted"></span></h2>
+        <ul id="event-log"></ul>
+      </section>
+    </aside>
+
+    <div id="tooltip" class="tooltip" hidden></div>
+    <div id="toast" class="toast" hidden></div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

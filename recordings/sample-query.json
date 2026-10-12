@@ -1,0 +1,507 @@
+{
+  "name": "sample-query",
+  "createdAt": "2026-10-12T15:42:07.712Z",
+  "events": [
+    {
+      "id": 14,
+      "ts": 1791819727712,
+      "type": "job",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "status": "start",
+      "data": {
+        "input": "Which DigitalOcean database supports similarity search?"
+      },
+      "t": 0
+    },
+    {
+      "id": 15,
+      "ts": 1791819727712,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "kb",
+      "status": "start",
+      "detail": "Knowledge Base received query",
+      "data": {
+        "question": "Which DigitalOcean database supports similarity search?"
+      },
+      "t": 0
+    },
+    {
+      "id": 16,
+      "ts": 1791819728114,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "kb",
+      "status": "progress",
+      "detail": "Query embedded (128 dims)",
+      "data": {
+        "step": "embed"
+      },
+      "t": 402
+    },
+    {
+      "id": 17,
+      "ts": 1791819728114,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "vectordb",
+      "status": "start",
+      "detail": "Cosine similarity search, top 3",
+      "data": {
+        "op": "search"
+      },
+      "t": 402
+    },
+    {
+      "id": 18,
+      "ts": 1791819728615,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "vectordb",
+      "status": "done",
+      "detail": "1 relevant chunk retrieved",
+      "data": {
+        "count": 1,
+        "hits": [
+          {
+            "id": 1,
+            "score": 0.421
+          }
+        ],
+        "op": "search"
+      },
+      "t": 903
+    },
+    {
+      "id": 19,
+      "ts": 1791819728816,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "kb",
+      "status": "done",
+      "detail": "Context assembled from 1 chunk",
+      "data": {
+        "hits": 1
+      },
+      "t": 1104
+    },
+    {
+      "id": 20,
+      "ts": 1791819728816,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "agent",
+      "status": "start",
+      "detail": "Agent composing grounded prompt",
+      "data": {
+        "contextChunks": 1
+      },
+      "t": 1104
+    },
+    {
+      "id": 21,
+      "ts": 1791819729317,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "agent",
+      "status": "done",
+      "detail": "Prompt ready; calling serverless inference",
+      "data": {},
+      "t": 1605
+    },
+    {
+      "id": 22,
+      "ts": 1791819729317,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "start",
+      "detail": "Serverless inference generating",
+      "data": {
+        "model": "mock-llm"
+      },
+      "t": 1605
+    },
+    {
+      "id": 23,
+      "ts": 1791819729664,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": "Based",
+        "index": 0,
+        "total": 20
+      },
+      "t": 1952
+    },
+    {
+      "id": 24,
+      "ts": 1791819729710,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": " on",
+        "index": 1,
+        "total": 20
+      },
+      "t": 1998
+    },
+    {
+      "id": 25,
+      "ts": 1791819729755,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": " the",
+        "index": 2,
+        "total": 20
+      },
+      "t": 2043
+    },
+    {
+      "id": 26,
+      "ts": 1791819729800,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": " knowledge",
+        "index": 3,
+        "total": 20
+      },
+      "t": 2088
+    },
+    {
+      "id": 27,
+      "ts": 1791819729846,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": " base:",
+        "index": 4,
+        "total": 20
+      },
+      "t": 2134
+    },
+    {
+      "id": 28,
+      "ts": 1791819729892,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": " DigitalOcean",
+        "index": 5,
+        "total": 20
+      },
+      "t": 2180
+    },
+    {
+      "id": 29,
+      "ts": 1791819729937,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": " Spaces",
+        "index": 6,
+        "total": 20
+      },
+      "t": 2225
+    },
+    {
+      "id": 30,
+      "ts": 1791819729983,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": " is",
+        "index": 7,
+        "total": 20
+      },
+      "t": 2271
+    },
+    {
+      "id": 31,
+      "ts": 1791819730028,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": " S3-compatible",
+        "index": 8,
+        "total": 20
+      },
+      "t": 2316
+    },
+    {
+      "id": 32,
+      "ts": 1791819730074,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": " object",
+        "index": 9,
+        "total": 20
+      },
+      "t": 2362
+    },
+    {
+      "id": 33,
+      "ts": 1791819730120,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": " storage.",
+        "index": 10,
+        "total": 20
+      },
+      "t": 2408
+    },
+    {
+      "id": 34,
+      "ts": 1791819730165,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": " Managed",
+        "index": 11,
+        "total": 20
+      },
+      "t": 2453
+    },
+    {
+      "id": 35,
+      "ts": 1791819730210,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": " Postgres",
+        "index": 12,
+        "total": 20
+      },
+      "t": 2498
+    },
+    {
+      "id": 36,
+      "ts": 1791819730256,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": " supports",
+        "index": 13,
+        "total": 20
+      },
+      "t": 2544
+    },
+    {
+      "id": 37,
+      "ts": 1791819730301,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": " the",
+        "index": 14,
+        "total": 20
+      },
+      "t": 2589
+    },
+    {
+      "id": 38,
+      "ts": 1791819730347,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": " pgvector",
+        "index": 15,
+        "total": 20
+      },
+      "t": 2635
+    },
+    {
+      "id": 39,
+      "ts": 1791819730392,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": " extension",
+        "index": 16,
+        "total": 20
+      },
+      "t": 2680
+    },
+    {
+      "id": 40,
+      "ts": 1791819730437,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": " for",
+        "index": 17,
+        "total": 20
+      },
+      "t": 2725
+    },
+    {
+      "id": 41,
+      "ts": 1791819730483,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": " similarity",
+        "index": 18,
+        "total": 20
+      },
+      "t": 2771
+    },
+    {
+      "id": 42,
+      "ts": 1791819730528,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "progress",
+      "detail": "",
+      "data": {
+        "token": " search.",
+        "index": 19,
+        "total": 20
+      },
+      "t": 2816
+    },
+    {
+      "id": 43,
+      "ts": 1791819730528,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "stage": "inference",
+      "status": "done",
+      "detail": "Generated 20 tokens",
+      "data": {
+        "tokens": 20
+      },
+      "t": 2816
+    },
+    {
+      "id": 44,
+      "ts": 1791819730529,
+      "type": "answer",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "data": {
+        "text": "Based on the knowledge base: DigitalOcean Spaces is S3-compatible object storage. Managed Postgres supports the pgvector extension for similarity search.",
+        "sources": [
+          {
+            "id": 1,
+            "chunk": "DigitalOcean Spaces is S3-compatible object storage. Managed Postgres supports the pgvector extension for similarity search.",
+            "score": 0.421
+          }
+        ]
+      },
+      "t": 2817
+    },
+    {
+      "id": 45,
+      "ts": 1791819730529,
+      "type": "job",
+      "flow": "query",
+      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "status": "done",
+      "data": {
+        "answer": "Based on the knowledge base: DigitalOcean Spaces is S3-compatible object storage. Managed Postgres supports the pgvector extension for similarity search.",
+        "sources": [
+          {
+            "id": 1,
+            "chunk": "DigitalOcean Spaces is S3-compatible object storage. Managed Postgres supports the pgvector extension for similarity search.",
+            "score": 0.421
+          }
+        ]
+      },
+      "t": 2817
+    }
+  ],
+  "flow": "query"
+}

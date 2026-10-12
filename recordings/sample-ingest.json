@@ -1,0 +1,149 @@
+{
+  "name": "sample-ingest",
+  "createdAt": "2026-10-12T15:42:05.650Z",
+  "events": [
+    {
+      "id": 2,
+      "ts": 1791819725651,
+      "type": "job",
+      "flow": "ingest",
+      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "status": "start",
+      "data": {
+        "input": "DigitalOcean Spaces is S3-compatible object storage. Managed Postgres supports the pgvector extension for similarity search."
+      },
+      "t": 1
+    },
+    {
+      "id": 3,
+      "ts": 1791819725651,
+      "type": "stage",
+      "flow": "ingest",
+      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "stage": "spaces",
+      "status": "start",
+      "detail": "PUT facts/1791819725651-ef4e8533.txt to Spaces bucket",
+      "data": {
+        "key": "facts/1791819725651-ef4e8533.txt",
+        "bytes": 124
+      },
+      "t": 1
+    },
+    {
+      "id": 4,
+      "ts": 1791819726253,
+      "type": "stage",
+      "flow": "ingest",
+      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "stage": "spaces",
+      "status": "done",
+      "detail": "Object stored; event trigger fired",
+      "data": {
+        "key": "facts/1791819725651-ef4e8533.txt"
+      },
+      "t": 603
+    },
+    {
+      "id": 5,
+      "ts": 1791819726253,
+      "type": "stage",
+      "flow": "ingest",
+      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "stage": "functions",
+      "status": "start",
+      "detail": "Function invoked: chunk + embed",
+      "data": {
+        "key": "facts/1791819725651-ef4e8533.txt"
+      },
+      "t": 603
+    },
+    {
+      "id": 6,
+      "ts": 1791819726655,
+      "type": "stage",
+      "flow": "ingest",
+      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "stage": "functions",
+      "status": "progress",
+      "detail": "Chunked into 1 chunk",
+      "data": {
+        "step": "chunk",
+        "chunks": 1
+      },
+      "t": 1005
+    },
+    {
+      "id": 7,
+      "ts": 1791819727007,
+      "type": "stage",
+      "flow": "ingest",
+      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "stage": "functions",
+      "status": "progress",
+      "detail": "Embedded chunk 1/1 (128 dims)",
+      "data": {
+        "step": "embed",
+        "index": 0,
+        "total": 1
+      },
+      "t": 1357
+    },
+    {
+      "id": 8,
+      "ts": 1791819727208,
+      "type": "stage",
+      "flow": "ingest",
+      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "stage": "functions",
+      "status": "done",
+      "detail": "Produced 1 vector",
+      "data": {
+        "chunks": 1
+      },
+      "t": 1558
+    },
+    {
+      "id": 9,
+      "ts": 1791819727208,
+      "type": "stage",
+      "flow": "ingest",
+      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "stage": "vectordb",
+      "status": "start",
+      "detail": "INSERT 1 row into pgvector",
+      "data": {},
+      "t": 1558
+    },
+    {
+      "id": 10,
+      "ts": 1791819727710,
+      "type": "stage",
+      "flow": "ingest",
+      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "stage": "vectordb",
+      "status": "done",
+      "detail": "Store now holds 1 chunks",
+      "data": {
+        "count": 1,
+        "inserted": 1
+      },
+      "t": 2060
+    },
+    {
+      "id": 11,
+      "ts": 1791819727710,
+      "type": "job",
+      "flow": "ingest",
+      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "status": "done",
+      "data": {
+        "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+        "key": "facts/1791819725651-ef4e8533.txt",
+        "chunks": 1,
+        "total": 1
+      },
+      "t": 2060
+    }
+  ],
+  "flow": "ingest"
+}
