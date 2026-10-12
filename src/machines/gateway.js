@@ -10,45 +10,47 @@ import { Solid, rrBox, box, cyl, ring, tagPart, textPlate, lineSegments, lineLoo
 
 export function buildGateway(parts) {
   const g = new THREE.Group();
-  const center = new THREE.Vector3(4.2, 1.0, 0.5);
+  // Sits in the open board between the Harness Runtime (front), Functions (back),
+  // Spaces (back-left) and pgvector (back-right), clear of the band the inference
+  // platters occlude from the default camera (x >~ 4.2 for z >~ 0.6).
+  const center = new THREE.Vector3(1.3, 1.0, 0.0);
   g.position.set(center.x, 0, center.z);
 
-  const W = 3.4;
+  const W = 3.0;
   const D = 2.0;
   const basePart = parts['gateway.base'];
   const base = tagPart(new Solid(rrBox(W, 0.5, D, 0.25, 0.06), { opacity: 1 }), basePart);
   g.add(base);
   basePart.solids.push(base);
-  // readout + nameplate on the front (+z) face. The board behind this machine is hidden by the
-  // inference platters from the default camera, so the name lives on the machine itself.
-  // (the left half of the front face is the part that stays visible, so the name goes there)
-  const readout = textPlate(1.5, 0.3, { px: 56, color: '#ffd166' });
-  readout.position.set(0.85, 0.25, D / 2 + 0.07);
+  // readout + MCP server plate on the front (+z) face; the machine name is a board label
+  // in front of it (see mount.js LABELS), like every other machine.
+  const readout = textPlate(1.4, 0.3, { px: 56, color: '#ffd166' });
+  readout.position.set(0.75, 0.25, D / 2 + 0.07);
   g.add(readout);
   readout.set('calls 0000');
-  const nameplate = textPlate(1.5, 0.3, { px: 46, color: '#aab2bc', align: 'center' });
-  nameplate.position.set(-0.85, 0.25, D / 2 + 0.07);
+  const nameplate = textPlate(1.4, 0.3, { px: 44, color: '#aab2bc', align: 'center' });
+  nameplate.position.set(-0.75, 0.25, D / 2 + 0.07);
   g.add(nameplate);
-  nameplate.set('ACTION GATEWAY');
+  nameplate.set('MCP · anatomy-data');
 
   // turret + selector (points at the routed target)
   const selPart = parts['gateway.selector'];
-  const sx = -0.35;
-  const sz = 0.05;
-  const turret = tagPart(new Solid(cyl(0.72, 0.55, 32), { fill: 0x0e0f12, opacity: 1, threshold: 60 }), selPart);
+  const sx = -0.45;
+  const sz = 0.0;
+  const turret = tagPart(new Solid(cyl(0.65, 0.55, 32), { fill: 0x0e0f12, opacity: 1, threshold: 60 }), selPart);
   turret.position.set(sx, 0.5, sz);
   g.add(turret);
-  const bezel = tagPart(new Solid(ring(0.72, 0.6, 0.08, 32), { fill: 0x15171b, edge: 0x8a919c, opacity: 1, threshold: 60 }), selPart);
+  const bezel = tagPart(new Solid(ring(0.65, 0.54, 0.08, 32), { fill: 0x15171b, edge: 0x8a919c, opacity: 1, threshold: 60 }), selPart);
   bezel.position.set(sx, 1.05, sz);
   g.add(bezel);
-  const face = tagPart(new Solid(cyl(0.6, 0.03, 32), { fill: 0x08090b, edge: 0x3e444c, opacity: 1, threshold: 60 }), selPart);
+  const face = tagPart(new Solid(cyl(0.54, 0.03, 32), { fill: 0x08090b, edge: 0x3e444c, opacity: 1, threshold: 60 }), selPart);
   face.position.set(sx, 1.05, sz);
   g.add(face);
   selPart.solids.push(turret, bezel, face);
-  const ticks = lineSegments(radialTicks(0.46, 0.55, 24, 1.09, 6, 0.05), 0x6a717a);
+  const ticks = lineSegments(radialTicks(0.42, 0.5, 24, 1.09, 6, 0.05), 0x6a717a);
   ticks.position.set(sx, 0, sz);
   g.add(ticks);
-  const inner = lineLoop(circlePoints(0.3, 32, 1.09), 0x3e444c);
+  const inner = lineLoop(circlePoints(0.28, 32, 1.09), 0x3e444c);
   inner.position.set(sx, 0, sz);
   g.add(inner);
   const selector = new THREE.Group();
@@ -67,16 +69,17 @@ export function buildGateway(parts) {
   selPart.solids.push(hub, arm, tip);
   g.add(selector);
 
-  // jack ports: one per neighbour (harness at +z, spaces at -x, pgvector at -z) with a lamp each
+  // jack ports: one per neighbour, next to where its track meets the base: harness (left-front),
+  // Spaces (left-back) and pgvector (back), with a lamp each
   const portPart = parts['gateway.ports'];
   const ports = {};
   const portGeom = ring(0.19, 0.11, 0.14, 20);
   const pinGeom = cyl(0.09, 0.22, 12);
   const lampGeom = cyl(0.07, 0.16, 12, 0.055);
   const PORTS = {
-    harness: { pos: [sx, 0.5, sz + 0.78], lamp: [sx + 0.3, 0.5, sz + 0.78] },
-    spaces: { pos: [sx - 0.55, 0.5, sz - 0.5], lamp: [sx - 0.55, 0.5, sz - 0.8] },
-    pgvector: { pos: [sx + 0.55, 0.5, sz - 0.5], lamp: [sx + 0.55, 0.5, sz - 0.8] },
+    harness: { pos: [-1.22, 0.5, 0.5], lamp: [-1.22, 0.5, 0.8] },
+    spaces: { pos: [-1.22, 0.5, -0.5], lamp: [-1.22, 0.5, -0.8] },
+    pgvector: { pos: [0.7, 0.5, -0.72], lamp: [1.0, 0.5, -0.72] },
   };
   for (const [name, p] of Object.entries(PORTS)) {
     const socket = tagPart(new Solid(portGeom, { fill: 0x121317, edge: 0x7a828c, opacity: 1, threshold: 60 }), portPart);
@@ -94,27 +97,27 @@ export function buildGateway(parts) {
 
   // policy plate at the right: a raised slab with two "allow" lamps and a rule bar
   const polPart = parts['gateway.policy'];
-  const px = 1.0;
-  const pz = 0.05;
-  const plate = tagPart(new Solid(rrBox(1.0, 0.45, 1.5, 0.08), { fill: 0x101115, opacity: 1 }), polPart);
+  const px = 0.8;
+  const pz = 0.15;
+  const plate = tagPart(new Solid(rrBox(0.95, 0.45, 1.2, 0.08), { fill: 0x101115, opacity: 1 }), polPart);
   plate.position.set(px, 0.5, pz);
   g.add(plate);
   const bar = tagPart(new Solid(box(0.7, 0.06, 0.12), { fill: 0x1a1c21, edge: 0x8a919c, opacity: 1 }), polPart);
-  bar.position.set(px, 0.95, pz + 0.5);
+  bar.position.set(px, 0.95, pz + 0.38);
   g.add(bar);
   const allowLamps = [];
   for (let i = 0; i < 2; i++) {
     const l = tagPart(new Solid(cyl(0.1, 0.2, 14, 0.08), { fill: 0x1b1d22, edge: 0x6a717a, opacity: 1, glow: '#4dff9a', threshold: 60 }), polPart);
-    l.position.set(px - 0.25 + i * 0.5, 0.95, pz - 0.15);
+    l.position.set(px - 0.22 + i * 0.44, 0.95, pz - 0.1);
     g.add(l);
     allowLamps.push(l);
     polPart.solids.push(l);
   }
-  g.add(lineSegments([[px - 0.35, 0.96, pz - 0.55], [px + 0.35, 0.96, pz - 0.55], [px - 0.35, 0.96, pz - 0.45], [px + 0.05, 0.96, pz - 0.45]], 0x3e444c));
+  g.add(lineSegments([[px - 0.35, 0.96, pz - 0.45], [px + 0.35, 0.96, pz - 0.45], [px - 0.35, 0.96, pz - 0.36], [px + 0.05, 0.96, pz - 0.36]], 0x3e444c));
   polPart.solids.push(plate, bar);
   const allowBurst = new Burst(0.05, 1.6);
 
-  const REST = Math.PI; // selector points back along -x (towards the harness side) when idle
+  const REST = Math.PI; // selector points along -x (towards the harness port) when idle
   let angle = REST;
   let target = REST;
   let spin = 0;

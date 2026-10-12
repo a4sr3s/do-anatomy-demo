@@ -72,7 +72,7 @@ function Hud() {
             {legend.map((j, i) => (
               <li key={i} className="flex items-center gap-2">
                 <span className="truncate">
-                  {j.flow === 'ingest' ? 'fact' : 'question'} · {j.input.slice(0, 28)}
+                  {j.flow === 'ingest' ? 'fact' : j.flow === 'delete' ? 'delete' : 'question'} · {j.input.slice(0, 28)}
                   {j.input.length > 28 ? '…' : ''}
                 </span>
                 <span className="size-2 shrink-0" style={{ background: j.color, boxShadow: `0 0 8px ${j.color}` }} />

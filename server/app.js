@@ -90,6 +90,23 @@ export async function createApp(options = {}) {
     return runWithFallback('ingest', () => pipeline.submitFact(text), res);
   });
 
+  // ---- facts: list / delete (pgvector rows + Spaces object) ----------------
+  // Deletions never fall back to a replay: the caller must know whether data is gone.
+  const factsRoute = (fn) => async (req, res) => {
+    try {
+      res.json({ ok: true, mode: pipeline.mode, ...(await fn(req)) });
+    } catch (err) {
+      if (!err.status) console.error('[facts] failed:', err.message);
+      res.status(err.status || (isNetworkError(err) ? 502 : 500)).json({ ok: false, error: err.message, jobId: err.jobId });
+    }
+  };
+  app.get('/api/facts', factsRoute(async () => {
+    const facts = await pipeline.listFacts();
+    return { facts, total: facts.length, chunks: facts.reduce((n, f) => n + (f.chunks || 0), 0) };
+  }));
+  app.delete('/api/facts', factsRoute(() => pipeline.deleteAllFacts()));
+  app.delete('/api/facts/:id', factsRoute((req) => pipeline.deleteFact(req.params.id)));
+
   app.post('/api/ask', (req, res) => {
     const question = String(req.body?.question || '').trim();
     if (!question) return res.status(400).json({ ok: false, error: 'question is required' });

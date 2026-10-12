@@ -16,12 +16,12 @@ export const ROUTES = {
   'client-router': { pts: [[-12.3, 1.45], [-11.5, 1.45], [-10.7, 2.25], [-10.7, 4.5], [-3.3, 4.5]], lanes: 2 },
   'spaces-functions': { pts: [[-5.3, -4.5], [-3.3, -4.5]], lanes: 2 },
   'functions-vectordb': { pts: [[1.3, -4.5], [3.5, -4.5]], lanes: 2 },
-  // app-side retrieval (fallback 1 / legacy backends): harness housing straight to pgvector, skirting the gateway
-  'router-vectordb': { pts: [[1.3, 2.9], [1.6, 2.9], [1.6, -1.8], [2.2, -2.4], [3.5, -2.4]], lanes: 2 },
-  // v4 tool path: harness -> Action Gateway (front port) -> pgvector (search_facts) / Spaces (get_document)
-  'router-gateway': { pts: [[1.3, 3.7], [3.0, 3.7], [4.2, 2.5], [4.2, 1.5]], lanes: 2 },
-  'gateway-vectordb': { pts: [[4.2, -0.5], [4.2, -1.5]], lanes: 2 },
-  'gateway-spaces': { pts: [[2.5, 0.1], [-3.8, 0.1], [-4.8, -0.9], [-4.8, -3.4], [-5.3, -3.4]], lanes: 2 },
+  // app-side retrieval (fallback 1 / legacy backends): harness right face straight to pgvector, skirting the gateway on the right
+  'router-vectordb': { pts: [[1.3, 3.2], [4.4, 3.2], [4.4, -1.5]], lanes: 2 },
+  // v4 tool path: harness (back face) -> Action Gateway (left port) -> pgvector (search_facts, back port) / Spaces (get_document, left port)
+  'router-gateway': { pts: [[-2.5, 2.6], [-2.5, 0.5], [-0.2, 0.5]], lanes: 2 },
+  'gateway-vectordb': { pts: [[2.0, -1.0], [2.0, -2.4], [3.5, -2.4]], lanes: 2 },
+  'gateway-spaces': { pts: [[-0.2, -0.5], [-3.8, -0.5], [-4.8, -1.5], [-4.8, -3.4], [-5.3, -3.4]], lanes: 2 },
   'router-inference': { pts: [[1.3, 5.4], [6, 5.4]], lanes: 2 },
   'inference-client': { pts: [[11, 4.5], [12.2, 4.5], [12.2, 8.7], [-11.5, 8.7], [-13.2, 7], [-13.2, 2.6]], lanes: 3 },
 };

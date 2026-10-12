@@ -4,7 +4,7 @@
  */
 import { toast } from 'sonner';
 import { MACHINES } from '@/components.js';
-import { store, MAX_LOG, type InspectorPart, type Stats, type Tone, type ConnState, type LegendJob, type Recording, type RecorderStatus } from './store';
+import { store, MAX_LOG, type InspectorPart, type Stats, type Tone, type ConnState, type LegendJob, type Recording, type RecorderStatus, type Fact } from './store';
 import { describeEvent } from './format';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -117,6 +117,10 @@ export function createBridge() {
     },
     setAuto(on: boolean) {
       store.set({ auto: on });
+    },
+    /** the stored facts list (refreshed by mount.js after every ingest / delete job) */
+    setFacts(list: Fact[]) {
+      store.set({ facts: list });
     },
     get pinned() {
       return pinned;

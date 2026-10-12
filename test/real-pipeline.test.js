@@ -152,3 +152,93 @@ test('pgPoolConfig: pg honours the explicit ssl option once sslmode is gone from
   const buggy = new Client({ connectionString: DO_URL, ssl: { rejectUnauthorized: false } });
   assert.notDeepEqual(buggy.ssl, { rejectUnauthorized: false });
 });
+
+/** RealPipeline with a scripted pg pool (records SQL) and a fake S3 client (records commands). */
+function setupFacts(rowsByQuery) {
+  const bus = new EventBus();
+  const events = [];
+  bus.on('event', (e) => events.push(e));
+  const p = new RealPipeline(bus, { DATABASE_URL: 'postgres://stub', DO_SPACES_BUCKET: 'anatomy-bucket', DO_SPACES_KEY: 'k', DO_SPACES_SECRET: 's', PGVECTOR_TABLE: 'demo_chunks' });
+  const queries = [];
+  p.db = async () => ({
+    query: async (sql, params) => {
+      queries.push({ sql, params });
+      for (const [re, rows] of rowsByQuery) if (re.test(sql)) return { rows: typeof rows === 'function' ? rows(params) : rows, rowCount: rows.length };
+      return { rows: [], rowCount: 0 };
+    },
+  });
+  const sent = [];
+  p.s3 = async () => ({ send: async (cmd) => { sent.push({ name: cmd.constructor.name, input: cmd.input }); return {}; } });
+  return { p, events, queries, sent };
+}
+
+test('real pipeline: listFacts groups pgvector rows per Spaces object, newest first', async () => {
+  const { p, queries } = setupFacts([
+    [/SELECT object_key AS key, count/, [
+      { key: 'facts/1760-bbbb.txt', chunks: 2, created_at: new Date('2026-10-12T15:00:00Z'), first_id: 8, text: 'Second fact part one. Second fact part two.' },
+      { key: 'facts/1760-aaaa.txt', chunks: 1, created_at: new Date('2026-10-12T14:00:00Z'), first_id: 7, text: FACT },
+    ]],
+  ]);
+  const facts = await p.listFacts();
+  assert.deepEqual(facts, [
+    { id: '1760-bbbb', key: 'facts/1760-bbbb.txt', text: 'Second fact part one. Second fact part two.', createdAt: Date.parse('2026-10-12T15:00:00Z'), chunks: 2 },
+    { id: '1760-aaaa', key: 'facts/1760-aaaa.txt', text: FACT, createdAt: Date.parse('2026-10-12T14:00:00Z'), chunks: 1 },
+  ]);
+  assert.equal(queries.length, 1);
+  assert.match(queries[0].sql, /FROM demo_chunks WHERE object_key IS NOT NULL GROUP BY object_key ORDER BY min\(id\) DESC/);
+  assert.match(queries[0].sql, /string_agg\(chunk, ' ' ORDER BY id\)/);
+});
+
+test('real pipeline: deleteFact deletes the rows by object_key (parameterised), recounts, then deletes the Spaces object', async () => {
+  const { p, events, queries, sent } = setupFacts([
+    [/^SELECT id FROM demo_chunks WHERE object_key = \$1/, [{ id: 7 }, { id: 8 }]],
+    [/^DELETE FROM demo_chunks WHERE object_key = \$1 RETURNING id$/, [{ id: 7 }, { id: 8 }]],
+    [/^SELECT count\(\*\)::int AS n FROM demo_chunks$/, [{ n: 3 }]],
+  ]);
+  const out = await p.deleteFact('1760-aaaa');
+  assert.equal(out.key, 'facts/1760-aaaa.txt');
+  assert.equal(out.id, '1760-aaaa');
+  assert.equal(out.removed, 2);
+  assert.equal(out.total, 3);
+  assert.equal(p.count, 3);
+  assert.deepEqual(queries.map((q) => q.params), [['facts/1760-aaaa.txt'], ['facts/1760-aaaa.txt'], undefined]);
+  assert.ok(queries.every((q) => !q.sql.includes('1760-aaaa')), 'the key only ever travels as a bind parameter');
+  assert.deepEqual(sent, [{ name: 'DeleteObjectCommand', input: { Bucket: 'anatomy-bucket', Key: 'facts/1760-aaaa.txt' } }]);
+  assert.deepEqual(stageSeq(events, 'start'), ['vectordb', 'spaces']);
+  assert.deepEqual(stageSeq(events, 'done'), ['vectordb', 'spaces']);
+  assert.ok(events.every((e) => e.flow === 'delete'));
+  const vdone = events.find((e) => e.stage === 'vectordb' && e.status === 'done');
+  assert.deepEqual(vdone.data, { op: 'delete', key: 'facts/1760-aaaa.txt', ids: [7, 8], removed: 2, count: 3 });
+  assert.equal(events.at(-1).type, 'job');
+  assert.equal(events.at(-1).status, 'done');
+
+  // a full key works as the id too; an unknown fact is a 404 before any job starts
+  await p.deleteFact('facts/1760-aaaa.txt');
+  assert.equal(sent.length, 2);
+  const before = events.length;
+  const { p: p2 } = setupFacts([]);
+  await assert.rejects(p2.deleteFact('ghost'), (err) => err.status === 404);
+  assert.equal(events.length, before);
+});
+
+test('real pipeline: deleteAllFacts removes every row (known keys + legacy rows) and the objects in one DeleteObjects batch', async () => {
+  const { p, events, queries, sent } = setupFacts([
+    [/^SELECT DISTINCT object_key AS key FROM demo_chunks/, [{ key: 'facts/1.txt' }, { key: 'facts/2.txt' }]],
+    [/^SELECT id FROM demo_chunks ORDER BY id$/, [{ id: 1 }, { id: 2 }, { id: 3 }]],
+    [/^DELETE FROM demo_chunks WHERE object_key = ANY\(\$1::text\[\]\) OR object_key IS NULL RETURNING id$/, [{ id: 1 }, { id: 2 }, { id: 3 }]],
+    [/^SELECT count\(\*\)::int AS n FROM demo_chunks$/, [{ n: 0 }]],
+  ]);
+  const out = await p.deleteAllFacts();
+  assert.deepEqual({ facts: out.facts, removed: out.removed, total: out.total }, { facts: 2, removed: 3, total: 0 });
+  const del = queries.find((q) => q.sql.startsWith('DELETE'));
+  assert.deepEqual(del.params, [['facts/1.txt', 'facts/2.txt']]);
+  assert.deepEqual(sent, [{ name: 'DeleteObjectsCommand', input: { Bucket: 'anatomy-bucket', Delete: { Objects: [{ Key: 'facts/1.txt' }, { Key: 'facts/2.txt' }], Quiet: true } } }]);
+  assert.deepEqual(stageSeq(events, 'done'), ['vectordb', 'spaces']);
+  assert.equal(events.find((e) => e.type === 'job').data.all, true);
+
+  // nothing stored: no DeleteObjects call, still a clean job
+  const empty = setupFacts([[/^SELECT count/, [{ n: 0 }]]]);
+  const none = await empty.p.deleteAllFacts();
+  assert.deepEqual({ facts: none.facts, removed: none.removed }, { facts: 0, removed: 0 });
+  assert.equal(empty.sent.length, 0);
+});

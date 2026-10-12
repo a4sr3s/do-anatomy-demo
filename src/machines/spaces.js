@@ -122,13 +122,14 @@ export function buildSpaces(parts) {
     close(index) {
       drawers[index].target = 0;
     },
-    /** drop a document slab into a drawer (colour = job colour). */
-    file(index, color) {
+    /** drop a document slab into a drawer (colour = job colour); `key` is the Spaces object key it stands for. */
+    file(index, color, key = null, { instant = false } = {}) {
       const d = drawers[index];
       const n = d.docs.length;
       const doc = tagPart(new Solid(docGeom, { fill: new THREE.Color(color).multiplyScalar(0.35), edge: new THREE.Color(color).multiplyScalar(1.5), opacity: 0.9, glow: color }), parts['spaces.doc']);
-      doc.position.set(-0.9 + (n % 3) * 0.9, 1.3, -0.1 + 0.2 * Math.floor(n / 3) * 0 + 0.05 * Math.floor(n / 3));
       doc.restY = 0.12 + 0.11 * Math.floor(n / 3);
+      doc.position.set(-0.9 + (n % 3) * 0.9, instant ? doc.restY : 1.3, -0.1 + 0.05 * Math.floor(n / 3));
+      doc.key = key;
       d.group.add(doc);
       d.docs.push(doc);
       if (d.docs.length > 9) {
@@ -137,6 +138,47 @@ export function buildSpaces(parts) {
       }
       objects++;
       return doc;
+    },
+    /** the drawer holding the slab for `key` (else the drawer that has something to give up, else 0) */
+    drawerFor(key) {
+      const i = drawers.findIndex((d) => d.docs.some((doc) => doc.key === key));
+      if (i >= 0) return i;
+      const j = drawers.findIndex((d) => d.docs.length);
+      return j >= 0 ? j : 0;
+    },
+    /** the object was deleted: its slab lifts out of the (open) drawer and shrinks away. Unknown keys take the newest slab. */
+    remove(key) {
+      let doc = null;
+      for (const d of drawers) doc = doc || d.docs.find((x) => x.key === key) || null;
+      if (!doc) {
+        const d = drawers.find((x) => x.docs.length);
+        doc = d ? d.docs[d.docs.length - 1] : null;
+      }
+      if (!doc) return false;
+      lift(doc);
+      return true;
+    },
+    /** every slab leaves (clear all) */
+    removeAll() {
+      let n = 0;
+      for (const d of drawers) for (const doc of d.docs.slice()) if (lift(doc)) n++;
+      return n;
+    },
+    /** slabs for keys the backend holds that are not in the cabinet yet (page load / reconnect); never removes. */
+    sync(keys, color = '#38e8ff') {
+      const have = new Set(drawers.flatMap((d) => d.docs.map((doc) => doc.key)));
+      let n = 0;
+      for (const key of keys) {
+        if (!key || have.has(key)) continue;
+        machine.file(objects % 3, color, key, { instant: true });
+        have.add(key);
+        n++;
+      }
+      return n;
+    },
+    /** keys of the slabs currently filed, per drawer */
+    get keys() {
+      return drawers.map((d) => d.docs.map((doc) => doc.key));
     },
     trigger() {
       lampBurst.fire();
@@ -150,11 +192,33 @@ export function buildSpaces(parts) {
       return objects;
     },
   };
-  // docs settle onto the tray floor
+  // a slab leaving a drawer: out of the docs list at once (so the slot count is right), then up and away
+  const leaving = [];
+  function lift(doc) {
+    const d = drawers.find((x) => x.docs.includes(doc));
+    if (!d) return false;
+    d.docs.splice(d.docs.indexOf(doc), 1);
+    doc.restY = doc.position.y + 2.2;
+    doc.active = 1;
+    leaving.push({ doc, group: d.group });
+    objects = Math.max(0, objects - 1);
+    return true;
+  }
+  // docs settle onto the tray floor; leaving slabs rise and shrink until they are gone
   const settle = (dt) => {
     for (const d of drawers)
       for (const doc of d.docs) doc.position.y = follow(doc.position.y, doc.restY, dt, 6);
+    for (let k = leaving.length - 1; k >= 0; k--) {
+      const { doc, group } = leaving[k];
+      doc.position.y = follow(doc.position.y, doc.restY, dt, 4);
+      doc.scale.multiplyScalar(Math.max(0, 1 - dt * 1.3));
+      if (doc.position.y > doc.restY - 0.25 || doc.scale.x < 0.08) {
+        group.remove(doc);
+        leaving.splice(k, 1);
+      }
+    }
   };
+  Object.defineProperty(machine, 'leaving', { get: () => leaving.length });
   const baseUpdate = machine.update;
   machine.update = (dt, t) => {
     baseUpdate(dt, t);

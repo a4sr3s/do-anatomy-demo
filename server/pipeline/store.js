@@ -23,7 +23,22 @@ export class MemoryVectorStore {
   searchText(text, k = 3) {
     return this.search(embedLocal(text), k);
   }
+  /** Remove every row whose meta.key matches; returns the removed row ids (ascending). */
+  removeByKey(key) {
+    const ids = [];
+    this.rows = this.rows.filter((r) => {
+      if (r.meta?.key !== key) return true;
+      ids.push(r.id);
+      return false;
+    });
+    return ids;
+  }
+  idsForKey(key) {
+    return this.rows.filter((r) => r.meta?.key === key).map((r) => r.id);
+  }
   clear() {
+    const ids = this.rows.map((r) => r.id);
     this.rows = [];
+    return ids;
   }
 }

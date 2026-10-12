@@ -1,4 +1,4 @@
-import { BoxesIcon, ScrollTextIcon, Settings2Icon, WaypointsIcon } from 'lucide-react';
+import { BoxesIcon, DatabaseIcon, ScrollTextIcon, Settings2Icon, WaypointsIcon } from 'lucide-react';
 import {
   Sidebar,
   SidebarContent,
@@ -15,11 +15,13 @@ import {
 } from '@/components/ui/sidebar';
 import { store, useStore, type Section } from '@/anatomy/store';
 import { ArchitectureSection } from '@/components/sections/architecture';
+import { FactsSection } from '@/components/sections/facts';
 import { LogsSection } from '@/components/sections/logs';
 import { ConfigSection } from '@/components/sections/config';
 
 const NAV: { key: Section; label: string; icon: typeof BoxesIcon; testid: string }[] = [
   { key: 'architecture', label: 'Architecture', icon: BoxesIcon, testid: 'nav-architecture' },
+  { key: 'facts', label: 'Facts', icon: DatabaseIcon, testid: 'nav-facts' },
   { key: 'logs', label: 'Logs', icon: ScrollTextIcon, testid: 'nav-logs' },
   { key: 'config', label: 'Configuration', icon: Settings2Icon, testid: 'nav-config' },
 ];
@@ -73,6 +75,7 @@ export function AppSidebar() {
         <SidebarSeparator />
         <div className="flex min-h-0 flex-1 flex-col group-data-[collapsible=icon]:hidden">
           {section === 'architecture' && <ArchitectureSection />}
+          {section === 'facts' && <FactsSection />}
           {section === 'logs' && <LogsSection />}
           {section === 'config' && <ConfigSection />}
         </div>

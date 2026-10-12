@@ -115,6 +115,9 @@ Events can be recorded to `recordings/<name>.json` and replayed with their origi
 | `GET /api/health` | Mode, pipeline description, recorder status |
 | `GET /api/events` | SSE stream. Event names: `hello`, `job`, `stage`, `tool`, `answer`, `recorder`, `replay`, `fallback`. Supports `Last-Event-ID` / `?since=` catch-up |
 | `POST /api/facts` `{text}` | Ingest a fact; resolves when the pipeline finishes |
+| `GET /api/facts` | Stored facts `{facts: [{id, key, text, createdAt, chunks}], total, chunks}` (one per Spaces object; `id` is the key's basename) |
+| `DELETE /api/facts/:id` | Remove one fact: its pgvector rows, then its Spaces object. Emits a `delete` flow (`vectordb` / `spaces` stages with `op: "delete"`); 404 if unknown |
+| `DELETE /api/facts` | Remove every fact (all rows, then all objects) in one `delete` job |
 | `POST /api/ask` `{question}` | Ask; resolves with `{answer, sources, timing: {firstTokenMs, totalMs, toolCalls}, backend, fallback?}` |
 | `POST /api/internal/tool-event` | Called by the MCP server for every tool call (`x-tool-event-token: MCP_AUTH_TOKEN`, 401 otherwise). Body `{phase, callId, tool, args, target, ms?, summary?, hits?, error?}`; attributed to the running question job |
 | `GET /api/recordings` | List recordings and recorder status |

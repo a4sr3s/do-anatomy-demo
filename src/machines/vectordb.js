@@ -103,8 +103,13 @@ export function buildVectorDb(parts) {
   g.add(curtain2);
   g.remove(curtain);
 
-  // cubes
-  const cubes = []; // index = row id - 1
+  // cubes: one per stored row. Each cube keeps its row id and its chamber slot, so rows can be
+  // deleted out of the middle (the slot frees up for the next insert) and a search still finds
+  // the cube for a row id.
+  const cubes = []; // live rows
+  const leaving = []; // cubes lifting out of the enclosure after a delete
+  const usedSlots = new Set();
+  let nextRowId = 1;
   const cubeGeom = box(0.3, 0.3, 0.3);
   const cubePart = parts['vectordb.cube'];
   function slotFor(i) {
@@ -115,20 +120,46 @@ export function buildVectorDb(parts) {
     const p = chamberPos[chamber];
     return new THREE.Vector3(p.x - 0.45 + (s % 3) * 0.45, 0.51 + level * 0.34, p.z - 0.4 + Math.floor(s / 3) * 0.4);
   }
+  function freeSlot() {
+    let i = 0;
+    while (usedSlots.has(i)) i++;
+    return i;
+  }
   function addCube(color, animate = true) {
-    const i = cubes.length;
+    const i = freeSlot();
+    usedSlots.add(i);
     const cube = tagPart(new Solid(cubeGeom, { fill: new THREE.Color(color).multiplyScalar(0.45), edge: new THREE.Color(color).multiplyScalar(1.6), opacity: 0.95, glow: '#ffffff' }), cubePart);
     const slot = slotFor(i);
     cube.position.copy(slot);
     cube.rest = slot.y;
     if (animate) cube.position.y += 2.2;
     cube.color = color;
-    cube.rowId = i + 1;
+    cube.rowId = nextRowId++;
+    cube.slot = i;
     cube.chamber = i % CHAMBERS;
     g.add(cube);
     cubes.push(cube);
     return cube;
   }
+  /** take a cube out of the live set; animated cubes lift out of the enclosure and shrink away */
+  function dropCube(cube, animate) {
+    const k = cubes.indexOf(cube);
+    if (k < 0) return false;
+    cubes.splice(k, 1);
+    usedSlots.delete(cube.slot);
+    flashed = flashed.filter((c) => c !== cube);
+    if (!animate) {
+      g.remove(cube);
+      return true;
+    }
+    cube.rest = cube.position.y + 2.6;
+    cube.active = 1;
+    leaving.push(cube);
+    return true;
+  }
+  const byRowId = (id) => cubes.find((c) => c.rowId === id);
+  /** the cube for a row id; unknown ids (real-mode serials) wrap onto an existing cube so something still lights up */
+  const cubeFor = (id) => byRowId(id) || (cubes.length ? cubes[(((Math.floor(Number(id)) || 1) - 1) % cubes.length + cubes.length) % cubes.length] : null);
 
   let scanning = 0;
   let scanT = 0;
@@ -145,6 +176,15 @@ export function buildVectorDb(parts) {
     chamberPos,
     update(dt, t) {
       for (const c of cubes) if (c.position.y !== c.rest) c.position.y = Math.abs(c.position.y - c.rest) < 0.003 ? c.rest : follow(c.position.y, c.rest, dt, 9);
+      for (let k = leaving.length - 1; k >= 0; k--) {
+        const c = leaving[k];
+        c.position.y = follow(c.position.y, c.rest, dt, 4);
+        c.scale.multiplyScalar(Math.max(0, 1 - dt * 1.3));
+        if (c.position.y > c.rest - 0.25 || c.scale.x < 0.08) {
+          g.remove(c);
+          leaving.splice(k, 1);
+        }
+      }
       if (scanning > 0) scanT += dt * 1.6;
       const sweep = scanning > 0 ? 0.5 - 0.5 * Math.cos(scanT * Math.PI) : 0;
       const x = -EW / 2 + 0.6 + sweep * (EW - 1.2);
@@ -160,8 +200,23 @@ export function buildVectorDb(parts) {
     /** sync cube count with the backend row count; new cubes take `color` */
     setCount(count, color = '#4dff9a', animate = true) {
       while (cubes.length < count) addCube(color, animate);
-      while (cubes.length > count) g.remove(cubes.pop());
+      while (cubes.length > count) dropCube(cubes[cubes.length - 1], false);
       readout.set(`rows ${String(cubes.length).padStart(4, '0')}`);
+    },
+    /**
+     * rows were deleted: lift their cubes out (by row id; ids that match no cube take the
+     * newest cubes instead) and settle on the backend's new row `count`. Returns how many left.
+     */
+    remove(ids = [], count) {
+      let n = 0;
+      for (const id of ids) {
+        const c = byRowId(id);
+        if (c && dropCube(c, true)) n++;
+      }
+      const target = count !== undefined ? count : cubes.length;
+      while (cubes.length > target) if (dropCube(cubes[cubes.length - 1], true)) n++;
+      readout.set(`rows ${String(cubes.length).padStart(4, '0')}`);
+      return n;
     },
     startScan() {
       scanning = 1;
@@ -173,7 +228,7 @@ export function buildVectorDb(parts) {
     /** flash the cubes (by row id) a search retrieved; returns their world positions */
     hit(ids) {
       for (const c of flashed) c.active = 0;
-      flashed = ids.map((id) => cubes[id - 1]).filter(Boolean);
+      flashed = [...new Set(ids.map(cubeFor).filter(Boolean))];
       flash.fire();
       return flashed.map((c) => {
         const v = c.position.clone();
@@ -193,6 +248,9 @@ export function buildVectorDb(parts) {
     },
     get flashing() {
       return flash.value;
+    },
+    get leaving() {
+      return leaving.length;
     },
     chamberWorld(i) {
       const v = chamberPos[i].clone();

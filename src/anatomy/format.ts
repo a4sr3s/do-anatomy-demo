@@ -14,6 +14,13 @@ export function fmtTimeNY(ts: number): string {
   return NY_TIME.format(new Date(ts));
 }
 
+const NY_DATE_TIME = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric', hourCycle: 'h23', hour: '2-digit', minute: '2-digit' });
+
+/** `Oct 12, 14:03` in America/New_York; em dash when unknown. */
+export function fmtDateTimeNY(ts: number | null | undefined): string {
+  return ts ? NY_DATE_TIME.format(new Date(ts)) : '—';
+}
+
 export const latencyMs = (ms: number) => (ms < 1 ? '<1' : Math.round(ms));
 
 /* eslint-disable @typescript-eslint/no-explicit-any */

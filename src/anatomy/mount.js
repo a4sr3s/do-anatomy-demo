@@ -54,6 +54,8 @@ export function mountAnatomy(container, ui) {
     [MACHINES.spaces.label, -7.5, -2.0],
     [MACHINES.functions.label, -1, -2.0],
     [MACHINES.vectordb.label, 7.8, -0.9],
+    // in front of the gateway, right of the harness base's shadow and left of the inference platters' shadow
+    [MACHINES.gateway.label, 1.3, 1.6],
     [`${MACHINES.router.label} · ${MACHINES.router.sublabel.replace(' · ', ' / ').toUpperCase()}`, -1, 7.0],
     [MACHINES.inference.label, 8.5, 7.1],
   ];
@@ -80,10 +82,10 @@ export function mountAnatomy(container, ui) {
 
   // ---- live stats -------------------------------------------------------------
   const stats = {
-    client: { facts: 0, questions: 0, 'last request': '—', 'last answer': '—' },
-    spaces: { objects: 0, 'last key': '—', bytes: 0, 'last PUT': '—' },
+    client: { facts: 0, questions: 0, deletes: 0, 'last request': '—', 'last answer': '—' },
+    spaces: { objects: 0, 'last key': '—', bytes: 0, 'last PUT': '—', deletes: 0 },
     functions: { invocations: 0, chunks: 0, embeddings: 0, 'last run': '—' },
-    vectordb: { rows: 0, inserts: 0, searches: 0, 'last hits': '—', 'top score': '—', 'last query': '—' },
+    vectordb: { rows: 0, inserts: 0, searches: 0, deletes: 0, 'last hits': '—', 'top score': '—', 'last query': '—' },
     router: { questions: 0, 'tool calls': 0, 'context chunks': 0, session: '—', 'first token': '—', 'last answer': '—', fallbacks: 0 },
     gateway: { 'tool calls': 0, searches: 0, documents: 0, errors: 0, 'last tool': '—', 'last latency': '—' },
     inference: { tokens: 0, model: '—', 'tok/s': '—', 'last generation': '—' },
@@ -157,6 +159,16 @@ export function mountAnatomy(container, ui) {
     job.stageStart.set(e.stage, e.ts);
     switch (e.stage) {
       case 'spaces': {
+        if (e.data?.op === 'delete') {
+          // the object(s) behind a deleted fact leave the bucket: open the drawer(s) that hold them
+          stats.spaces['last key'] = e.data.all ? `${(e.data.keys || []).length} objects` : e.data.key || '—';
+          enqueue(job, async () => {
+            setActivity('spaces', true);
+            if (e.data.all) for (let i = 0; i < 3; i++) machines.spaces.open(i);
+            else job.drawer = machines.spaces.open(machines.spaces.drawerFor(e.data.key));
+          });
+          break;
+        }
         if (e.data?.op === 'tool') {
           // get_document: the gateway reads an object back out of the bucket
           stats.spaces['last key'] = e.data?.args?.key || '—';
@@ -170,6 +182,7 @@ export function mountAnatomy(container, ui) {
         }
         stats.spaces['last key'] = e.data?.key || '—';
         stats.spaces.bytes += e.data?.bytes || 0;
+        job.key = e.data?.key || null;
         machines.client.type([0, 4, 8, 2, 6], 60);
         machines.client.screen(`> PUT ${job.input.slice(0, 20)}`, 'posting fact…', job.color);
         enqueue(job, async () => {
@@ -191,7 +204,14 @@ export function mountAnatomy(container, ui) {
         });
         break;
       case 'vectordb':
-        if (e.data?.op === 'tool') {
+        if (e.data?.op === 'delete') {
+          // rows behind a deleted fact: the scanner finds them, then they lift out (on `done`)
+          stats.vectordb.deletes++;
+          enqueue(job, async () => {
+            setActivity('vectordb', true);
+            machines.vectordb.startScan();
+          });
+        } else if (e.data?.op === 'tool') {
           // search_facts routed by the gateway
           stats.vectordb.searches++;
           stats.vectordb['last query'] = '…';
@@ -309,6 +329,23 @@ export function mountAnatomy(container, ui) {
     const latency = started != null ? e.ts - started : null;
     switch (e.stage) {
       case 'spaces':
+        if (e.data?.op === 'delete') {
+          const n = e.data.all ? e.data.removed || 0 : 1;
+          stats.spaces.deletes += n;
+          stats.spaces.objects = Math.max(0, stats.spaces.objects - n);
+          enqueue(job, async () => {
+            await wait(350);
+            if (e.data.all) machines.spaces.removeAll();
+            else machines.spaces.remove(e.data.key);
+            machines.spaces.trigger();
+            await wait(900);
+            if (e.data.all) for (let i = 0; i < 3; i++) machines.spaces.close(i);
+            else machines.spaces.close(job.drawer ?? 0);
+            setActivity('spaces', false);
+            machines.client.screen('> deleted', e.data.all ? `${n} objects removed` : (e.data.key || '').slice(-24), job.color);
+          });
+          break;
+        }
         if (e.data?.op === 'tool') {
           enqueue(job, async () => {
             await wait(400);
@@ -324,7 +361,7 @@ export function mountAnatomy(container, ui) {
         stats.spaces['last PUT'] = `${latencyMs(latency)} ms`;
         enqueue(job, async () => {
           await wait(250);
-          machines.spaces.file(job.drawer ?? 0, job.color);
+          machines.spaces.file(job.drawer ?? 0, job.color, job.key);
           machines.spaces.trigger();
           await wait(600);
           machines.spaces.close(job.drawer ?? 0);
@@ -341,6 +378,21 @@ export function mountAnatomy(container, ui) {
         break;
       case 'vectordb':
         if (e.data?.count !== undefined) stats.vectordb.rows = e.data.count;
+        if (e.data?.op === 'delete') {
+          const ids = e.data.ids || [];
+          const count = e.data.count;
+          enqueue(job, async () => {
+            await wait(700); // a visible sweep before the rows are found
+            machines.vectordb.stopScan();
+            machines.vectordb.hit(ids);
+            await wait(350);
+            machines.vectordb.remove(ids, count);
+            await wait(400);
+            setActivity('vectordb', false);
+            machines.client.screen('> deleted', `${ids.length} rows · ${count ?? '?'} left`, job.color);
+          });
+          break;
+        }
         if (e.data?.op === 'search' || e.data?.op === 'tool') {
           const viaTool = e.data.op === 'tool';
           const hits = e.data?.hits || [];
@@ -445,20 +497,33 @@ export function mountAnatomy(container, ui) {
           stats.vectordb.rows = e.data.pipeline.chunks;
           machines.vectordb.setCount(e.data.pipeline.chunks, '#4dff9a', false);
         }
+        refreshFacts({ sync: true });
         break;
       case 'job': {
         const job = getJob(e);
         if (e.status === 'start') {
           job.input = e.data?.input || '';
           if (e.flow === 'ingest') stats.client.facts++;
+          else if (e.flow === 'delete') stats.client.deletes++;
           else stats.client.questions++;
           stats.client['last request'] = job.input.slice(0, 50);
           if (e.flow === 'query') ui.answerReset(job.input);
+          if (e.flow === 'delete') {
+            // the delete request leaves the client for the data plane; the vectordb / spaces stages do the rest
+            machines.client.type([2, 6, 8], 60);
+            machines.client.screen(`> DEL ${e.data?.all ? 'all facts' : job.input.slice(-20)}`, 'deleting…', job.color);
+            enqueue(job, async () => {
+              setActivity('client', true);
+              await tracks.send('client-spaces', { color: job.color, lane: 1, count: 30 });
+              setActivity('client', false);
+            });
+          }
           machines.client.setLed(job.color);
           recentJobs = [{ flow: e.flow, input: job.input, color: job.color }, ...recentJobs].slice(0, 5);
           ui.setLegend(recentJobs);
         } else {
           job.finished = true;
+          if (e.flow === 'ingest' || e.flow === 'delete') refreshFacts();
           if (e.status === 'error') {
             ui.toast(`Pipeline error: ${e.data?.message || 'unknown'}`, 'err');
             for (const k of Object.keys(activity)) setActivity(k, false);
@@ -525,6 +590,21 @@ export function mountAnatomy(container, ui) {
         break;
     }
     ui.log(e, { latency: latency != null ? latencyMs(latency) : undefined });
+  }
+
+  /** GET /api/facts into the sidebar; with `sync`, slabs for facts not yet in the cabinet are filed instantly (page load) */
+  async function refreshFacts({ sync = false } = {}) {
+    try {
+      const r = await api('/facts');
+      const facts = r.facts || [];
+      ui.setFacts?.(facts);
+      stats.spaces.objects = facts.length;
+      if (sync) machines.spaces.sync(facts.map((f) => f.key));
+      return facts;
+    } catch (err) {
+      console.warn('facts', err);
+      return [];
+    }
   }
 
   async function refreshRecordings() {
@@ -601,6 +681,9 @@ export function mountAnatomy(container, ui) {
       }
     },
     refreshRecordings,
+    refreshFacts: () => refreshFacts(),
+    deleteFact: (id) => api(`/facts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    deleteAllFacts: () => api('/facts', { method: 'DELETE' }),
   };
 
   function dispose() {

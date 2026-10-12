@@ -99,7 +99,7 @@ export const PARTS = {
   'router.base': P('router.base', 'router', 'Harness session', 'A named, long-lived session (idle timeout 30 m). The first question wakes it; later ones reuse it. Permissions: deny everything except the two MCP tools.'),
 
   'gateway.selector': P('gateway.selector', 'gateway', 'Route selector', 'Swings to point at the machine a tool call is routed to: pgvector for search_facts, Spaces for get_document.'),
-  'gateway.ports': P('gateway.ports', 'gateway', 'Jack ports', 'One port per neighbour: harness (front), Spaces (left), pgvector (right). The lamp flashes when a packet passes through.'),
+  'gateway.ports': P('gateway.ports', 'gateway', 'Jack ports', 'One port per neighbour: harness (left-front), Spaces (left-back), pgvector (back). The lamp flashes when a packet passes through.'),
   'gateway.policy': P('gateway.policy', 'gateway', 'Permission policy', 'Default deny; allow rules for anatomy-data/search_facts and anatomy-data/get_document. The green lamps flash when a call is allowed.'),
   'gateway.base': P('gateway.base', 'gateway', 'MCP server', 'The anatomy-data MCP server (Streamable HTTP, bearer auth) behind the gateway. It embeds the query with the same embedder as ingest and reports each call to the app. The readout counts tool calls.'),
 

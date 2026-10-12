@@ -6,7 +6,7 @@
  */
 import { useSyncExternalStore } from 'react';
 
-export type Section = 'architecture' | 'logs' | 'config';
+export type Section = 'architecture' | 'facts' | 'logs' | 'config';
 export type Tone = '' | 'ok' | 'warn' | 'err';
 export type ConnState = 'connecting' | 'open' | 'reconnecting';
 
@@ -19,6 +19,15 @@ export interface LogEntry {
   latency?: number | string;
   replay: boolean;
   stale: boolean;
+}
+
+/** One stored fact: a Spaces object plus its pgvector rows (GET /api/facts). */
+export interface Fact {
+  id: string;
+  key: string;
+  text: string;
+  createdAt: number | null;
+  chunks: number;
 }
 
 export interface LegendJob {
@@ -75,6 +84,7 @@ export interface State {
   machineStats: Record<string, Stats>;
   recordings: Recording[];
   recorder: RecorderStatus;
+  facts: Fact[];
   health: Health | null;
   healthError: string | null;
   speed: number;
@@ -96,6 +106,7 @@ const initial: State = {
   machineStats: {},
   recordings: [],
   recorder: { recording: null, replaying: null },
+  facts: [],
   health: null,
   healthError: null,
   speed: 1,

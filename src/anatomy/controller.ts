@@ -11,6 +11,12 @@ export interface Actions {
   stopReplay(): Promise<void>;
   toggleRecord(): Promise<void>;
   refreshRecordings(): Promise<void>;
+  /** re-fetch GET /api/facts into the store */
+  refreshFacts(): Promise<unknown>;
+  /** DELETE /api/facts/:id (resolves with the server result; the scene animates from the SSE events) */
+  deleteFact(id: string): Promise<{ removed: number; total: number }>;
+  /** DELETE /api/facts */
+  deleteAllFacts(): Promise<{ facts: number; removed: number; total: number }>;
 }
 
 let current: Actions | null = null;

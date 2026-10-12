@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { chunkText } from './embedding.js';
 import { HarnessClient, harnessConfig, buildPrompt, buildToolPrompt, isDontKnow, normalizeToolName, toolTarget } from './harness.js';
 import { pgPoolConfig, embeddingConfig, embedTexts, toVector, cosineSearch } from './retrieval.js';
+import { factId, factKey, notFound } from './facts.js';
 
 export { pgPoolConfig };
 
@@ -189,6 +190,107 @@ export class RealPipeline {
     } catch (err) {
       ev.job('error', { message: err.message });
       throw Object.assign(err, { jobId, flow: 'ingest' });
+    }
+  }
+
+  // ---- facts: list / delete -------------------------------------------------
+  /** Re-read the row count after a change so the readout never drifts. */
+  async recount(pool) {
+    const r = await pool.query(`SELECT count(*)::int AS n FROM ${this.cfg.table}`);
+    this.count = r.rows[0].n;
+    return this.count;
+  }
+
+  /**
+   * Stored facts, newest first: one entry per Spaces object key, with the chunk
+   * texts re-joined in insertion order. Rows without an object_key (legacy)
+   * are not listed; "clear all" still removes them.
+   */
+  async listFacts() {
+    const pool = await this.db();
+    const r = await pool.query(
+      `SELECT object_key AS key, count(*)::int AS chunks, min(created_at) AS created_at, min(id)::int AS first_id, string_agg(chunk, ' ' ORDER BY id) AS text FROM ${this.cfg.table} WHERE object_key IS NOT NULL GROUP BY object_key ORDER BY min(id) DESC`
+    );
+    return r.rows.map((x) => ({
+      id: factId(x.key),
+      key: x.key,
+      text: x.text || '',
+      createdAt: x.created_at ? new Date(x.created_at).getTime() : null,
+      chunks: x.chunks,
+    }));
+  }
+
+  /** Delete one fact: its pgvector rows (`WHERE object_key = $1`), then the Spaces object. Emits a `delete` flow. */
+  async deleteFact(id) {
+    const key = factKey(id);
+    if (!key) throw notFound(id);
+    const pool = await this.db();
+    const found = await pool.query(`SELECT id FROM ${this.cfg.table} WHERE object_key = $1 ORDER BY id`, [key]);
+    if (!found.rows.length) throw notFound(id);
+    const ids = found.rows.map((r) => r.id);
+    const jobId = randomUUID();
+    const ev = this.bus.forJob(jobId, 'delete');
+    ev.job('start', { input: key, key, id: factId(key) });
+    try {
+      ev.stage('vectordb', 'start', `DELETE ${ids.length} row${ids.length === 1 ? '' : 's'} FROM ${this.cfg.table} WHERE object_key = ${key}`, { op: 'delete', key, ids });
+      const del = await pool.query(`DELETE FROM ${this.cfg.table} WHERE object_key = $1 RETURNING id`, [key]);
+      const removed = del.rows.map((r) => r.id);
+      await this.recount(pool);
+      ev.stage('vectordb', 'done', `Removed ${removed.length} row${removed.length === 1 ? '' : 's'}; table now holds ${this.count} chunks`, { op: 'delete', key, ids: removed, removed: removed.length, count: this.count });
+
+      ev.stage('spaces', 'start', `DELETE ${key} from ${this.cfg.spaces.bucket}`, { op: 'delete', key });
+      const { DeleteObjectCommand } = await import('@aws-sdk/client-s3');
+      const s3 = await this.s3();
+      await s3.send(new DeleteObjectCommand({ Bucket: this.cfg.spaces.bucket, Key: key }));
+      ev.stage('spaces', 'done', 'Object removed from Spaces', { op: 'delete', key });
+
+      const result = { jobId, id: factId(key), key, removed: removed.length, total: this.count };
+      ev.job('done', result);
+      return result;
+    } catch (err) {
+      ev.job('error', { message: err.message });
+      throw Object.assign(err, { jobId, flow: 'delete' });
+    }
+  }
+
+  /**
+   * Delete every fact: all rows of the table (those pointing at a known object
+   * plus legacy rows without a key), then every object those rows pointed at.
+   */
+  async deleteAllFacts() {
+    const pool = await this.db();
+    const keyRows = await pool.query(`SELECT DISTINCT object_key AS key FROM ${this.cfg.table} WHERE object_key IS NOT NULL ORDER BY object_key`);
+    const keys = keyRows.rows.map((r) => r.key);
+    const idRows = await pool.query(`SELECT id FROM ${this.cfg.table} ORDER BY id`);
+    const ids = idRows.rows.map((r) => r.id);
+    const jobId = randomUUID();
+    const ev = this.bus.forJob(jobId, 'delete');
+    ev.job('start', { input: `all facts (${keys.length})`, all: true, keys });
+    try {
+      ev.stage('vectordb', 'start', `DELETE all ${ids.length} row${ids.length === 1 ? '' : 's'} FROM ${this.cfg.table}`, { op: 'delete', all: true, keys, ids });
+      const del = await pool.query(`DELETE FROM ${this.cfg.table} WHERE object_key = ANY($1::text[]) OR object_key IS NULL RETURNING id`, [keys]);
+      const removed = del.rows.map((r) => r.id);
+      await this.recount(pool);
+      ev.stage('vectordb', 'done', `Removed ${removed.length} row${removed.length === 1 ? '' : 's'}; table now holds ${this.count} chunks`, { op: 'delete', all: true, keys, ids: removed, removed: removed.length, count: this.count });
+
+      ev.stage('spaces', 'start', `DELETE ${keys.length} object${keys.length === 1 ? '' : 's'} from ${this.cfg.spaces.bucket}`, { op: 'delete', all: true, keys });
+      if (keys.length) {
+        const { DeleteObjectsCommand } = await import('@aws-sdk/client-s3');
+        const s3 = await this.s3();
+        for (let i = 0; i < keys.length; i += 1000) {
+          const batch = keys.slice(i, i + 1000);
+          const out = await s3.send(new DeleteObjectsCommand({ Bucket: this.cfg.spaces.bucket, Delete: { Objects: batch.map((Key) => ({ Key })), Quiet: true } }));
+          if (out?.Errors?.length) throw new Error(`Spaces refused ${out.Errors.length} delete${out.Errors.length === 1 ? '' : 's'}: ${out.Errors[0].Key} ${out.Errors[0].Message || out.Errors[0].Code || ''}`.trim());
+        }
+      }
+      ev.stage('spaces', 'done', `${keys.length} object${keys.length === 1 ? '' : 's'} removed`, { op: 'delete', all: true, keys, removed: keys.length });
+
+      const result = { jobId, facts: keys.length, keys, removed: removed.length, total: this.count };
+      ev.job('done', result);
+      return result;
+    } catch (err) {
+      ev.job('error', { message: err.message });
+      throw Object.assign(err, { jobId, flow: 'delete' });
     }
   }
 
