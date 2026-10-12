@@ -1,13 +1,13 @@
 {
   "name": "sample-query",
-  "createdAt": "2026-10-12T15:42:07.712Z",
+  "createdAt": "2026-10-12T20:43:53.730Z",
   "events": [
     {
       "id": 14,
-      "ts": 1791819727712,
+      "ts": 1791837833730,
       "type": "job",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "status": "start",
       "data": {
         "input": "Which DigitalOcean database supports similarity search?"
@@ -16,56 +16,116 @@
     },
     {
       "id": 15,
-      "ts": 1791819727712,
+      "ts": 1791837833730,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
-      "stage": "kb",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
+      "stage": "agent",
       "status": "start",
-      "detail": "Knowledge Base received query",
+      "detail": "Harness Runtime (OpenCode, mock-llm) answering with tools (inline)",
       "data": {
-        "question": "Which DigitalOcean database supports similarity search?"
+        "via": "harness",
+        "toolsMode": "inline",
+        "model": "mock-llm",
+        "session": "mock-harness"
       },
       "t": 0
     },
     {
       "id": 16,
-      "ts": 1791819728114,
+      "ts": 1791837834081,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
-      "stage": "kb",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
+      "stage": "agent",
       "status": "progress",
-      "detail": "Query embedded (128 dims)",
+      "detail": "Harness session mock-harness ready",
       "data": {
-        "step": "embed"
+        "step": "session",
+        "created": false,
+        "via": "harness"
       },
-      "t": 402
+      "t": 351
     },
     {
       "id": 17,
-      "ts": 1791819728114,
-      "type": "stage",
+      "ts": 1791837834432,
+      "type": "tool",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
-      "stage": "vectordb",
-      "status": "start",
-      "detail": "Cosine similarity search, top 3",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "data": {
-        "op": "search"
+        "tool": "search_facts",
+        "phase": "start",
+        "args": {
+          "query": "Which DigitalOcean database supports similarity search?",
+          "k": 3
+        },
+        "target": "pgvector",
+        "callId": "6bb1f837-4040-4bf4-b88b-bddde13d3e44",
+        "source": "mcp"
       },
-      "t": 402
+      "t": 702
     },
     {
       "id": 18,
-      "ts": 1791819728615,
+      "ts": 1791837834432,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
+      "stage": "gateway",
+      "status": "start",
+      "detail": "TOOL search_facts(query=\"Which DigitalOcean database supports similarity search?\") → pgvector",
+      "data": {
+        "tool": "search_facts",
+        "callId": "6bb1f837-4040-4bf4-b88b-bddde13d3e44",
+        "args": {
+          "query": "Which DigitalOcean database supports similarity search?",
+          "k": 3
+        },
+        "op": "tool",
+        "target": "pgvector"
+      },
+      "t": 702
+    },
+    {
+      "id": 19,
+      "ts": 1791837834732,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
+      "stage": "vectordb",
+      "status": "start",
+      "detail": "search_facts via Action Gateway: cosine similarity search, top 3",
+      "data": {
+        "tool": "search_facts",
+        "callId": "6bb1f837-4040-4bf4-b88b-bddde13d3e44",
+        "args": {
+          "query": "Which DigitalOcean database supports similarity search?",
+          "k": 3
+        },
+        "op": "tool",
+        "target": "pgvector"
+      },
+      "t": 1002
+    },
+    {
+      "id": 20,
+      "ts": 1791837835234,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "vectordb",
       "status": "done",
-      "detail": "1 relevant chunk retrieved",
+      "detail": "search_facts: 1 hit · 502 ms",
       "data": {
+        "tool": "search_facts",
+        "callId": "6bb1f837-4040-4bf4-b88b-bddde13d3e44",
+        "args": {
+          "query": "Which DigitalOcean database supports similarity search?",
+          "k": 3
+        },
+        "op": "tool",
+        "target": "pgvector",
         "count": 1,
         "hits": [
           {
@@ -73,70 +133,82 @@
             "score": 0.421
           }
         ],
-        "op": "search"
+        "ms": 502
       },
-      "t": 903
-    },
-    {
-      "id": 19,
-      "ts": 1791819728816,
-      "type": "stage",
-      "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
-      "stage": "kb",
-      "status": "done",
-      "detail": "Context assembled from 1 chunk",
-      "data": {
-        "hits": 1
-      },
-      "t": 1104
-    },
-    {
-      "id": 20,
-      "ts": 1791819728816,
-      "type": "stage",
-      "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
-      "stage": "agent",
-      "status": "start",
-      "detail": "Agent composing grounded prompt",
-      "data": {
-        "contextChunks": 1
-      },
-      "t": 1104
+      "t": 1504
     },
     {
       "id": 21,
-      "ts": 1791819729317,
+      "ts": 1791837835234,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
-      "stage": "agent",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
+      "stage": "gateway",
       "status": "done",
-      "detail": "Prompt ready; calling serverless inference",
-      "data": {},
-      "t": 1605
+      "detail": "TOOL search_facts(query=\"Which DigitalOcean database supports similarity search?\") → pgvector · 1 hit · 502 ms",
+      "data": {
+        "tool": "search_facts",
+        "callId": "6bb1f837-4040-4bf4-b88b-bddde13d3e44",
+        "args": {
+          "query": "Which DigitalOcean database supports similarity search?",
+          "k": 3
+        },
+        "op": "tool",
+        "target": "pgvector",
+        "hits": [
+          {
+            "id": 1,
+            "score": 0.421
+          }
+        ],
+        "ms": 502
+      },
+      "t": 1504
     },
     {
       "id": 22,
-      "ts": 1791819729317,
-      "type": "stage",
+      "ts": 1791837835234,
+      "type": "tool",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
-      "stage": "inference",
-      "status": "start",
-      "detail": "Serverless inference generating",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "data": {
-        "model": "mock-llm"
+        "tool": "search_facts",
+        "phase": "done",
+        "args": {
+          "query": "Which DigitalOcean database supports similarity search?",
+          "k": 3
+        },
+        "target": "pgvector",
+        "callId": "6bb1f837-4040-4bf4-b88b-bddde13d3e44",
+        "ms": 502,
+        "summary": "1 hit",
+        "hits": 1,
+        "source": "mcp"
       },
-      "t": 1605
+      "t": 1504
     },
     {
       "id": 23,
-      "ts": 1791819729664,
+      "ts": 1791837835485,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
+      "stage": "inference",
+      "status": "start",
+      "detail": "Serverless inference via harness: mock-llm",
+      "data": {
+        "model": "mock-llm",
+        "via": "harness",
+        "toolsMode": "inline"
+      },
+      "t": 1755
+    },
+    {
+      "id": 24,
+      "ts": 1791837835832,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -145,14 +217,14 @@
         "index": 0,
         "total": 20
       },
-      "t": 1952
+      "t": 2102
     },
     {
-      "id": 24,
-      "ts": 1791819729710,
+      "id": 25,
+      "ts": 1791837835877,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -161,14 +233,14 @@
         "index": 1,
         "total": 20
       },
-      "t": 1998
+      "t": 2147
     },
     {
-      "id": 25,
-      "ts": 1791819729755,
+      "id": 26,
+      "ts": 1791837835923,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -177,14 +249,14 @@
         "index": 2,
         "total": 20
       },
-      "t": 2043
+      "t": 2193
     },
     {
-      "id": 26,
-      "ts": 1791819729800,
+      "id": 27,
+      "ts": 1791837835968,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -193,14 +265,14 @@
         "index": 3,
         "total": 20
       },
-      "t": 2088
+      "t": 2238
     },
     {
-      "id": 27,
-      "ts": 1791819729846,
+      "id": 28,
+      "ts": 1791837836014,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -209,14 +281,14 @@
         "index": 4,
         "total": 20
       },
-      "t": 2134
+      "t": 2284
     },
     {
-      "id": 28,
-      "ts": 1791819729892,
+      "id": 29,
+      "ts": 1791837836059,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -225,14 +297,14 @@
         "index": 5,
         "total": 20
       },
-      "t": 2180
+      "t": 2329
     },
     {
-      "id": 29,
-      "ts": 1791819729937,
+      "id": 30,
+      "ts": 1791837836105,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -241,14 +313,14 @@
         "index": 6,
         "total": 20
       },
-      "t": 2225
+      "t": 2375
     },
     {
-      "id": 30,
-      "ts": 1791819729983,
+      "id": 31,
+      "ts": 1791837836150,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -257,14 +329,14 @@
         "index": 7,
         "total": 20
       },
-      "t": 2271
+      "t": 2420
     },
     {
-      "id": 31,
-      "ts": 1791819730028,
+      "id": 32,
+      "ts": 1791837836196,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -273,14 +345,14 @@
         "index": 8,
         "total": 20
       },
-      "t": 2316
+      "t": 2466
     },
     {
-      "id": 32,
-      "ts": 1791819730074,
+      "id": 33,
+      "ts": 1791837836241,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -289,14 +361,14 @@
         "index": 9,
         "total": 20
       },
-      "t": 2362
+      "t": 2511
     },
     {
-      "id": 33,
-      "ts": 1791819730120,
+      "id": 34,
+      "ts": 1791837836287,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -305,14 +377,14 @@
         "index": 10,
         "total": 20
       },
-      "t": 2408
+      "t": 2557
     },
     {
-      "id": 34,
-      "ts": 1791819730165,
+      "id": 35,
+      "ts": 1791837836332,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -321,14 +393,14 @@
         "index": 11,
         "total": 20
       },
-      "t": 2453
+      "t": 2602
     },
     {
-      "id": 35,
-      "ts": 1791819730210,
+      "id": 36,
+      "ts": 1791837836378,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -337,14 +409,14 @@
         "index": 12,
         "total": 20
       },
-      "t": 2498
+      "t": 2648
     },
     {
-      "id": 36,
-      "ts": 1791819730256,
+      "id": 37,
+      "ts": 1791837836423,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -353,14 +425,14 @@
         "index": 13,
         "total": 20
       },
-      "t": 2544
+      "t": 2693
     },
     {
-      "id": 37,
-      "ts": 1791819730301,
+      "id": 38,
+      "ts": 1791837836468,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -369,14 +441,14 @@
         "index": 14,
         "total": 20
       },
-      "t": 2589
+      "t": 2738
     },
     {
-      "id": 38,
-      "ts": 1791819730347,
+      "id": 39,
+      "ts": 1791837836514,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -385,14 +457,14 @@
         "index": 15,
         "total": 20
       },
-      "t": 2635
+      "t": 2784
     },
     {
-      "id": 39,
-      "ts": 1791819730392,
+      "id": 40,
+      "ts": 1791837836559,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -401,14 +473,14 @@
         "index": 16,
         "total": 20
       },
-      "t": 2680
+      "t": 2829
     },
     {
-      "id": 40,
-      "ts": 1791819730437,
+      "id": 41,
+      "ts": 1791837836605,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -417,14 +489,14 @@
         "index": 17,
         "total": 20
       },
-      "t": 2725
+      "t": 2875
     },
     {
-      "id": 41,
-      "ts": 1791819730483,
+      "id": 42,
+      "ts": 1791837836650,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -433,14 +505,14 @@
         "index": 18,
         "total": 20
       },
-      "t": 2771
+      "t": 2920
     },
     {
-      "id": 42,
-      "ts": 1791819730528,
+      "id": 43,
+      "ts": 1791837836695,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "progress",
       "detail": "",
@@ -449,46 +521,69 @@
         "index": 19,
         "total": 20
       },
-      "t": 2816
+      "t": 2965
     },
     {
-      "id": 43,
-      "ts": 1791819730528,
+      "id": 44,
+      "ts": 1791837836695,
       "type": "stage",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "stage": "inference",
       "status": "done",
       "detail": "Generated 20 tokens",
       "data": {
-        "tokens": 20
+        "tokens": 20,
+        "via": "harness",
+        "firstTokenMs": 2102,
+        "totalMs": 2965,
+        "toolCalls": 1
       },
-      "t": 2816
+      "t": 2965
     },
     {
-      "id": 44,
-      "ts": 1791819730529,
+      "id": 45,
+      "ts": 1791837836695,
+      "type": "stage",
+      "flow": "query",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
+      "stage": "agent",
+      "status": "done",
+      "detail": "Harness answered (first token 2102 ms, total 2965 ms, 1 tool call)",
+      "data": {
+        "via": "harness",
+        "firstTokenMs": 2102,
+        "totalMs": 2965,
+        "toolCalls": 1,
+        "backend": "harness"
+      },
+      "t": 2965
+    },
+    {
+      "id": 46,
+      "ts": 1791837836695,
       "type": "answer",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "data": {
         "text": "Based on the knowledge base: DigitalOcean Spaces is S3-compatible object storage. Managed Postgres supports the pgvector extension for similarity search.",
         "sources": [
           {
             "id": 1,
             "chunk": "DigitalOcean Spaces is S3-compatible object storage. Managed Postgres supports the pgvector extension for similarity search.",
-            "score": 0.421
+            "score": 0.421,
+            "origin": "search_facts"
           }
         ]
       },
-      "t": 2817
+      "t": 2965
     },
     {
-      "id": 45,
-      "ts": 1791819730529,
+      "id": 47,
+      "ts": 1791837836695,
       "type": "job",
       "flow": "query",
-      "jobId": "b9b18c7d-e115-4e41-bbf0-a7e412ed07f2",
+      "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "status": "done",
       "data": {
         "answer": "Based on the knowledge base: DigitalOcean Spaces is S3-compatible object storage. Managed Postgres supports the pgvector extension for similarity search.",
@@ -496,11 +591,18 @@
           {
             "id": 1,
             "chunk": "DigitalOcean Spaces is S3-compatible object storage. Managed Postgres supports the pgvector extension for similarity search.",
-            "score": 0.421
+            "score": 0.421,
+            "origin": "search_facts"
           }
-        ]
+        ],
+        "timing": {
+          "firstTokenMs": 2102,
+          "totalMs": 2965,
+          "toolCalls": 1
+        },
+        "backend": "harness"
       },
-      "t": 2817
+      "t": 2965
     }
   ],
   "flow": "query"

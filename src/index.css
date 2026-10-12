@@ -49,6 +49,8 @@
   --color-stage-kb: var(--stage-kb);
   --color-stage-agent: var(--stage-agent);
   --color-stage-inference: var(--stage-inference);
+  --color-stage-gateway: var(--stage-gateway);
+  --color-stage-tool: var(--stage-gateway);
   --radius-sm: calc(var(--radius) * 0.6);
   --radius-md: calc(var(--radius) * 0.8);
   --radius-lg: var(--radius);
@@ -102,6 +104,7 @@
   --stage-kb: #b77bff;
   --stage-agent: #b77bff;
   --stage-inference: #ff4fd8;
+  --stage-gateway: #ffd166;
 }
 
 @layer base {

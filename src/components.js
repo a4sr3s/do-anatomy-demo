@@ -37,11 +37,21 @@ export const MACHINES = {
   },
   router: {
     key: 'router',
-    label: 'KNOWLEDGE BASE / MANAGED AGENT',
-    title: 'Knowledge Base / Managed Agent',
-    stage: 'kb',
-    desc: 'The GenAI Platform retrieval and orchestration layer. The Knowledge Base embeds the question and asks pgvector for the nearest chunks; the dial needle points at the chambers that were retrieved. The Managed Agent stacks that context into a grounded prompt and dispatches it to inference.',
+    label: 'HARNESS RUNTIME',
+    sublabel: 'OpenCode · gpt-oss-20b',
+    title: 'Harness Runtime',
+    stage: 'agent',
+    desc: 'A DigitalOcean Managed Agents session: an OpenCode harness in a hardware-isolated microVM with gpt-oss-20b served by Serverless Inference. It receives the question, decides to call the search_facts tool through the Action Gateway, and composes the grounded answer. The dial needle points at the pgvector chambers the tool returned; the tray lights one slot per retrieved chunk.',
     color: '#b77bff',
+  },
+  gateway: {
+    key: 'gateway',
+    label: 'ACTION GATEWAY',
+    sublabel: 'MCP · anatomy-data',
+    title: 'Action Gateway · MCP tools',
+    stage: 'gateway',
+    desc: 'The governed tool layer. The harness calls search_facts / get_document; the gateway checks the permission policy (allow lamps), routes the call to the anatomy-data MCP server and on to pgvector or Spaces (the selector swings to the target), and reports every call back to the app so you can watch it.',
+    color: '#ffd166',
   },
   inference: {
     key: 'inference',
@@ -54,7 +64,7 @@ export const MACHINES = {
 };
 
 /** stage name from an SSE event -> machine key */
-export const STAGE_MACHINE = { spaces: 'spaces', functions: 'functions', vectordb: 'vectordb', kb: 'router', agent: 'router', inference: 'inference' };
+export const STAGE_MACHINE = { spaces: 'spaces', functions: 'functions', vectordb: 'vectordb', kb: 'router', agent: 'router', gateway: 'gateway', inference: 'inference' };
 
 const P = (key, machine, title, desc) => ({ key, machine, title, desc, solids: [] });
 
@@ -82,11 +92,16 @@ export const PARTS = {
   'vectordb.plinth': P('vectordb.plinth', 'vectordb', 'Managed Postgres', 'The database engine. The readout shows the live row count.'),
   'vectordb.cube': P('vectordb.cube', 'vectordb', 'Vector row', 'One chunk and its 128-dim embedding. Flashes white when a search retrieves it.'),
 
-  'router.dial': P('router.dial', 'router', 'Retrieval dial', 'Knowledge Base. The needle sweeps while searching and settles pointing at the chamber of each retrieved chunk.'),
+  'router.dial': P('router.dial', 'router', 'Retrieval dial', 'The needle sweeps while the agent waits for a tool result and settles pointing at the chamber of each retrieved chunk.'),
   'router.needle': P('router.needle', 'router', 'Needle', 'Points physically at the retrieved chamber in the vector enclosure.'),
-  'router.knob': P('router.knob', 'router', 'Embedding knob', 'Turns one notch when the question is embedded.'),
-  'router.tray': P('router.tray', 'router', 'Prompt tray', 'Managed Agent. One slot lights per retrieved chunk; the prompt lamp comes on when the grounded prompt is ready.'),
-  'router.base': P('router.base', 'router', 'GenAI Platform', 'Knowledge Base + Managed Agent share one housing: retrieval on the left, orchestration on the right.'),
+  'router.knob': P('router.knob', 'router', 'Embedding knob', 'Turns one notch when a question is embedded app-side (fallback: context passed in the prompt).'),
+  'router.tray': P('router.tray', 'router', 'Context tray', 'One slot lights per chunk the tool returned; the lamp comes on when the agent has its grounded answer ready.'),
+  'router.base': P('router.base', 'router', 'Harness session', 'A named, long-lived session (idle timeout 30 m). The first question wakes it; later ones reuse it. Permissions: deny everything except the two MCP tools.'),
+
+  'gateway.selector': P('gateway.selector', 'gateway', 'Route selector', 'Swings to point at the machine a tool call is routed to: pgvector for search_facts, Spaces for get_document.'),
+  'gateway.ports': P('gateway.ports', 'gateway', 'Jack ports', 'One port per neighbour: harness (front), Spaces (left), pgvector (right). The lamp flashes when a packet passes through.'),
+  'gateway.policy': P('gateway.policy', 'gateway', 'Permission policy', 'Default deny; allow rules for anatomy-data/search_facts and anatomy-data/get_document. The green lamps flash when a call is allowed.'),
+  'gateway.base': P('gateway.base', 'gateway', 'MCP server', 'The anatomy-data MCP server (Streamable HTTP, bearer auth) behind the gateway. It embeds the query with the same embedder as ingest and reports each call to the app. The readout counts tool calls.'),
 
   'inference.platters': P('inference.platters', 'inference', 'Platters', 'Spin while the model generates. Track rings light in the job colour as tokens stream.'),
   'inference.arm': P('inference.arm', 'inference', 'Actuator arm', 'Seeks to a different track for every token.'),

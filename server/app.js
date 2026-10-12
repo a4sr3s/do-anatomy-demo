@@ -5,10 +5,12 @@ import { fileURLToPath } from 'node:url';
 import { EventBus } from './bus.js';
 import { Recorder } from './recorder.js';
 import { createPipeline } from './pipeline/index.js';
+import { tokenEquals } from './auth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
-const STAGE_ORDER = ['spaces', 'functions', 'vectordb', 'kb', 'agent', 'inference'];
+// v4: `agent` is the Harness Runtime, `gateway` the Action Gateway / MCP hop it uses to reach vectordb + spaces
+const STAGE_ORDER = ['spaces', 'functions', 'vectordb', 'kb', 'agent', 'gateway', 'inference'];
 const isNetworkError = (err) =>
   /ECONN|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|fetch failed|timeout|network|5\d\d|credentials missing|DATABASE_URL missing|_KEY missing/i.test(
     `${err?.code || ''} ${err?.message || ''}`
@@ -92,6 +94,17 @@ export async function createApp(options = {}) {
     const question = String(req.body?.question || '').trim();
     if (!question) return res.status(400).json({ ok: false, error: 'question is required' });
     return runWithFallback('query', () => pipeline.ask(question), res);
+  });
+
+  // ---- internal: tool calls reported by the MCP server ----------------------
+  // The mcp/ service POSTs here (TOOL_EVENT_URL) for every tool call; the event
+  // is attributed to the question job currently running in the harness.
+  const toolEventToken = env.MCP_AUTH_TOKEN || '';
+  app.post('/api/internal/tool-event', (req, res) => {
+    if (!tokenEquals(req.get('x-tool-event-token'), toolEventToken)) return res.status(401).json({ ok: false, error: 'unauthorized' });
+    if (typeof pipeline.handleToolEvent !== 'function') return res.status(202).json({ ok: true, accepted: false, reason: `no tool events in ${pipeline.mode} mode` });
+    const out = pipeline.handleToolEvent(req.body || {});
+    res.json({ ok: true, ...out });
   });
 
   // ---- recording / replay -------------------------------------------------

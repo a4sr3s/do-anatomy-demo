@@ -24,7 +24,11 @@ test('mock pipeline: submitting a fact then asking returns it, with stage events
   assert.equal(result.sources.length, 1);
 
   const stages = events.filter((e) => e.type === 'stage' && e.status === 'start').map((e) => e.stage);
-  assert.deepEqual(stages, ['spaces', 'functions', 'vectordb', 'kb', 'vectordb', 'agent', 'inference']);
+  // v4: the question goes to the Harness Runtime (agent), which searches pgvector through the Action Gateway (tool call)
+  assert.deepEqual(stages, ['spaces', 'functions', 'vectordb', 'agent', 'gateway', 'vectordb', 'inference']);
+  assert.ok(events.some((e) => e.type === 'tool' && e.data.tool === 'search_facts' && e.data.phase === 'done'));
+  assert.equal(result.timing.toolCalls, 1);
+  assert.equal(result.backend, 'harness');
   assert.ok(events.some((e) => e.type === 'stage' && e.stage === 'inference' && e.data?.token));
   assert.ok(events.some((e) => e.type === 'answer'));
 });
