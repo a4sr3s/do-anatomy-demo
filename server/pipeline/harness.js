@@ -34,6 +34,28 @@ export const TOOLS_MODES = ['inline', 'gateway', 'none'];
 /** Action Gateway slugs are `<serverRef>_<tool>`; the MCP server is registered as `anatomy-data`. */
 export const DEFAULT_GATEWAY_TOOLS = MCP_TOOLS.map((t) => `${MCP_SERVER_NAME}_${t}`);
 
+/**
+ * Bare MCP tool name from however the harness spells it: `do_actions_anatomy-data_search_facts`,
+ * `do.actions/anatomy-data/get_document`, `anatomy-data_search_facts`, … -> `search_facts`.
+ * Returns '' for falsy input or a run-event type (`run.tool_call_completed`) that carries no tool name.
+ */
+export function normalizeToolName(name) {
+  let n = String(name || '').trim();
+  if (!n || /^run\./.test(n)) return '';
+  let prev;
+  do {
+    prev = n;
+    n = n.replace(/^(do[._-]actions|do)[._/-]+/i, '').replace(new RegExp(`^${MCP_SERVER_NAME}[._/-]+`, 'i'), '');
+  } while (n !== prev);
+  return n;
+}
+
+/** Target the tool reaches: `search_facts` -> pgvector, `get_document` -> Spaces, anything else -> null. */
+export function toolTarget(name) {
+  const n = normalizeToolName(name);
+  return n === 'get_document' ? 'spaces' : n === 'search_facts' ? 'pgvector' : null;
+}
+
 export function harnessConfig(env) {
   const toolsMode = (env.HARNESS_TOOLS_MODE || 'gateway').toLowerCase();
   const gatewayTools = String(env.HARNESS_GATEWAY_TOOLS || '')

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { chunkText } from './embedding.js';
-import { HarnessClient, harnessConfig, buildPrompt, buildToolPrompt, isDontKnow } from './harness.js';
+import { HarnessClient, harnessConfig, buildPrompt, buildToolPrompt, isDontKnow, normalizeToolName, toolTarget } from './harness.js';
 import { pgPoolConfig, embeddingConfig, embedTexts, toVector, cosineSearch } from './retrieval.js';
 
 export { pgPoolConfig };
@@ -296,7 +296,7 @@ export class RealPipeline {
     const hooks = (label) => ({
       onSession: describe,
       onStarted: (ms) => ev.stage('agent', 'progress', `Harness run started (+${ms} ms)${label ? ` · ${label}` : ''}`, { step: 'run', ms, via: 'harness' }),
-      onToolEvent: (t) => ev.tool({ source: 'harness', phase: /complet|done|result|finish/i.test(t.type) ? 'done' : /fail|error/i.test(t.type) ? 'error' : 'start', tool: t.data?.tool || t.data?.name || t.type, args: t.data?.input || t.data?.args || undefined, summary: t.type, harnessType: t.type }),
+      onToolEvent: (t) => ev.tool(this.harnessToolEvent(run, t)),
       onToken,
     });
     const contextRun = async (detail, why) => {
@@ -352,6 +352,41 @@ export class RealPipeline {
     } finally {
       if (this.activeRun === run) this.activeRun = null;
     }
+  }
+
+  /**
+   * Shape a harness-side tool event (`run.tool_call*` on the session SSE stream)
+   * into the same `tool` payload the MCP server reports. Names arrive as gateway
+   * slugs (`do_actions_anatomy-data_search_facts`) and completion events often
+   * carry no name at all, so started calls are remembered on the run (by call id
+   * when present) and reused for the matching completed/failed event.
+   */
+  harnessToolEvent(run, t) {
+    const d = t.data || {};
+    const type = String(t.type || '');
+    const phase = /complet|done|result|finish/i.test(type) ? 'done' : /fail|error/i.test(type) ? 'error' : 'start';
+    const callId = d.call_id ?? d.callId ?? d.tool_call_id ?? d.id ?? undefined;
+    let tool = normalizeToolName(d.tool || d.name || d.tool_name);
+    let args = d.input || d.args || d.arguments;
+    if (args && typeof args !== 'object') args = undefined;
+    if (!run.harnessCalls) run.harnessCalls = [];
+    if (phase === 'start') {
+      run.harnessCalls.push({ callId, tool, args });
+    } else {
+      const idx = callId != null ? run.harnessCalls.findIndex((c) => c.callId === callId) : run.harnessCalls.length - 1;
+      const started = idx >= 0 ? run.harnessCalls.splice(idx, 1)[0] : null;
+      if (started) {
+        if (!tool) tool = started.tool;
+        if (!args) args = started.args;
+      }
+    }
+    const target = toolTarget(tool);
+    const slug = String(d.tool || d.name || d.tool_name || '') || undefined;
+    const err = phase === 'error' ? d.error || d.message : undefined;
+    const error = err == null ? undefined : typeof err === 'string' ? err : err.message || JSON.stringify(err);
+    const data = { source: 'harness', phase, tool: tool || type, args, callId, harnessType: type, slug, error };
+    if (target) data.target = target;
+    return data;
   }
 
   /**

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventBus } from '../server/bus.js';
 import { RealPipeline } from '../server/pipeline/real.js';
-import { MarkerFilter, HarnessClient, buildManifest, buildPrompt, buildToolPrompt, harnessConfig, manifestHash, isDontKnow } from '../server/pipeline/harness.js';
+import { MarkerFilter, HarnessClient, buildManifest, buildPrompt, buildToolPrompt, harnessConfig, manifestHash, isDontKnow, normalizeToolName, toolTarget } from '../server/pipeline/harness.js';
 
 const FACT = 'Acme Robotics runs 40 GPU droplets in SFO3.';
 const sseFrame = (e) => `id: x\nevent: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`;
@@ -390,10 +390,27 @@ test('harness: without a Managed Agent a pre-token failure surfaces as an error 
   }
 });
 
+test('harness: normalizeToolName strips gateway/MCP prefixes and toolTarget maps to pgvector/spaces', () => {
+  for (const n of ['do_actions_anatomy-data_search_facts', 'do.actions/anatomy-data/search_facts', 'do.actions/anatomy-data_search_facts', 'anatomy-data_search_facts', 'anatomy-data/search_facts', 'search_facts']) {
+    assert.equal(normalizeToolName(n), 'search_facts', n);
+    assert.equal(toolTarget(n), 'pgvector', n);
+  }
+  assert.equal(normalizeToolName('do_actions_anatomy-data_get_document'), 'get_document');
+  assert.equal(toolTarget('anatomy-data/get_document'), 'spaces');
+  assert.equal(normalizeToolName('run.tool_call_completed'), '', 'event types are not tool names');
+  assert.equal(normalizeToolName(undefined), '');
+  assert.equal(normalizeToolName('bash'), 'bash');
+  assert.equal(toolTarget('bash'), null);
+});
+
 test('harness: tool-call events in the harness SSE stream are forwarded as tool events with source harness', async () => {
   const extraEvents = [
-    { type: 'run.tool_call', data: { tool: 'anatomy-data_search_facts', input: { query: 'q' } } },
-    { type: 'run.tool_result', data: { tool: 'anatomy-data_search_facts' } },
+    { type: 'run.tool_call_started', data: { tool: 'do_actions_anatomy-data_search_facts', input: { query: 'q' }, call_id: 'c1' } },
+    { type: 'run.tool_call_completed', data: { call_id: 'c1' } },
+    { type: 'run.tool_call', data: { tool: 'do.actions/anatomy-data/get_document', input: { key: 'facts/1.txt' } } },
+    { type: 'run.tool_call', data: { name: 'anatomy-data_search_facts', args: { query: 'q2' } } },
+    { type: 'run.tool_call_completed', data: {} },
+    { type: 'run.tool_call_failed', data: { error: 'boom' } },
     { type: 'run.something_new', data: {} },
   ];
   const h = fakeHarness(['ANSWER: ok'], { extraEvents });
@@ -402,9 +419,19 @@ test('harness: tool-call events in the harness SSE stream are forwarded as tool 
   p.harness.log = { debug: (m) => debug.push(m) };
   try {
     await p.ask('q');
-    const tool = events.filter((e) => e.type === 'tool' && e.data.source === 'harness');
-    assert.deepEqual(tool.map((e) => e.data.phase), ['start', 'done']);
-    assert.equal(tool[0].data.tool, 'anatomy-data_search_facts');
+    const tool = events.filter((e) => e.type === 'tool' && e.data.source === 'harness').map((e) => e.data);
+    assert.deepEqual(tool.map((d) => d.phase), ['start', 'done', 'start', 'start', 'done', 'error']);
+    assert.deepEqual(tool.map((d) => d.tool), ['search_facts', 'search_facts', 'get_document', 'search_facts', 'search_facts', 'get_document']);
+    assert.deepEqual(tool.map((d) => d.target), ['pgvector', 'pgvector', 'spaces', 'pgvector', 'pgvector', 'spaces']);
+    // completed-by-id reuses the started call's args; completed-without-id reuses the most recent started call
+    assert.deepEqual(tool[1].args, { query: 'q' });
+    assert.equal(tool[1].callId, 'c1');
+    assert.deepEqual(tool[4].args, { query: 'q2' });
+    assert.deepEqual(tool[5].args, { key: 'facts/1.txt' });
+    assert.equal(tool[5].error, 'boom');
+    assert.equal(tool[0].slug, 'do_actions_anatomy-data_search_facts');
+    assert.equal(tool[1].harnessType, 'run.tool_call_completed');
+    assert.ok(tool.every((d) => d.summary === undefined), 'event types no longer leak into the log summary');
     assert.deepEqual(debug, ['[harness] unhandled event type run.something_new']);
     await p.ask('q');
     assert.equal(debug.length, 1, 'unknown types are logged once');
