@@ -31,9 +31,15 @@ export const MCP_SERVER_NAME = 'anatomy-data';
 export const MCP_TOOLS = ['search_facts', 'get_document'];
 export const MCP_SECRET_SLOT = 'ANATOMY_MCP_TOKEN';
 export const TOOLS_MODES = ['inline', 'gateway', 'none'];
+/** Action Gateway slugs are `<serverRef>_<tool>`; the MCP server is registered as `anatomy-data`. */
+export const DEFAULT_GATEWAY_TOOLS = MCP_TOOLS.map((t) => `${MCP_SERVER_NAME}_${t}`);
 
 export function harnessConfig(env) {
-  const toolsMode = (env.HARNESS_TOOLS_MODE || 'inline').toLowerCase();
+  const toolsMode = (env.HARNESS_TOOLS_MODE || 'gateway').toLowerCase();
+  const gatewayTools = String(env.HARNESS_GATEWAY_TOOLS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
   return {
     token: env.HARNESS_API_TOKEN || env.DIGITALOCEAN_ACCESS_TOKEN || '',
     inferenceKey: env.HARNESS_INFERENCE_API_KEY || '',
@@ -44,13 +50,10 @@ export function harnessConfig(env) {
     timeoutMs: Number(env.HARNESS_TIMEOUT_MS) || 90000,
     firstTokenTimeoutMs: Number(env.HARNESS_FIRST_TOKEN_TIMEOUT_MS) || 45000,
     apiUrl: (env.HARNESS_API_URL || API).replace(/\/$/, ''),
-    toolsMode: TOOLS_MODES.includes(toolsMode) ? toolsMode : 'inline',
+    toolsMode: TOOLS_MODES.includes(toolsMode) ? toolsMode : 'gateway',
     mcpUrl: (env.MCP_PUBLIC_URL || '').replace(/\/$/, ''),
     mcpToken: env.MCP_AUTH_TOKEN || '',
-    gatewayTools: String(env.HARNESS_GATEWAY_TOOLS || '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean),
+    gatewayTools: gatewayTools.length ? gatewayTools : DEFAULT_GATEWAY_TOOLS,
   };
 }
 
@@ -233,7 +236,6 @@ export class HarnessClient {
     if (!this.cfg.inferenceKey) throw new Error('HARNESS_INFERENCE_API_KEY missing');
     if (this.cfg.toolsMode === 'inline' && !this.cfg.mcpUrl) throw new Error('MCP_PUBLIC_URL missing (required with HARNESS_TOOLS_MODE=inline)');
     if (this.cfg.toolsMode === 'inline' && !this.cfg.mcpToken) throw new Error('MCP_AUTH_TOKEN missing (required with HARNESS_TOOLS_MODE=inline)');
-    if (this.cfg.toolsMode === 'gateway' && !this.cfg.gatewayTools.length) throw new Error('HARNESS_GATEWAY_TOOLS missing (required with HARNESS_TOOLS_MODE=gateway)');
     const res = await this.fetch(this.cfg.apiUrl, {
       method: 'POST',
       headers: this.headers({ 'content-type': 'application/x-yaml' }),

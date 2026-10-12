@@ -97,21 +97,25 @@ test('harness: MarkerFilter hides text before ANSWER: and falls back to raw text
   assert.equal(g.finish().text, 'plain answer');
 });
 
-test('harness: config defaults (v4 session name, inline tools, DIGITALOCEAN_ACCESS_TOKEN fallback)', () => {
-  const cfg = harnessConfig({ DIGITALOCEAN_ACCESS_TOKEN: 'dop', HARNESS_GATEWAY_TOOLS: 'anatomy-data_search_facts, anatomy-data_get_document' });
+test('harness: config defaults (v4 session name, gateway tools, DIGITALOCEAN_ACCESS_TOKEN fallback)', () => {
+  const cfg = harnessConfig({ DIGITALOCEAN_ACCESS_TOKEN: 'dop' });
   assert.equal(cfg.token, 'dop');
   assert.equal(harnessConfig({ HARNESS_API_TOKEN: 'h', DIGITALOCEAN_ACCESS_TOKEN: 'dop' }).token, 'h');
   assert.equal(cfg.sessionName, 'alexis-anatomy-harness-v4');
-  assert.equal(cfg.toolsMode, 'inline');
+  assert.equal(cfg.toolsMode, 'gateway');
   assert.equal(cfg.size, 'mars-1vcpu-1gb');
   assert.equal(cfg.idleTimeout, '30m');
   assert.equal(cfg.firstTokenTimeoutMs, 45000);
+  // HARNESS_GATEWAY_TOOLS unset / blank -> Action Gateway slugs <serverRef>_<tool> for the anatomy-data server
   assert.deepEqual(cfg.gatewayTools, ['anatomy-data_search_facts', 'anatomy-data_get_document']);
-  assert.equal(harnessConfig({ HARNESS_TOOLS_MODE: 'bogus' }).toolsMode, 'inline');
+  assert.deepEqual(harnessConfig({ HARNESS_GATEWAY_TOOLS: ' , ' }).gatewayTools, ['anatomy-data_search_facts', 'anatomy-data_get_document']);
+  assert.deepEqual(harnessConfig({ HARNESS_GATEWAY_TOOLS: 'custom_search_facts, custom_get_document' }).gatewayTools, ['custom_search_facts', 'custom_get_document']);
+  assert.equal(harnessConfig({ HARNESS_TOOLS_MODE: 'inline' }).toolsMode, 'inline');
+  assert.equal(harnessConfig({ HARNESS_TOOLS_MODE: 'bogus' }).toolsMode, 'gateway');
 });
 
 test('harness: inline manifest declares the anatomy-data MCP server, its secret slot and allow rules', () => {
-  const m = buildManifest(harnessConfig({ ...BASE_ENV }));
+  const m = buildManifest(harnessConfig({ ...BASE_ENV, HARNESS_TOOLS_MODE: 'inline' }));
   assert.match(m, /^name: alexis-anatomy-harness-v4$/m);
   assert.match(m, /^agent: opencode$/m);
   assert.match(m, /^size: mars-1vcpu-1gb$/m);
@@ -128,14 +132,15 @@ test('harness: inline manifest declares the anatomy-data MCP server, its secret 
   assert.doesNotMatch(m, /do\.actions/);
 });
 
-test('harness: gateway manifest selects do.actions tools with preload and allow rules, no MCP secret', () => {
-  const m = buildManifest(harnessConfig({ ...BASE_ENV, HARNESS_TOOLS_MODE: 'gateway', HARNESS_GATEWAY_TOOLS: 'anatomy-data_search_facts,anatomy-data_get_document' }));
+test('harness: gateway manifest (default mode, default slugs) selects do.actions tools with preload and allow rules, no MCP secret', () => {
+  const m = buildManifest(harnessConfig({ ...BASE_ENV }));
   assert.match(m, /^tools:\n  - do\.actions:\n      tools: \[anatomy-data_search_facts, anatomy-data_get_document\]\n      preload_tools: \[anatomy-data_search_facts, anatomy-data_get_document\]$/m);
   assert.match(m, /- tool: do\.actions\/anatomy-data_search_facts\n      action: allow/);
   assert.match(m, /- tool: do\.actions\/anatomy-data_get_document\n      action: allow/);
   assert.doesNotMatch(m, /ANATOMY_MCP_TOKEN/);
   assert.doesNotMatch(m, /name: anatomy-data/);
   assert.match(m, /^  tools-mode: gateway$/m);
+  assert.equal(m, buildManifest(harnessConfig({ ...BASE_ENV, HARNESS_TOOLS_MODE: 'gateway', HARNESS_GATEWAY_TOOLS: 'anatomy-data_search_facts,anatomy-data_get_document' })));
 });
 
 test('harness: none manifest has no tools and denies everything; hash differs per mode', () => {
@@ -145,7 +150,9 @@ test('harness: none manifest has no tools and denies everything; hash differs pe
   assert.match(none, /permissions:\n  default: deny\n$/);
   const h = (env) => manifestHash(harnessConfig({ ...BASE_ENV, ...env }));
   assert.notEqual(h({}), h({ HARNESS_TOOLS_MODE: 'none' }));
-  assert.notEqual(h({}), h({ MCP_PUBLIC_URL: 'https://other.example/mcp' }));
+  assert.notEqual(h({}), h({ HARNESS_TOOLS_MODE: 'inline' }));
+  assert.notEqual(h({}), h({ HARNESS_GATEWAY_TOOLS: 'other_search_facts' }));
+  assert.notEqual(h({ HARNESS_TOOLS_MODE: 'inline' }), h({ HARNESS_TOOLS_MODE: 'inline', MCP_PUBLIC_URL: 'https://other.example/mcp' }));
   assert.equal(h({}), h({ MCP_AUTH_TOKEN: 'different-secret', HARNESS_INFERENCE_API_KEY: 'other' }), 'secrets do not change the fingerprint');
 });
 
