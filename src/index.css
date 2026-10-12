@@ -1,0 +1,135 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-mono: ui-monospace, 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+  --font-sans: var(--font-mono);
+  --font-heading: var(--font-mono);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  /* scene palette (see src/kit.js) exposed as semantic tokens */
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+  --color-stage-spaces: var(--stage-spaces);
+  --color-stage-functions: var(--stage-functions);
+  --color-stage-vectordb: var(--stage-vectordb);
+  --color-stage-kb: var(--stage-kb);
+  --color-stage-agent: var(--stage-agent);
+  --color-stage-inference: var(--stage-inference);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/* The shell is always dark and matches the three.js scene (src/kit.js C.*). */
+:root,
+.dark {
+  --background: #111111;
+  --foreground: #cfd5dc;
+  --card: rgb(12 13 15 / 0.9);
+  --card-foreground: #cfd5dc;
+  --popover: #0c0d0f;
+  --popover-foreground: #cfd5dc;
+  --primary: #38e8ff;
+  --primary-foreground: #0b0c0f;
+  --secondary: #182024;
+  --secondary-foreground: #cfd5dc;
+  --muted: #16181c;
+  --muted-foreground: #6f7883;
+  --accent: #182024;
+  --accent-foreground: #38e8ff;
+  --destructive: #ff5d73;
+  --border: #24272c;
+  --input: #2a2e34;
+  --ring: #38e8ff;
+  --chart-1: #38e8ff;
+  --chart-2: #ffb347;
+  --chart-3: #4dff9a;
+  --chart-4: #b77bff;
+  --chart-5: #ff4fd8;
+  --radius: 0.375rem;
+  --sidebar: #0c0d0f;
+  --sidebar-foreground: #cfd5dc;
+  --sidebar-primary: #38e8ff;
+  --sidebar-primary-foreground: #0b0c0f;
+  --sidebar-accent: #182024;
+  --sidebar-accent-foreground: #38e8ff;
+  --sidebar-border: #24272c;
+  --sidebar-ring: #38e8ff;
+  --success: #4dff9a;
+  --warning: #ffb347;
+  --info: #5b8dff;
+  --stage-spaces: #38e8ff;
+  --stage-functions: #ffb347;
+  --stage-vectordb: #4dff9a;
+  --stage-kb: #b77bff;
+  --stage-agent: #b77bff;
+  --stage-inference: #ff4fd8;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html,
+  body,
+  #root {
+    @apply h-full overflow-hidden;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-mono;
+  }
+  /* three.js mount point: fill the scene container, no inline-canvas gap */
+  [data-slot="scene"] canvas {
+    @apply block;
+  }
+}
+
+@keyframes caret-blink {
+  50% { opacity: 0.35; }
+}
+.answer-caret::after {
+  content: '▍';
+  color: var(--primary);
+  animation: caret-blink 0.8s steps(2) infinite;
+}
