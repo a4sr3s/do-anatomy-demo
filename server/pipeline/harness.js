@@ -27,6 +27,8 @@ import { createHash } from 'node:crypto';
 
 const API = 'https://api.digitalocean.com/v2/agents/sessions';
 const MARKER = 'ANSWER:';
+/** Shared by both prompts: the session is long-lived, so earlier turns can describe facts that no longer exist. */
+const STALE_TURNS = 'Facts can be added or deleted at any time, so everything from earlier turns is stale and must never be used.';
 export const MCP_SERVER_NAME = 'anatomy-data';
 export const MCP_TOOLS = ['search_facts', 'get_document'];
 export const MCP_SECRET_SLOT = 'ANATOMY_MCP_TOKEN';
@@ -144,6 +146,7 @@ export function buildManifest(cfg, name = cfg.sessionName) {
 export function buildPrompt(question, context) {
   return [
     'You are the answering step of a retrieval pipeline. Ignore all earlier turns in this conversation and do not use any tools.',
+    `${STALE_TURNS} The context below is the only source of truth for this turn.`,
     'Answer the question using ONLY the context below. If the context is empty or does not contain the answer, say that you do not know that yet.',
     `Reply with a single line that starts with "${MARKER}" followed by a concise answer (one or two sentences).`,
     '',
@@ -160,9 +163,10 @@ export function buildToolPrompt(question, { gateway = false } = {}) {
   const doc = gateway ? 'get_document' : `${MCP_SERVER_NAME}/get_document`;
   return [
     'You are the answering step of a retrieval pipeline. Ignore all earlier turns in this conversation.',
-    `First call ${search} with the question below as the query (k=3). Call ${doc} only if a hit is truncated and you need its full text.`,
+    `${STALE_TURNS} Never answer from memory or from an earlier turn, even if the same question was asked before.`,
+    `You MUST call ${search} in this turn, with the question below as the query (k=3), before answering. Call ${doc} only if a hit is truncated and you need its full text.`,
     'Do not use any other tool, do not run commands, do not read or write files, do not browse.',
-    'Answer ONLY from the tool results. If the results are empty or do not contain the answer, say that you do not know that yet.',
+    "Answer ONLY from this turn's tool results. If this turn's results are empty or do not contain the answer, say that you do not know that yet.",
     `After the tool calls, reply with a single final line that starts with "${MARKER}" followed by a concise answer (one or two sentences).`,
     '',
     `Question: ${question}`,

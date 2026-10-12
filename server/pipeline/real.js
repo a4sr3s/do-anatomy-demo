@@ -29,8 +29,12 @@ export function fmtArgs(args = {}) {
  *   which lands in handleToolEvent() below and is attributed to the active
  *   question job so the scene can animate it.
  * Fallback 1: tool path unavailable (MCP health check fails, HARNESS_TOOLS_MODE=none,
- *   or the agent answered "don't know" without any tool result): the app
- *   retrieves itself and passes the context in the prompt.
+ *   the agent answered without calling any tool, or it answered "don't know"
+ *   without any usable tool result): the app retrieves itself and passes the
+ *   context in the prompt. The session keeps its history, so an answer without a
+ *   tool call is treated as ungrounded (it may describe a fact deleted since) and
+ *   is never shown: on the tool path answer tokens are held back until a tool
+ *   call has been observed.
  * Fallback 2: the harness fails before producing anything: the old Managed
  *   Agent path (DO_AGENT_ENDPOINT) answers with app-side retrieval.
  */
@@ -300,7 +304,7 @@ export class RealPipeline {
    * Runtime agent retrieves through the MCP tools itself (see class docs);
    * the legacy backends retrieve from pgvector first and then generate via the
    * Managed Agent (DO_AGENT_ENDPOINT) or Serverless Inference (DO_INFERENCE_KEY).
-   * Resolves { jobId, answer, sources, timing: {firstTokenMs, totalMs, toolCalls}, backend, fallback? }.
+   * Resolves { jobId, answer, sources, timing: {firstTokenMs, totalMs, toolCalls}, backend, fallback?, reason? }.
    */
   async ask(question) {
     const jobId = randomUUID();
@@ -348,7 +352,7 @@ export class RealPipeline {
 
       const { answer, sources } = result;
       ev.answer(answer, sources);
-      ev.job('done', { answer, sources, timing: result.timing, backend: result.backend, fallback: result.fallback });
+      ev.job('done', { answer, sources, timing: result.timing, backend: result.backend, fallback: result.fallback, reason: result.reason });
       return { jobId, ...result };
     } catch (err) {
       ev.job('error', { message: err.message });
@@ -379,64 +383,98 @@ export class RealPipeline {
    */
   async askViaHarness(question, ev, jobId, t0) {
     const h = this.cfg.harness;
-    const run = { jobId, ev, toolCalls: 0, toolDone: 0, toolErrors: 0, hits: [], seen: new Set() };
+    const run = { jobId, ev, toolCalls: 0, toolDone: 0, toolErrors: 0, harnessToolEvents: 0, hits: [], seen: new Set() };
     this.activeRun = run;
     let firstTokenMs = null;
     let streamed = 0;
-    const onToken = (token, index) => {
+    // A tool call "observed" for this run: reported by the MCP server (primary) or seen on the harness SSE stream.
+    const toolSeen = () => run.toolCalls > 0 || run.harnessToolEvents > 0;
+    // Tool path: the warm session keeps its conversation history, so an answer produced without any tool
+    // call may be a stale earlier turn (e.g. a fact deleted since). Answer tokens are held back until a
+    // tool call has been seen; if the run completes without one, the held answer is discarded unseen.
+    const gate = { enabled: false, held: [] };
+    const forward = (token, index) => {
       if (firstTokenMs == null) firstTokenMs = Date.now() - t0;
       streamed++;
       ev.stage('inference', 'progress', '', { token, index });
+    };
+    const flushHeld = () => {
+      const held = gate.held.splice(0);
+      for (const [token, index] of held) forward(token, index);
+    };
+    const onToken = (token, index) => {
+      if (gate.enabled && !toolSeen()) { gate.held.push([token, index]); return; }
+      if (gate.held.length) flushHeld();
+      forward(token, index);
     };
     const timing = () => ({ firstTokenMs, totalMs: Date.now() - t0, toolCalls: run.toolCalls });
     let sources = [];
     let answer = '';
     let backend = 'harness';
     let fallback = null;
+    let reason = null;
     let harnessOut = null;
     const describe = (s) => ev.stage('agent', 'progress', s.created ? `Harness session ${s.name} created (manifest ${s.hash})` : `Harness session ${s.name} ready${s.stale ? ' (base session has a stale manifest)' : ''}`, { step: 'session', created: s.created, name: s.name, via: 'harness', toolsMode: s.toolsMode, hash: s.hash });
     const hooks = (label) => ({
       onSession: describe,
       onStarted: (ms) => ev.stage('agent', 'progress', `Harness run started (+${ms} ms)${label ? ` · ${label}` : ''}`, { step: 'run', ms, via: 'harness' }),
-      onToolEvent: (t) => ev.tool(this.harnessToolEvent(run, t)),
+      onToolEvent: (t) => { run.harnessToolEvents++; ev.tool(this.harnessToolEvent(run, t)); },
       onToken,
     });
-    const contextRun = async (detail, why) => {
+    const contextRun = async (detail, why, because) => {
       // FALLBACK 1: the app retrieves itself and passes the context in the prompt
+      gate.enabled = false;
+      gate.held.length = 0;
       sources = await this.retrieve(question, ev);
       const context = sources.map((s, i) => `[${i + 1}] ${s.chunk}`).join('\n');
       ev.stage('inference', 'start', `Serverless inference via harness: ${h.model}`, { model: h.model, via: 'harness', toolsMode: 'none' });
       harnessOut = await this.harness.ask(buildPrompt(question, context), hooks(detail));
       answer = harnessOut.text;
       fallback = why;
+      reason = because || null;
     };
 
     try {
       try {
         let toolPath = h.toolsMode !== 'none';
-        let reason = h.toolsMode === 'none' ? 'HARNESS_TOOLS_MODE=none' : '';
+        let unavailable = h.toolsMode === 'none' ? 'HARNESS_TOOLS_MODE=none' : '';
         if (toolPath) {
           const health = await this.mcpHealthy();
-          if (!health.ok) { toolPath = false; reason = health.reason; }
+          if (!health.ok) { toolPath = false; unavailable = health.reason; }
         }
         if (toolPath) {
           ev.stage('agent', 'start', `Harness Runtime (OpenCode, ${h.model}) answering with tools (${h.toolsMode})`, { via: 'harness', session: h.sessionName, toolsMode: h.toolsMode, model: h.model });
           ev.stage('inference', 'start', `Serverless inference via harness: ${h.model}`, { model: h.model, via: 'harness', toolsMode: h.toolsMode });
+          gate.enabled = true;
           harnessOut = await this.harness.ask(buildToolPrompt(question, { gateway: h.toolsMode === 'gateway' }), hooks('tool path'));
           answer = harnessOut.text;
           sources = run.hits.slice();
-          if ((run.toolDone === 0 || run.toolErrors > 0) && isDontKnow(answer)) {
-            // the agent never got a usable tool result: retry once with context in the prompt
-            ev.stage('agent', 'progress', `No usable tool result (${run.toolDone} done, ${run.toolErrors} failed); retrying with context passed in prompt`, { fallback: 'context', via: 'harness' });
-            await contextRun('context retry', 'context-retry');
+          if (!toolSeen()) {
+            // GUARD: no tool call at all -> the answer is ungrounded (likely recalled from an earlier turn,
+            // possibly about a fact that has since been deleted). Discard it and re-ask with fresh context.
+            const held = gate.held.length;
+            gate.held.length = 0;
+            const what = streamed > 0 ? 'the ungrounded answer already streamed was discarded; the final answer replaces it' : `ungrounded answer discarded unseen (${held} held token${held === 1 ? '' : 's'})`;
+            ev.stage('agent', 'progress', `Harness answered without calling any tool: ${what}; re-asking with context passed in prompt`, { fallback: 'context', reason: 'no tool call', discarded: true, streamed, held, via: 'harness' });
+            answer = '';
+            sources = [];
+            await contextRun('context (no tool call)', 'context', 'no tool call');
+          } else {
+            if (gate.held.length) flushHeld();
+            gate.enabled = false;
+            if ((run.toolDone === 0 || run.toolErrors > 0) && isDontKnow(answer)) {
+              // the agent never got a usable tool result: retry once with context in the prompt
+              ev.stage('agent', 'progress', `No usable tool result (${run.toolDone} done, ${run.toolErrors} failed); retrying with context passed in prompt`, { fallback: 'context', via: 'harness' });
+              await contextRun('context retry', 'context-retry');
+            }
           }
         } else {
-          ev.stage('agent', 'start', `Harness Runtime (OpenCode, ${h.model}) answering · Tool path unavailable, context passed in prompt (${reason})`, { via: 'harness', session: h.sessionName, toolsMode: 'none', model: h.model, fallback: 'context', reason });
-          await contextRun('context in prompt', 'context');
+          ev.stage('agent', 'start', `Harness Runtime (OpenCode, ${h.model}) answering · Tool path unavailable, context passed in prompt (${unavailable})`, { via: 'harness', session: h.sessionName, toolsMode: 'none', model: h.model, fallback: 'context', reason: unavailable });
+          await contextRun('context in prompt', 'context', unavailable);
         }
         const t = timing();
         ev.stage('inference', 'done', 'Completed', { model: harnessOut.model || h.model, tokens: harnessOut.tokens, via: 'harness', ...t });
-        ev.stage('agent', 'done', `Harness answered (first token ${t.firstTokenMs ?? '—'} ms, total ${t.totalMs} ms, ${t.toolCalls} tool call${t.toolCalls === 1 ? '' : 's'})`, { via: 'harness', ...t, runId: harnessOut.runId, backend, fallback });
+        ev.stage('agent', 'done', `Harness answered (first token ${t.firstTokenMs ?? '—'} ms, total ${t.totalMs} ms, ${t.toolCalls} tool call${t.toolCalls === 1 ? '' : 's'})`, { via: 'harness', ...t, runId: harnessOut.runId, backend, fallback, reason });
       } catch (err) {
         // FALLBACK 2: the harness failed before producing anything -> old Managed Agent path
         if (streamed > 0 || err.beforeFirstToken === false || !this.cfg.agent.endpoint || !this.cfg.agent.key) throw err;
@@ -448,9 +486,10 @@ export class RealPipeline {
         answer = await this.askAgent(question, context, guidance, sources, ev, onToken);
         backend = 'agent';
         fallback = 'agent';
+        reason = err.message;
       }
       if (!answer) answer = DONT_KNOW_TEXT;
-      return { answer, sources, backend, timing: timing(), fallback };
+      return { answer, sources, backend, timing: timing(), fallback, reason };
     } finally {
       if (this.activeRun === run) this.activeRun = null;
     }

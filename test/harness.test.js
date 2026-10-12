@@ -158,15 +158,22 @@ test('harness: none manifest has no tools and denies everything; hash differs pe
 
 test('harness: prompts', () => {
   const tp = buildToolPrompt('Where does Acme run?');
-  assert.match(tp, /call anatomy-data\/search_facts/);
+  assert.match(tp, /MUST call anatomy-data\/search_facts in this turn/);
   assert.match(tp, /get_document only if/);
   assert.match(tp, /Do not use any other tool/);
-  assert.match(tp, /ONLY from the tool results/);
+  assert.match(tp, /ONLY from this turn's tool results/);
   assert.match(tp, /do not know that yet/);
   assert.match(tp, /starts with "ANSWER:"/);
   assert.match(tp, /Question: Where does Acme run\?$/);
-  assert.match(buildToolPrompt('q', { gateway: true }), /the search_facts tool/);
+  assert.match(buildToolPrompt('q', { gateway: true }), /MUST call the search_facts tool in this turn/);
   assert.match(buildPrompt('q', '[1] ctx'), /do not use any tools[\s\S]*Context:\n\[1\] ctx/);
+  // the session keeps its history: both prompts must declare earlier turns stale (facts come and go)
+  for (const prompt of [tp, buildToolPrompt('q', { gateway: true }), buildPrompt('q', '[1] ctx')]) {
+    assert.match(prompt, /Facts can be added or deleted at any time/);
+    assert.match(prompt, /earlier turns is stale and must never be used/);
+  }
+  assert.match(tp, /Never answer from memory or from an earlier turn/);
+  assert.match(buildPrompt('q', ''), /context below is the only source of truth for this turn/);
   assert.ok(isDontKnow("I don't know that yet."));
   assert.ok(isDontKnow('No relevant facts were found.'));
   assert.ok(isDontKnow(''));
@@ -289,11 +296,20 @@ test('harness: HARNESS_TOOLS_MODE=none never checks MCP and passes context in th
   }
 });
 
-test('harness: "don\'t know" with zero tool results is retried once with context in the prompt', async () => {
+test('harness: "don\'t know" with a failed tool call (no usable result) is retried once with context in the prompt', async () => {
   const prompts = [];
   let n = 0;
-  const h = fakeHarness([], { onInput: (t) => prompts.push(t) });
-  // first run: no tool events, don't-know answer; second run: grounded answer
+  let pipeline;
+  const h = fakeHarness([], {
+    onInput: (t) => {
+      prompts.push(t);
+      // first run: the tool is called but fails, don't-know answer; second run (context in prompt): grounded answer
+      if (prompts.length === 1) {
+        pipeline.handleToolEvent({ phase: 'start', callId: 'c1', tool: 'search_facts', args: { query: 'How many droplets?' }, target: 'pgvector' });
+        pipeline.handleToolEvent({ phase: 'error', callId: 'c1', tool: 'search_facts', args: { query: 'How many droplets?' }, target: 'pgvector', error: 'pg down' });
+      }
+    },
+  });
   const base = h.impl;
   h.impl = async (url, init) => {
     if (String(url).endsWith('/events')) {
@@ -305,28 +321,114 @@ test('harness: "don\'t know" with zero tool results is retried once with context
     return base(url, init);
   };
   const { p, events, restore } = setup(BASE_ENV, h);
+  pipeline = p;
   try {
     const out = await p.ask('How many droplets?');
     assert.equal(out.answer, '40 droplets.');
     assert.equal(out.fallback, 'context-retry');
+    assert.equal(out.timing.toolCalls, 1);
     assert.equal(prompts.length, 2);
     assert.match(prompts[0], /search_facts/);
     assert.match(prompts[1], /Context:\n\[1\] Acme Robotics/);
     assert.ok(events.some((e) => e.stage === 'agent' && e.status === 'progress' && /retrying with context passed in prompt/.test(e.detail)));
-    assert.deepEqual(starts(events), ['agent', 'inference', 'kb', 'vectordb', 'inference']);
-    assert.equal(tokensOf(events), "I don't know that yet.40 droplets.", 'the first (empty-handed) answer streamed too; the UI replaces it with the final answer');
+    assert.deepEqual(starts(events), ['agent', 'inference', 'gateway', 'vectordb', 'kb', 'vectordb', 'inference']);
+    assert.equal(tokensOf(events), "I don't know that yet.40 droplets.", 'a tool call was seen, so the first (empty-handed) answer streamed too; the UI replaces it with the final answer');
   } finally {
     restore();
   }
 });
 
-test('harness: a successful tool run with a confident answer is not retried even without tool events', async () => {
-  const h = fakeHarness(['ANSWER: Acme runs 40 GPU droplets in SFO3.']);
-  const { p, restore } = setup(BASE_ENV, h);
+test('harness: an answer produced with zero tool calls is discarded unseen and re-asked with context (stale-history guard)', async () => {
+  // The warm session remembers earlier turns: after a fact is deleted the agent can answer confidently
+  // from history without calling search_facts. That answer must never reach the audience.
+  const prompts = [];
+  let n = 0;
+  const h = fakeHarness([], { onInput: (t) => prompts.push(t) });
+  const base = h.impl;
+  h.impl = async (url, init) => {
+    if (String(url).endsWith('/events')) {
+      n++;
+      const text = n === 1 ? 'Recalling... ANSWER: Acme runs 40 GPU droplets in SFO3.' : "ANSWER: I don't know that yet.";
+      const evs = [{ type: 'run.started', run_id: 'run-1', data: {} }, { type: 'run.token_delta', run_id: 'run-1', data: { text, is_reasoning: false } }, { type: 'run.completed', run_id: 'run-1', data: {} }];
+      return new Response(evs.map(sseFrame).join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    }
+    return base(url, init);
+  };
+  const { p, events, restore } = setup(BASE_ENV, h);
+  try {
+    const out = await p.ask('How many droplets does Acme run?');
+    assert.equal(out.answer, "I don't know that yet.", 'the final answer comes from the context run, not from history');
+    assert.equal(out.fallback, 'context');
+    assert.equal(out.reason, 'no tool call');
+    assert.equal(out.backend, 'harness');
+    assert.equal(out.timing.toolCalls, 0);
+    assert.deepEqual(out.sources.map((s) => s.id), [7], 'sources are the app-side retrieval of the context run');
+    assert.equal(prompts.length, 2);
+    assert.match(prompts[0], /MUST call .*search_facts/);
+    assert.match(prompts[1], /Context:\n\[1\] Acme Robotics/);
+    assert.equal(tokensOf(events), "I don't know that yet.", 'the ungrounded answer was never streamed');
+    assert.ok(!events.some((e) => e.type === 'stage' && e.data?.token !== undefined && /40 GPU/.test(e.data.token)));
+    const discard = events.find((e) => e.stage === 'agent' && e.status === 'progress' && e.data.discarded);
+    assert.ok(discard, 'a stage event explains the discard');
+    assert.match(discard.detail, /without calling any tool: ungrounded answer discarded unseen \(1 held token\); re-asking with context passed in prompt/);
+    assert.equal(discard.data.fallback, 'context');
+    assert.equal(discard.data.reason, 'no tool call');
+    assert.equal(discard.data.streamed, 0);
+    assert.deepEqual(starts(events), ['agent', 'inference', 'kb', 'vectordb', 'inference']);
+    const agentDone = events.find((e) => e.stage === 'agent' && e.status === 'done');
+    assert.equal(agentDone.data.fallback, 'context');
+    assert.equal(agentDone.data.reason, 'no tool call');
+    const job = events.at(-1);
+    assert.equal(job.type, 'job');
+    assert.equal(job.status, 'done');
+    assert.equal(job.data.fallback, 'context');
+    assert.equal(job.data.reason, 'no tool call');
+    const ans = events.find((e) => e.type === 'answer');
+    assert.equal(ans.data.text, "I don't know that yet.");
+  } finally {
+    restore();
+  }
+});
+
+test('harness: tool path holds answer tokens until a tool call is observed, then streams them in order', async () => {
+  let pipeline;
+  let tokensBeforeTool = -1;
+  const h = fakeHarness([]);
+  const base = h.impl;
+  h.impl = async (url, init) => {
+    if (String(url).endsWith('/events')) {
+      // tokens arrive BEFORE the MCP server's report of the tool call (webhook latency), then more after it
+      const frames = (evs) => new TextEncoder().encode(evs.map((e) => sseFrame({ ...e, run_id: 'run-1' })).join(''));
+      const body = new ReadableStream({
+        async start(ctrl) {
+          ctrl.enqueue(frames([{ type: 'run.started', data: {} }, { type: 'run.token_delta', data: { text: 'ANSWER: Acme', is_reasoning: false } }, { type: 'run.token_delta', data: { text: ' runs', is_reasoning: false } }]));
+          await new Promise((r) => setTimeout(r, 20));
+          tokensBeforeTool = tokensOf(pipelineEvents).length;
+          pipeline.handleToolEvent({ phase: 'start', callId: 'c1', tool: 'search_facts', args: { query: 'q' }, target: 'pgvector' });
+          pipeline.handleToolEvent({ phase: 'done', callId: 'c1', tool: 'search_facts', args: { query: 'q' }, target: 'pgvector', summary: '1 hit', hits: [{ id: 7, score: 0.9, chunk: FACT, object_key: 'facts/1.txt' }] });
+          ctrl.enqueue(frames([{ type: 'run.token_delta', data: { text: ' 40 GPU droplets.', is_reasoning: false } }, { type: 'run.completed', data: { total_tokens_in: 1, total_tokens_out: 3 } }]));
+          ctrl.close();
+        },
+      });
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    }
+    return base(url, init);
+  };
+  const { p, events, restore } = setup(BASE_ENV, h);
+  const pipelineEvents = events;
+  pipeline = p;
   try {
     const out = await p.ask('q');
+    assert.equal(tokensBeforeTool, 0, 'nothing streamed before the tool call was seen');
+    assert.equal(out.answer, 'Acme runs 40 GPU droplets.');
     assert.equal(out.fallback, null);
-    assert.deepEqual(out.sources, []);
+    assert.equal(out.timing.toolCalls, 1);
+    assert.deepEqual(out.sources.map((s) => s.id), [7]);
+    const toks = events.filter((e) => e.type === 'stage' && e.stage === 'inference' && e.status === 'progress');
+    assert.deepEqual(toks.map((e) => e.data.token), ['Acme', ' runs', ' 40 GPU droplets.']);
+    assert.deepEqual(toks.map((e) => e.data.index), [0, 1, 2]);
+    assert.ok(typeof out.timing.firstTokenMs === 'number' && out.timing.firstTokenMs >= 0);
+    assert.ok(!events.some((e) => e.data?.discarded));
   } finally {
     restore();
   }
@@ -418,7 +520,10 @@ test('harness: tool-call events in the harness SSE stream are forwarded as tool 
   const debug = [];
   p.harness.log = { debug: (m) => debug.push(m) };
   try {
-    await p.ask('q');
+    const out = await p.ask('q');
+    assert.equal(out.fallback, null, 'tool calls seen on the harness stream count as observed: no stale-history discard');
+    assert.equal(out.answer, 'ok');
+    assert.equal(tokensOf(events), 'ok');
     const tool = events.filter((e) => e.type === 'tool' && e.data.source === 'harness').map((e) => e.data);
     assert.deepEqual(tool.map((d) => d.phase), ['start', 'done', 'start', 'start', 'done', 'error']);
     assert.deepEqual(tool.map((d) => d.tool), ['search_facts', 'search_facts', 'get_document', 'search_facts', 'search_facts', 'get_document']);
