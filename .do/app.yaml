@@ -45,6 +45,11 @@ services:
       - key: DATABASE_URL
         value: ""
         type: SECRET
+      # Optional: Managed Postgres CA certificate (PEM, "\n" for newlines) so the
+      # TLS chain is verified. Leave empty to connect without chain verification.
+      - key: DATABASE_CA_CERT
+        value: ""
+        type: SECRET
       - key: DO_INFERENCE_URL
         value: https://inference.do-ai.run/v1
       # Model Access Key (control panel only). Optional when DO_AGENT_ENDPOINT is set.

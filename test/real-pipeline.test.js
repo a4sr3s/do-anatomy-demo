@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventBus } from '../server/bus.js';
-import { RealPipeline } from '../server/pipeline/real.js';
+import { RealPipeline, pgPoolConfig } from '../server/pipeline/real.js';
 
 const FACT = 'Acme Robotics runs 40 GPU droplets in SFO3.';
 
@@ -101,4 +101,54 @@ test('real pipeline: no agent and no inference key is a clear error that trigger
   } finally {
     restore();
   }
+});
+
+const DO_URL = 'postgresql://doadmin:p%40ss@db-postgresql-nyc3-1-do-user-1.b.db.ondigitalocean.com:25060/defaultdb?sslmode=require';
+
+test('pgPoolConfig: sslmode=require is stripped and TLS runs without chain verification when no CA is given', () => {
+  const cfg = pgPoolConfig(DO_URL, undefined);
+  assert.doesNotMatch(cfg.connectionString, /sslmode/);
+  assert.match(cfg.connectionString, /^postgresql:\/\/doadmin:p%40ss@db-postgresql-nyc3-1-do-user-1\.b\.db\.ondigitalocean\.com:25060\/defaultdb$/);
+  assert.deepEqual(cfg.ssl, { rejectUnauthorized: false });
+  assert.deepEqual(pgPoolConfig(DO_URL.replace('require', 'verify-full'), '').ssl, { rejectUnauthorized: false });
+  assert.deepEqual(pgPoolConfig(DO_URL.replace('require', 'verify-ca'), '  ').ssl, { rejectUnauthorized: false });
+});
+
+test('pgPoolConfig: DATABASE_CA_CERT enables verification and accepts literal \\n sequences', () => {
+  const pem = '-----BEGIN CERTIFICATE-----\nMIIB\nAAA=\n-----END CERTIFICATE-----';
+  const cfg = pgPoolConfig(DO_URL, pem);
+  assert.doesNotMatch(cfg.connectionString, /sslmode/);
+  assert.equal(cfg.ssl.rejectUnauthorized, true);
+  assert.equal(cfg.ssl.ca, '-----BEGIN CERTIFICATE-----\nMIIB\nAAA=\n-----END CERTIFICATE-----');
+  // real newlines pass through unchanged
+  assert.equal(pgPoolConfig(DO_URL, '-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----\n').ssl.ca, '-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----');
+});
+
+test('pgPoolConfig: other parameters survive, sslmode=disable turns TLS off, no sslmode leaves pg defaults', () => {
+  const cfg = pgPoolConfig('postgres://u:p@localhost:5432/db?application_name=demo&sslmode=require', '');
+  assert.equal(cfg.connectionString, 'postgres://u:p@localhost:5432/db?application_name=demo');
+  assert.deepEqual(pgPoolConfig('postgres://u:p@localhost/db?sslmode=disable', ''), { connectionString: 'postgres://u:p@localhost/db', ssl: false });
+  assert.deepEqual(pgPoolConfig('postgres://u:p@localhost/db', ''), { connectionString: 'postgres://u:p@localhost/db' });
+  assert.deepEqual(pgPoolConfig('not a url', ''), { connectionString: 'not a url' });
+});
+
+test('pgPoolConfig: pg honours the explicit ssl option once sslmode is gone from the connection string', async () => {
+  const pg = await import('pg');
+  const Client = pg.default?.Client || pg.Client;
+  // Client parses the connection string at construction time (no connect needed).
+  const client = new Client(pgPoolConfig(DO_URL, ''));
+  assert.deepEqual(client.ssl, { rejectUnauthorized: false });
+  assert.equal(client.host, 'db-postgresql-nyc3-1-do-user-1.b.db.ondigitalocean.com');
+  assert.equal(client.port, 25060);
+  assert.equal(client.user, 'doadmin');
+  assert.equal(client.password, 'p@ss');
+  assert.equal(client.database, 'defaultdb');
+
+  const verified = new Client(pgPoolConfig(DO_URL, '-----BEGIN CERTIFICATE-----\\nAAA=\\n-----END CERTIFICATE-----'));
+  assert.equal(verified.ssl.rejectUnauthorized, true);
+  assert.equal(verified.ssl.ca, '-----BEGIN CERTIFICATE-----\nAAA=\n-----END CERTIFICATE-----');
+
+  // The bug being fixed: with sslmode=require left in the URL, pg ignores the ssl option (treats it as verify-full).
+  const buggy = new Client({ connectionString: DO_URL, ssl: { rejectUnauthorized: false } });
+  assert.notDeepEqual(buggy.ssl, { rejectUnauthorized: false });
 });

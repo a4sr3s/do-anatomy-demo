@@ -2,6 +2,38 @@ import { randomUUID } from 'node:crypto';
 import { chunkText, embedLocal, LOCAL_DIM } from './embedding.js';
 
 /**
+ * Build the `pg.Pool` config for DATABASE_URL.
+ *
+ * pg >= 8.x treats `sslmode=require` (and `prefer` / `verify-ca`) in the
+ * connection string as `verify-full`, and the parsed connection string wins
+ * over an explicit `ssl` option. Against DigitalOcean Managed Postgres, whose
+ * server certificate is signed by a per-cluster CA, that fails with
+ * "self-signed certificate in certificate chain". So the sslmode parameter is
+ * stripped here and TLS is configured explicitly:
+ *   - DATABASE_CA_CERT set   -> verify the chain against that CA (secure)
+ *   - otherwise, sslmode=prefer / require / verify-* -> TLS without chain verification
+ *   - no sslmode (or disable) -> leave ssl to pg's defaults / PGSSLMODE
+ * DATABASE_CA_CERT may contain literal "\n" sequences (App Platform secrets
+ * are single-line), which are converted back to newlines.
+ */
+export function pgPoolConfig(databaseUrl, caCert) {
+  let url;
+  try {
+    url = new URL(databaseUrl);
+  } catch {
+    return { connectionString: databaseUrl };
+  }
+  const sslmode = url.searchParams.get('sslmode');
+  url.searchParams.delete('sslmode');
+  const connectionString = url.toString();
+  const ca = typeof caCert === 'string' && caCert.trim() ? caCert.trim().replace(/\\n/g, '\n') : '';
+  if (ca) return { connectionString, ssl: { ca, rejectUnauthorized: true } };
+  if (sslmode && /^(prefer|require|verify-ca|verify-full)$/.test(sslmode)) return { connectionString, ssl: { rejectUnauthorized: false } };
+  if (sslmode === 'disable') return { connectionString, ssl: false };
+  return { connectionString };
+}
+
+/**
  * Real pipeline wired for DigitalOcean. All heavy dependencies are imported
  * lazily so mock mode never loads them. Configuration comes from env vars
  * documented in .env.example.
@@ -72,17 +104,27 @@ export class RealPipeline {
     if (!this.cfg.databaseUrl) throw new Error('DATABASE_URL missing');
     const pg = await import('pg');
     const Pool = pg.default?.Pool || pg.Pool;
-    this._pool = new Pool({ connectionString: this.cfg.databaseUrl, ssl: /sslmode=require/.test(this.cfg.databaseUrl) ? { rejectUnauthorized: false } : undefined });
+    const pool = new Pool(pgPoolConfig(this.cfg.databaseUrl, this.env.DATABASE_CA_CERT));
+    this._pool = pool;
     this._ready = (async () => {
-      await this._pool.query('CREATE EXTENSION IF NOT EXISTS vector');
-      await this._pool.query(
+      await pool.query('CREATE EXTENSION IF NOT EXISTS vector');
+      await pool.query(
         `CREATE TABLE IF NOT EXISTS ${this.cfg.table} (id serial PRIMARY KEY, chunk text NOT NULL, object_key text, embedding vector(${this.cfg.dim}), created_at timestamptz DEFAULT now())`
       );
-      const r = await this._pool.query(`SELECT count(*)::int AS n FROM ${this.cfg.table}`);
+      const r = await pool.query(`SELECT count(*)::int AS n FROM ${this.cfg.table}`);
       this.count = r.rows[0].n;
     })();
-    await this._ready;
-    return this._pool;
+    try {
+      await this._ready;
+    } catch (err) {
+      // Do not cache a pool whose schema setup failed (bad TLS config, wrong
+      // credentials...) so the next request retries from scratch.
+      this._pool = null;
+      this._ready = null;
+      pool.end().catch(() => {});
+      throw err;
+    }
+    return pool;
   }
 
   async embed(texts) {
