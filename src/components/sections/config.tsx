@@ -63,10 +63,12 @@ function servicesFor(h: Health): Service[] {
     ];
   }
   return [
-    { name: 'Spaces', detail: 'object storage · PutObject', up: Boolean(p.spaces) },
+    { name: 'Spaces', detail: 'object storage · PutObject / GetObject', up: Boolean(p.spaces) },
     { name: 'Managed Postgres', detail: `pgvector · ${p.chunks ?? 0} rows`, up: Boolean(p.database) },
-    { name: 'Managed Agent', detail: 'GenAI Platform · chat/completions', up: Boolean(p.agent) },
-    { name: 'Serverless Inference', detail: `via ${p.inferenceVia ?? 'none'}`, up: Boolean(p.inference) || p.inferenceVia === 'agent' },
+    { name: 'Harness Runtime', detail: p.harness ? `${p.harnessModel ?? 'opencode'} · session ${p.harnessSession ?? ''}` : 'HARNESS_API_TOKEN not set', up: Boolean(p.harness) },
+    { name: 'Action Gateway / MCP', detail: `tools mode ${p.toolsMode ?? 'inline'}${p.mcp ? '' : ' · MCP_PUBLIC_URL not set'}`, up: p.toolsMode === 'none' ? null : Boolean(p.mcp) },
+    { name: 'Managed Agent', detail: p.agent ? 'fallback 2 · chat/completions' : 'no fallback agent', up: Boolean(p.agent) },
+    { name: 'Serverless Inference', detail: `via ${p.inferenceVia ?? 'none'}`, up: Boolean(p.inference) || p.inferenceVia === 'agent' || p.inferenceVia === 'harness' },
     { name: 'Embeddings', detail: String(p.embedding ?? 'local-hash'), up: null },
   ];
 }

@@ -1,48 +1,44 @@
 import { randomUUID } from 'node:crypto';
-import { chunkText, embedLocal, LOCAL_DIM } from './embedding.js';
+import { chunkText } from './embedding.js';
+import { HarnessClient, harnessConfig, buildPrompt, buildToolPrompt, isDontKnow } from './harness.js';
+import { pgPoolConfig, embeddingConfig, embedTexts, toVector, cosineSearch } from './retrieval.js';
 
-/**
- * Build the `pg.Pool` config for DATABASE_URL.
- *
- * pg >= 8.x treats `sslmode=require` (and `prefer` / `verify-ca`) in the
- * connection string as `verify-full`, and the parsed connection string wins
- * over an explicit `ssl` option. Against DigitalOcean Managed Postgres, whose
- * server certificate is signed by a per-cluster CA, that fails with
- * "self-signed certificate in certificate chain". So the sslmode parameter is
- * stripped here and TLS is configured explicitly:
- *   - DATABASE_CA_CERT set   -> verify the chain against that CA (secure)
- *   - otherwise, sslmode=prefer / require / verify-* -> TLS without chain verification
- *   - no sslmode (or disable) -> leave ssl to pg's defaults / PGSSLMODE
- * DATABASE_CA_CERT may contain literal "\n" sequences (App Platform secrets
- * are single-line), which are converted back to newlines.
- */
-export function pgPoolConfig(databaseUrl, caCert) {
-  let url;
-  try {
-    url = new URL(databaseUrl);
-  } catch {
-    return { connectionString: databaseUrl };
-  }
-  const sslmode = url.searchParams.get('sslmode');
-  url.searchParams.delete('sslmode');
-  const connectionString = url.toString();
-  const ca = typeof caCert === 'string' && caCert.trim() ? caCert.trim().replace(/\\n/g, '\n') : '';
-  if (ca) return { connectionString, ssl: { ca, rejectUnauthorized: true } };
-  if (sslmode && /^(prefer|require|verify-ca|verify-full)$/.test(sslmode)) return { connectionString, ssl: { rejectUnauthorized: false } };
-  if (sslmode === 'disable') return { connectionString, ssl: false };
-  return { connectionString };
+export { pgPoolConfig };
+
+const MCP_HEALTH_TIMEOUT_MS = 1500;
+const DONT_KNOW_TEXT = 'I do not know that yet.';
+
+/** Short, log-safe rendering of tool arguments: search_facts(query=…) */
+export function fmtArgs(args = {}) {
+  return Object.entries(args)
+    .map(([k, v]) => `${k}=${typeof v === 'string' ? JSON.stringify(v.length > 60 ? `${v.slice(0, 57)}…` : v) : JSON.stringify(v)}`)
+    .join(', ');
 }
 
 /**
  * Real pipeline wired for DigitalOcean. All heavy dependencies are imported
  * lazily so mock mode never loads them. Configuration comes from env vars
  * documented in .env.example.
+ *
+ * Architecture v4 question flow (ANSWER_BACKEND=harness, the default):
+ *   client -> Harness Runtime session (OpenCode + gpt-oss on Serverless Inference)
+ *          -> Action Gateway / inline MCP -> anatomy-data MCP server (mcp/)
+ *          -> pgvector (search_facts) / Spaces (get_document)
+ *   The MCP server reports each tool call to POST /api/internal/tool-event,
+ *   which lands in handleToolEvent() below and is attributed to the active
+ *   question job so the scene can animate it.
+ * Fallback 1: tool path unavailable (MCP health check fails, HARNESS_TOOLS_MODE=none,
+ *   or the agent answered "don't know" without any tool result): the app
+ *   retrieves itself and passes the context in the prompt.
+ * Fallback 2: the harness fails before producing anything: the old Managed
+ *   Agent path (DO_AGENT_ENDPOINT) answers with app-side retrieval.
  */
 export class RealPipeline {
   constructor(bus, env = process.env) {
     this.bus = bus;
     this.env = env;
     this.mode = 'real';
+    const embedding = embeddingConfig(env);
     this.cfg = {
       spaces: {
         key: env.DO_SPACES_KEY,
@@ -55,21 +51,30 @@ export class RealPipeline {
       databaseUrl: env.DATABASE_URL,
       table: env.PGVECTOR_TABLE || 'anatomy_chunks',
       inference: {
-        url: (env.DO_INFERENCE_URL || 'https://inference.do-ai.run/v1').replace(/\/$/, ''),
+        url: embedding.url,
         key: env.DO_INFERENCE_KEY,
         model: env.DO_INFERENCE_MODEL || 'llama3.3-70b-instruct',
-        embeddingModel: env.DO_EMBEDDING_MODEL || '',
+        embeddingModel: embedding.embeddingModel,
       },
+      embedding,
       agent: { endpoint: (env.DO_AGENT_ENDPOINT || '').replace(/\/$/, ''), key: env.DO_AGENT_KEY },
-      dim: Number(env.VECTOR_DIM) || (env.DO_EMBEDDING_MODEL ? 1024 : LOCAL_DIM),
+      // ANSWER_BACKEND=harness|agent picks who answers questions (see README).
+      answerBackend: (env.ANSWER_BACKEND || 'harness').toLowerCase(),
+      harness: harnessConfig(env),
+      mcpToken: env.MCP_AUTH_TOKEN || '',
+      dim: embedding.dim,
     };
+    this.harness = new HarnessClient(this.cfg.harness);
     this._s3 = null;
     this._pool = null;
     this._ready = null;
     this.count = 0;
+    this.activeRun = null; // the question job currently running in the harness (tool events attach to it)
+    this.askQueue = Promise.resolve();
   }
 
   describe() {
+    const h = this.cfg.harness;
     return {
       mode: this.mode,
       chunks: this.count,
@@ -77,13 +82,20 @@ export class RealPipeline {
       database: Boolean(this.cfg.databaseUrl),
       inference: Boolean(this.cfg.inference.key),
       agent: Boolean(this.cfg.agent.endpoint),
+      harness: Boolean(h.token),
+      harnessModel: h.model,
+      harnessSession: h.sessionName,
+      toolsMode: h.toolsMode,
+      mcp: Boolean(h.mcpUrl),
+      answerBackend: this.cfg.answerBackend,
       inferenceVia: this.inferenceVia(),
       embedding: this.cfg.inference.embeddingModel || 'local-hash',
     };
   }
 
-  /** Which service answers questions: a Managed Agent, direct Serverless Inference, or nothing configured. */
+  /** Which service answers questions: the Harness Runtime, a Managed Agent, direct Serverless Inference, or nothing configured. */
   inferenceVia() {
+    if (this.cfg.answerBackend === 'harness' && this.cfg.harness.token) return 'harness';
     if (this.cfg.agent.endpoint) return 'agent';
     if (this.cfg.inference.key) return 'serverless';
     return null;
@@ -128,20 +140,11 @@ export class RealPipeline {
   }
 
   async embed(texts) {
-    const { url, key, embeddingModel } = this.cfg.inference;
-    if (!embeddingModel) return texts.map((t) => embedLocal(t, this.cfg.dim));
-    const res = await fetch(`${url}/embeddings`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-      body: JSON.stringify({ model: embeddingModel, input: texts }),
-    });
-    if (!res.ok) throw new Error(`Embedding request failed: ${res.status} ${await res.text()}`);
-    const json = await res.json();
-    return json.data.sort((a, b) => a.index - b.index).map((d) => d.embedding);
+    return embedTexts(this.cfg.embedding, texts);
   }
 
   toVector(arr) {
-    return `[${arr.map((x) => Number(x).toFixed(6)).join(',')}]`;
+    return toVector(arr);
   }
 
   // ---- ingest -------------------------------------------------------------
@@ -191,92 +194,254 @@ export class RealPipeline {
 
   // ---- query --------------------------------------------------------------
   /**
-   * Answer a question. Retrieval always runs against pgvector first so a fact
-   * submitted seconds ago is answerable immediately, even when a Managed Agent
-   * (with its own, periodically indexed Knowledge Base) produces the answer.
-   * Generation goes through DO_AGENT_ENDPOINT when set, otherwise directly to
-   * Serverless Inference with DO_INFERENCE_KEY.
+   * Answer a question. With ANSWER_BACKEND=harness (default) the Harness
+   * Runtime agent retrieves through the MCP tools itself (see class docs);
+   * the legacy backends retrieve from pgvector first and then generate via the
+   * Managed Agent (DO_AGENT_ENDPOINT) or Serverless Inference (DO_INFERENCE_KEY).
+   * Resolves { jobId, answer, sources, timing: {firstTokenMs, totalMs, toolCalls}, backend, fallback? }.
    */
   async ask(question) {
     const jobId = randomUUID();
     const ev = this.bus.forJob(jobId, 'query');
+    const t0 = Date.now();
     ev.job('start', { input: question });
     try {
       const via = this.inferenceVia();
-      if (!via) throw new Error('DO_INFERENCE_KEY missing and no DO_AGENT_ENDPOINT configured: set a Managed Agent endpoint + key, or a Model Access Key');
+      if (!via) throw new Error('DO_INFERENCE_KEY missing and no DO_AGENT_ENDPOINT configured (nor HARNESS_API_TOKEN with ANSWER_BACKEND=harness): set a Harness Runtime token, a Managed Agent endpoint + key, or a Model Access Key');
       if (via === 'agent' && !this.cfg.agent.key) throw new Error('DO_AGENT_KEY missing (required with DO_AGENT_ENDPOINT)');
 
-      // 1. retrieval over our own vector store, always
-      const sources = await this.retrieve(question, ev);
-      const context = sources.map((s, i) => `[${i + 1}] ${s.chunk}`).join('\n');
-      const guidance = 'Answer using only the provided context. If the context is empty or does not cover the question, say you do not know yet. Be concise.';
-      const onToken = (token, index) => ev.stage('inference', 'progress', '', { token, index });
-      let answer;
-
-      if (via === 'agent') {
-        // 2. Managed Agent: it owns a Knowledge Base and calls the model for us.
-        const { endpoint, key } = this.cfg.agent;
-        ev.stage('agent', 'start', 'Managed Agent (KB + model) answering', { contextChunks: sources.length, via });
-        // Agent endpoints apply their own system instructions, so the grounding guidance travels inside the user turn.
-        const messages = [{ role: 'user', content: `${guidance}\n\nContext:\n${context || '(none)'}\n\nQuestion: ${question}` }];
-        ev.stage('inference', 'start', 'Serverless inference via agent', { via });
-        const agentSources = [];
-        const onRetrieval = (retrieved) => {
-          const extra = retrieved
-            .map((r, i) => ({ id: r.id ?? `kb-${agentSources.length + i + 1}`, chunk: r.text || r.content || r.chunk || '', score: r.score ?? null, origin: 'agent-kb' }))
-            .filter((r) => r.chunk);
-          if (!extra.length) return;
-          agentSources.push(...extra);
-          ev.stage('kb', 'progress', `Agent Knowledge Base returned ${agentSources.length} chunk${agentSources.length === 1 ? '' : 's'}`, { step: 'agent-kb', hits: agentSources.length });
-        };
-        const out = await this.streamChat(messages, onToken, {
-          url: `${endpoint}/api/v1`,
-          key,
-          model: null,
-          body: { include_retrieval_info: true },
-          onRetrieval,
-        });
-        answer = out.text;
-        // merge agent KB hits after our own pgvector hits, skipping duplicate text
-        const seen = new Set(sources.map((s) => s.chunk.trim()));
-        for (const s of agentSources) if (!seen.has(s.chunk.trim())) { seen.add(s.chunk.trim()); sources.push(s); }
-        ev.stage('inference', 'done', 'Completed', { model: out.model || undefined, tokens: out.tokens, via });
-        ev.stage('agent', 'done', `Agent responded with ${agentSources.length} KB chunk${agentSources.length === 1 ? '' : 's'}`, { kbHits: agentSources.length });
+      let result;
+      if (via === 'harness') {
+        // one harness run at a time so tool events are attributed to the right job
+        const run = this.askQueue.then(() => this.askViaHarness(question, ev, jobId, t0));
+        this.askQueue = run.catch(() => {});
+        result = await run;
       } else {
-        // 3. direct Serverless Inference with a Model Access Key
-        ev.stage('agent', 'start', 'Composing grounded prompt', { contextChunks: sources.length, via });
-        const messages = [
-          { role: 'system', content: guidance },
-          { role: 'user', content: `Context:\n${context || '(none)'}\n\nQuestion: ${question}` },
-        ];
-        ev.stage('agent', 'done', 'Prompt ready; calling serverless inference', {});
-        ev.stage('inference', 'start', `Serverless inference: ${this.cfg.inference.model}`, { model: this.cfg.inference.model, via });
-        const out = await this.streamChat(messages, onToken);
-        answer = out.text;
-        ev.stage('inference', 'done', 'Completed', { model: out.model || this.cfg.inference.model, tokens: out.tokens, via });
+        // legacy: retrieval over our own vector store first, then generate
+        const sources = await this.retrieve(question, ev);
+        const context = sources.map((s, i) => `[${i + 1}] ${s.chunk}`).join('\n');
+        const guidance = 'Answer using only the provided context. If the context is empty or does not cover the question, say you do not know yet. Be concise.';
+        let firstTokenMs = null;
+        const onToken = (token, index) => {
+          if (firstTokenMs == null) firstTokenMs = Date.now() - t0;
+          ev.stage('inference', 'progress', '', { token, index });
+        };
+        let answer;
+        if (via === 'agent') answer = await this.askAgent(question, context, guidance, sources, ev, onToken);
+        else {
+          // direct Serverless Inference with a Model Access Key
+          ev.stage('agent', 'start', 'Composing grounded prompt', { contextChunks: sources.length, via });
+          const messages = [
+            { role: 'system', content: guidance },
+            { role: 'user', content: `Context:\n${context || '(none)'}\n\nQuestion: ${question}` },
+          ];
+          ev.stage('agent', 'done', 'Prompt ready; calling serverless inference', {});
+          ev.stage('inference', 'start', `Serverless inference: ${this.cfg.inference.model}`, { model: this.cfg.inference.model, via });
+          const out = await this.streamChat(messages, onToken);
+          answer = out.text;
+          ev.stage('inference', 'done', 'Completed', { model: out.model || this.cfg.inference.model, tokens: out.tokens, via });
+        }
+        result = { answer, sources, backend: via, timing: { firstTokenMs, totalMs: Date.now() - t0, toolCalls: 0 } };
       }
 
+      const { answer, sources } = result;
       ev.answer(answer, sources);
-      ev.job('done', { answer, sources });
-      return { jobId, answer, sources };
+      ev.job('done', { answer, sources, timing: result.timing, backend: result.backend, fallback: result.fallback });
+      return { jobId, ...result };
     } catch (err) {
       ev.job('error', { message: err.message });
       throw Object.assign(err, { jobId, flow: 'query' });
     }
   }
 
-  /** Embed the question and run a cosine top-3 search in pgvector, emitting kb/vectordb stage events. */
+  /** `GET <MCP_PUBLIC_URL>/health` with a short timeout: is the tool path reachable? */
+  async mcpHealthy() {
+    const url = this.cfg.harness.mcpUrl;
+    if (!url) return { ok: false, reason: 'MCP_PUBLIC_URL not set' };
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), MCP_HEALTH_TIMEOUT_MS);
+    try {
+      const res = await fetch(`${url}/health`, { signal: ac.signal });
+      if (!res.ok) return { ok: false, reason: `MCP health HTTP ${res.status}` };
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, reason: `MCP health ${ac.signal.aborted ? 'timed out' : err.message}` };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * v4 answer flow through the Harness Runtime. Returns
+   * { answer, sources, backend, timing, fallback }.
+   */
+  async askViaHarness(question, ev, jobId, t0) {
+    const h = this.cfg.harness;
+    const run = { jobId, ev, toolCalls: 0, toolDone: 0, toolErrors: 0, hits: [], seen: new Set() };
+    this.activeRun = run;
+    let firstTokenMs = null;
+    let streamed = 0;
+    const onToken = (token, index) => {
+      if (firstTokenMs == null) firstTokenMs = Date.now() - t0;
+      streamed++;
+      ev.stage('inference', 'progress', '', { token, index });
+    };
+    const timing = () => ({ firstTokenMs, totalMs: Date.now() - t0, toolCalls: run.toolCalls });
+    let sources = [];
+    let answer = '';
+    let backend = 'harness';
+    let fallback = null;
+    let harnessOut = null;
+    const describe = (s) => ev.stage('agent', 'progress', s.created ? `Harness session ${s.name} created (manifest ${s.hash})` : `Harness session ${s.name} ready${s.stale ? ' (base session has a stale manifest)' : ''}`, { step: 'session', created: s.created, name: s.name, via: 'harness', toolsMode: s.toolsMode, hash: s.hash });
+    const hooks = (label) => ({
+      onSession: describe,
+      onStarted: (ms) => ev.stage('agent', 'progress', `Harness run started (+${ms} ms)${label ? ` · ${label}` : ''}`, { step: 'run', ms, via: 'harness' }),
+      onToolEvent: (t) => ev.tool({ source: 'harness', phase: /complet|done|result|finish/i.test(t.type) ? 'done' : /fail|error/i.test(t.type) ? 'error' : 'start', tool: t.data?.tool || t.data?.name || t.type, args: t.data?.input || t.data?.args || undefined, summary: t.type, harnessType: t.type }),
+      onToken,
+    });
+    const contextRun = async (detail, why) => {
+      // FALLBACK 1: the app retrieves itself and passes the context in the prompt
+      sources = await this.retrieve(question, ev);
+      const context = sources.map((s, i) => `[${i + 1}] ${s.chunk}`).join('\n');
+      ev.stage('inference', 'start', `Serverless inference via harness: ${h.model}`, { model: h.model, via: 'harness', toolsMode: 'none' });
+      harnessOut = await this.harness.ask(buildPrompt(question, context), hooks(detail));
+      answer = harnessOut.text;
+      fallback = why;
+    };
+
+    try {
+      try {
+        let toolPath = h.toolsMode !== 'none';
+        let reason = h.toolsMode === 'none' ? 'HARNESS_TOOLS_MODE=none' : '';
+        if (toolPath) {
+          const health = await this.mcpHealthy();
+          if (!health.ok) { toolPath = false; reason = health.reason; }
+        }
+        if (toolPath) {
+          ev.stage('agent', 'start', `Harness Runtime (OpenCode, ${h.model}) answering with tools (${h.toolsMode})`, { via: 'harness', session: h.sessionName, toolsMode: h.toolsMode, model: h.model });
+          ev.stage('inference', 'start', `Serverless inference via harness: ${h.model}`, { model: h.model, via: 'harness', toolsMode: h.toolsMode });
+          harnessOut = await this.harness.ask(buildToolPrompt(question, { gateway: h.toolsMode === 'gateway' }), hooks('tool path'));
+          answer = harnessOut.text;
+          sources = run.hits.slice();
+          if ((run.toolDone === 0 || run.toolErrors > 0) && isDontKnow(answer)) {
+            // the agent never got a usable tool result: retry once with context in the prompt
+            ev.stage('agent', 'progress', `No usable tool result (${run.toolDone} done, ${run.toolErrors} failed); retrying with context passed in prompt`, { fallback: 'context', via: 'harness' });
+            await contextRun('context retry', 'context-retry');
+          }
+        } else {
+          ev.stage('agent', 'start', `Harness Runtime (OpenCode, ${h.model}) answering · Tool path unavailable, context passed in prompt (${reason})`, { via: 'harness', session: h.sessionName, toolsMode: 'none', model: h.model, fallback: 'context', reason });
+          await contextRun('context in prompt', 'context');
+        }
+        const t = timing();
+        ev.stage('inference', 'done', 'Completed', { model: harnessOut.model || h.model, tokens: harnessOut.tokens, via: 'harness', ...t });
+        ev.stage('agent', 'done', `Harness answered (first token ${t.firstTokenMs ?? '—'} ms, total ${t.totalMs} ms, ${t.toolCalls} tool call${t.toolCalls === 1 ? '' : 's'})`, { via: 'harness', ...t, runId: harnessOut.runId, backend, fallback });
+      } catch (err) {
+        // FALLBACK 2: the harness failed before producing anything -> old Managed Agent path
+        if (streamed > 0 || err.beforeFirstToken === false || !this.cfg.agent.endpoint || !this.cfg.agent.key) throw err;
+        this.bus.publish({ type: 'fallback', flow: 'query', jobId, data: { reason: err.message, to: 'agent', from: 'harness' } });
+        ev.stage('agent', 'progress', `Harness failed before first token (${err.message}); falling back to Managed Agent`, { fallback: 'agent', via: 'harness' });
+        if (!sources.length) sources = await this.retrieve(question, ev);
+        const context = sources.map((s, i) => `[${i + 1}] ${s.chunk}`).join('\n');
+        const guidance = 'Answer using only the provided context. If the context is empty or does not cover the question, say you do not know yet. Be concise.';
+        answer = await this.askAgent(question, context, guidance, sources, ev, onToken);
+        backend = 'agent';
+        fallback = 'agent';
+      }
+      if (!answer) answer = DONT_KNOW_TEXT;
+      return { answer, sources, backend, timing: timing(), fallback };
+    } finally {
+      if (this.activeRun === run) this.activeRun = null;
+    }
+  }
+
+  /**
+   * A tool call reported by the MCP server (POST /api/internal/tool-event).
+   * Publishes a `tool` event plus `gateway` and target (`vectordb` / `spaces`)
+   * stage events attributed to the active question job.
+   */
+  handleToolEvent(body = {}) {
+    const run = this.activeRun;
+    const tool = String(body.tool || 'unknown');
+    const phase = ['start', 'done', 'error'].includes(body.phase) ? body.phase : 'done';
+    const target = body.target === 'spaces' || body.target === 'pgvector' ? body.target : tool === 'get_document' ? 'spaces' : 'pgvector';
+    const stage = target === 'spaces' ? 'spaces' : 'vectordb';
+    const args = body.args && typeof body.args === 'object' ? body.args : {};
+    const hits = Array.isArray(body.hits) ? body.hits : [];
+    const ms = Number.isFinite(body.ms) ? body.ms : undefined;
+    const data = { tool, phase, args, summary: body.summary, ms, target, callId: body.callId, hits: hits.length, error: body.error, source: 'mcp' };
+    if (!run) {
+      this.bus.publish({ type: 'tool', flow: 'query', jobId: null, data });
+      return { accepted: false };
+    }
+    const { ev } = run;
+    ev.tool(data);
+    const base = { tool, callId: body.callId, args, op: 'tool', target };
+    if (phase === 'start') {
+      run.toolCalls++;
+      ev.stage('gateway', 'start', `TOOL ${tool}(${fmtArgs(args)}) → ${target}`, base);
+      ev.stage(stage, 'start', `${tool} via Action Gateway`, base);
+    } else if (phase === 'done') {
+      run.toolDone++;
+      for (const hit of hits) {
+        const id = hit?.id ?? hit?.object_key;
+        if (id == null || run.seen.has(id)) continue;
+        run.seen.add(id);
+        run.hits.push({ id, chunk: hit.chunk || '', score: hit.score ?? null, object_key: hit.object_key ?? null, origin: tool });
+      }
+      const short = hits.map((h) => ({ id: h?.id, score: h?.score ?? null }));
+      ev.stage(stage, 'done', `${tool}: ${body.summary || `${hits.length} hits`}${ms != null ? ` · ${ms} ms` : ''}`, { ...base, hits: short, ms, ...(stage === 'vectordb' ? { count: this.count } : {}) });
+      ev.stage('gateway', 'done', `TOOL ${tool}(${fmtArgs(args)}) → ${target} · ${body.summary || `${hits.length} hits`}${ms != null ? ` · ${ms} ms` : ''}`, { ...base, hits: short, ms });
+    } else {
+      run.toolErrors++;
+      ev.stage(stage, 'error', `${tool} failed: ${body.error || 'unknown error'}`);
+      ev.stage('gateway', 'error', `TOOL ${tool}(${fmtArgs(args)}) → ${target} failed: ${body.error || 'unknown error'}`);
+    }
+    return { accepted: true, jobId: run.jobId };
+  }
+
+  /** Managed Agent path (DO_AGENT_ENDPOINT): the agent owns a KB and calls the model. Mutates `sources`. */
+  async askAgent(question, context, guidance, sources, ev, onToken) {
+    const via = 'agent';
+    let answer;
+    // 2. Managed Agent: it owns a Knowledge Base and calls the model for us.
+    const { endpoint, key } = this.cfg.agent;
+    ev.stage('agent', 'start', 'Managed Agent (KB + model) answering', { contextChunks: sources.length, via });
+    // Agent endpoints apply their own system instructions, so the grounding guidance travels inside the user turn.
+    const messages = [{ role: 'user', content: `${guidance}\n\nContext:\n${context || '(none)'}\n\nQuestion: ${question}` }];
+    ev.stage('inference', 'start', 'Serverless inference via agent', { via });
+    const agentSources = [];
+    const onRetrieval = (retrieved) => {
+      const extra = retrieved
+        .map((r, i) => ({ id: r.id ?? `kb-${agentSources.length + i + 1}`, chunk: r.text || r.content || r.chunk || '', score: r.score ?? null, origin: 'agent-kb' }))
+        .filter((r) => r.chunk);
+      if (!extra.length) return;
+      agentSources.push(...extra);
+      ev.stage('kb', 'progress', `Agent Knowledge Base returned ${agentSources.length} chunk${agentSources.length === 1 ? '' : 's'}`, { step: 'agent-kb', hits: agentSources.length });
+    };
+    const out = await this.streamChat(messages, onToken, {
+      url: `${endpoint}/api/v1`,
+      key,
+      model: null,
+      body: { include_retrieval_info: true },
+      onRetrieval,
+    });
+    answer = out.text;
+    // merge agent KB hits after our own pgvector hits, skipping duplicate text
+    const seen = new Set(sources.map((s) => s.chunk.trim()));
+    for (const s of agentSources) if (!seen.has(s.chunk.trim())) { seen.add(s.chunk.trim()); sources.push(s); }
+    ev.stage('inference', 'done', 'Completed', { model: out.model || undefined, tokens: out.tokens, via });
+    ev.stage('agent', 'done', `Agent responded with ${agentSources.length} KB chunk${agentSources.length === 1 ? '' : 's'}`, { kbHits: agentSources.length });
+    return answer;
+  }
+
+  /** Embed the question and run a cosine top-3 search in pgvector, emitting kb/vectordb stage events (app-side retrieval). */
   async retrieve(question, ev) {
-    ev.stage('kb', 'start', 'Knowledge Base received query', { question });
+    ev.stage('kb', 'start', 'App-side retrieval: embedding the question', { question });
     const [qvec] = await this.embed([question]);
     ev.stage('kb', 'progress', 'Query embedded', { step: 'embed' });
     ev.stage('vectordb', 'start', 'pgvector cosine search, top 3', { op: 'search' });
     const pool = await this.db();
-    const r = await pool.query(
-      `SELECT id, chunk, 1 - (embedding <=> $1::vector) AS score FROM ${this.cfg.table} ORDER BY embedding <=> $1::vector LIMIT 3`,
-      [this.toVector(qvec)]
-    );
-    const sources = r.rows.filter((x) => x.score > 0.08).map((x) => ({ id: x.id, chunk: x.chunk, score: Number(Number(x.score).toFixed(3)) }));
+    const sources = await cosineSearch(pool, this.cfg.table, qvec, 3);
     ev.stage('vectordb', 'done', `${sources.length} relevant chunk${sources.length === 1 ? '' : 's'} retrieved`, { count: this.count, hits: sources.map((s) => ({ id: s.id, score: s.score })), op: 'search' });
     ev.stage('kb', 'done', `Context assembled from ${sources.length} chunk${sources.length === 1 ? '' : 's'}`, { hits: sources.length });
     return sources;

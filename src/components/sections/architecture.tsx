@@ -11,13 +11,14 @@ interface Machine {
   label: string;
   title: string;
   stage: string | null;
+  sublabel?: string;
   desc: string;
   color: string;
 }
 
 const machines = Object.values(MACHINES as Record<string, Machine>);
 
-/** The six machines with their live counters, plus the jobs currently in flight. */
+/** The seven machines with their live counters, plus the jobs currently in flight. */
 export function ArchitectureSection() {
   const machineStats = useStore((s) => s.machineStats);
   const legend = useStore((s) => s.legend);
@@ -28,8 +29,10 @@ export function ArchitectureSection() {
         <SidebarGroupLabel>Pipeline</SidebarGroupLabel>
         <SidebarGroupContent className="flex flex-col gap-2 px-2">
           <p className="text-xs text-muted-foreground">
-            A fact goes CLIENT → SPACES → FUNCTIONS → VECTOR DB. A question goes CLIENT → KNOWLEDGE BASE → VECTOR DB → AGENT → INFERENCE → CLIENT. Every
-            motion in the scene is a backend event.
+            A fact goes CLIENT → SPACES → FUNCTIONS → VECTOR DB. A question goes CLIENT → HARNESS RUNTIME, where an OpenCode agent calls the
+            search_facts tool: ACTION GATEWAY → MCP server → VECTOR DB (or SPACES for get_document) and back, then INFERENCE streams the grounded answer
+            to the CLIENT. If the tool path is down the app retrieves itself and passes context in the prompt; if the harness fails before its first
+            token the Managed Agent answers. Every motion in the scene is a backend event.
           </p>
           {machines.map((m) => (
             <MachineCard key={m.key} machine={m} stats={machineStats[m.key]} />
@@ -76,7 +79,10 @@ function MachineCard({ machine: m, stats }: { machine: Machine; stats?: Stats })
           <span className="size-2 shrink-0" style={{ background: m.color, boxShadow: `0 0 6px ${m.color}` }} />
           <span className="truncate">{m.title}</span>
         </CardTitle>
-        <CardDescription className="truncate text-[11px] tracking-wider">{m.label}</CardDescription>
+        <CardDescription className="truncate text-[11px] tracking-wider">
+          {m.label}
+          {m.sublabel ? <span className="normal-case tracking-normal text-muted-foreground/70"> · {m.sublabel}</span> : null}
+        </CardDescription>
         {m.stage && (
           <CardAction>
             <Badge variant="outline">{m.stage}</Badge>

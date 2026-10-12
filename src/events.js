@@ -15,7 +15,7 @@ export function connectEvents({ onEvent, onState }) {
         console.warn('bad event', err);
       }
     };
-    for (const type of ['hello', 'job', 'stage', 'answer', 'recorder', 'replay', 'fallback']) es.addEventListener(type, handle);
+    for (const type of ['hello', 'job', 'stage', 'tool', 'answer', 'recorder', 'replay', 'fallback']) es.addEventListener(type, handle);
     es.onmessage = handle;
   };
   open();

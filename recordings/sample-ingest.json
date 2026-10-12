@@ -1,13 +1,13 @@
 {
   "name": "sample-ingest",
-  "createdAt": "2026-10-12T15:42:05.650Z",
+  "createdAt": "2026-10-12T20:43:51.667Z",
   "events": [
     {
       "id": 2,
-      "ts": 1791819725651,
+      "ts": 1791837831668,
       "type": "job",
       "flow": "ingest",
-      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "jobId": "badbf434-a81e-4600-8dd9-c559525c8b6d",
       "status": "start",
       "data": {
         "input": "DigitalOcean Spaces is S3-compatible object storage. Managed Postgres supports the pgvector extension for similarity search."
@@ -16,53 +16,53 @@
     },
     {
       "id": 3,
-      "ts": 1791819725651,
+      "ts": 1791837831668,
       "type": "stage",
       "flow": "ingest",
-      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "jobId": "badbf434-a81e-4600-8dd9-c559525c8b6d",
       "stage": "spaces",
       "status": "start",
-      "detail": "PUT facts/1791819725651-ef4e8533.txt to Spaces bucket",
+      "detail": "PUT facts/1791837831668-badbf434.txt to Spaces bucket",
       "data": {
-        "key": "facts/1791819725651-ef4e8533.txt",
+        "key": "facts/1791837831668-badbf434.txt",
         "bytes": 124
       },
       "t": 1
     },
     {
       "id": 4,
-      "ts": 1791819726253,
+      "ts": 1791837832270,
       "type": "stage",
       "flow": "ingest",
-      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "jobId": "badbf434-a81e-4600-8dd9-c559525c8b6d",
       "stage": "spaces",
       "status": "done",
       "detail": "Object stored; event trigger fired",
       "data": {
-        "key": "facts/1791819725651-ef4e8533.txt"
+        "key": "facts/1791837831668-badbf434.txt"
       },
       "t": 603
     },
     {
       "id": 5,
-      "ts": 1791819726253,
+      "ts": 1791837832270,
       "type": "stage",
       "flow": "ingest",
-      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "jobId": "badbf434-a81e-4600-8dd9-c559525c8b6d",
       "stage": "functions",
       "status": "start",
       "detail": "Function invoked: chunk + embed",
       "data": {
-        "key": "facts/1791819725651-ef4e8533.txt"
+        "key": "facts/1791837831668-badbf434.txt"
       },
       "t": 603
     },
     {
       "id": 6,
-      "ts": 1791819726655,
+      "ts": 1791837832671,
       "type": "stage",
       "flow": "ingest",
-      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "jobId": "badbf434-a81e-4600-8dd9-c559525c8b6d",
       "stage": "functions",
       "status": "progress",
       "detail": "Chunked into 1 chunk",
@@ -70,14 +70,14 @@
         "step": "chunk",
         "chunks": 1
       },
-      "t": 1005
+      "t": 1004
     },
     {
       "id": 7,
-      "ts": 1791819727007,
+      "ts": 1791837833024,
       "type": "stage",
       "flow": "ingest",
-      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "jobId": "badbf434-a81e-4600-8dd9-c559525c8b6d",
       "stage": "functions",
       "status": "progress",
       "detail": "Embedded chunk 1/1 (128 dims)",
@@ -90,10 +90,10 @@
     },
     {
       "id": 8,
-      "ts": 1791819727208,
+      "ts": 1791837833225,
       "type": "stage",
       "flow": "ingest",
-      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "jobId": "badbf434-a81e-4600-8dd9-c559525c8b6d",
       "stage": "functions",
       "status": "done",
       "detail": "Produced 1 vector",
@@ -104,10 +104,10 @@
     },
     {
       "id": 9,
-      "ts": 1791819727208,
+      "ts": 1791837833225,
       "type": "stage",
       "flow": "ingest",
-      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "jobId": "badbf434-a81e-4600-8dd9-c559525c8b6d",
       "stage": "vectordb",
       "status": "start",
       "detail": "INSERT 1 row into pgvector",
@@ -116,10 +116,10 @@
     },
     {
       "id": 10,
-      "ts": 1791819727710,
+      "ts": 1791837833726,
       "type": "stage",
       "flow": "ingest",
-      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "jobId": "badbf434-a81e-4600-8dd9-c559525c8b6d",
       "stage": "vectordb",
       "status": "done",
       "detail": "Store now holds 1 chunks",
@@ -127,22 +127,22 @@
         "count": 1,
         "inserted": 1
       },
-      "t": 2060
+      "t": 2059
     },
     {
       "id": 11,
-      "ts": 1791819727710,
+      "ts": 1791837833726,
       "type": "job",
       "flow": "ingest",
-      "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
+      "jobId": "badbf434-a81e-4600-8dd9-c559525c8b6d",
       "status": "done",
       "data": {
-        "jobId": "ef4e8533-409d-48a4-82f7-88b80f21ecfd",
-        "key": "facts/1791819725651-ef4e8533.txt",
+        "jobId": "badbf434-a81e-4600-8dd9-c559525c8b6d",
+        "key": "facts/1791837831668-badbf434.txt",
         "chunks": 1,
         "total": 1
       },
-      "t": 2060
+      "t": 2059
     }
   ],
   "flow": "ingest"

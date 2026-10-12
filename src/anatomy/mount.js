@@ -17,6 +17,7 @@ import { buildFunctions } from '../machines/functions.js';
 import { buildVectorDb } from '../machines/vectordb.js';
 import { buildRouter } from '../machines/router.js';
 import { buildInference } from '../machines/inference.js';
+import { buildGateway } from '../machines/gateway.js';
 import { connectEvents, api } from '../events.js';
 import { MACHINES, PARTS, SAMPLE_FACTS, SAMPLE_QUESTIONS } from '../components.js';
 import { JOB_COLORS } from '../kit.js';
@@ -42,6 +43,7 @@ export function mountAnatomy(container, ui) {
     functions: buildFunctions(PARTS),
     vectordb: buildVectorDb(PARTS),
     router: buildRouter(PARTS),
+    gateway: buildGateway(PARTS),
     inference: buildInference(PARTS),
   };
   for (const m of Object.values(machines)) view.scene.add(m.group);
@@ -52,10 +54,10 @@ export function mountAnatomy(container, ui) {
     [MACHINES.spaces.label, -7.5, -2.0],
     [MACHINES.functions.label, -1, -2.0],
     [MACHINES.vectordb.label, 7.8, -0.9],
-    ['KNOWLEDGE BASE / AGENT · GENAI PLATFORM', -1, 7.0],
+    [`${MACHINES.router.label} · ${MACHINES.router.sublabel.replace(' · ', ' / ').toUpperCase()}`, -1, 7.0],
     [MACHINES.inference.label, 8.5, 7.1],
   ];
-  for (const [text, x, z] of LABELS) view.scene.add(boardLabel(text, x, z));
+  for (const [text, x, z, opts] of LABELS) view.scene.add(boardLabel(text, x, z, opts));
   // register every pickable mesh; parts know their machine for double-click focus
   for (const p of Object.values(PARTS)) {
     p.machine = p.machine ? { ...MACHINES[p.machine], center: machines[p.machine].center, focusZoom: machines[p.machine].focusZoom, key: p.machine } : { center: new THREE.Vector3(BOARD.x, 0, BOARD.z), focusZoom: 1 };
@@ -82,12 +84,13 @@ export function mountAnatomy(container, ui) {
     spaces: { objects: 0, 'last key': '—', bytes: 0, 'last PUT': '—' },
     functions: { invocations: 0, chunks: 0, embeddings: 0, 'last run': '—' },
     vectordb: { rows: 0, inserts: 0, searches: 0, 'last hits': '—', 'top score': '—', 'last query': '—' },
-    router: { queries: 0, 'context chunks': 0, prompts: 0, 'last retrieval': '—' },
+    router: { questions: 0, 'tool calls': 0, 'context chunks': 0, session: '—', 'first token': '—', 'last answer': '—', fallbacks: 0 },
+    gateway: { 'tool calls': 0, searches: 0, documents: 0, errors: 0, 'last tool': '—', 'last latency': '—' },
     inference: { tokens: 0, model: '—', 'tok/s': '—', 'last generation': '—' },
   };
   ui.setStatsProvider((part) => {
     if (part.key === 'track') return { 'streams in flight': tracks.inFlight, routes: Object.keys(tracks.tracks).length };
-    if (part.key === 'board') return { machines: 6, mode: baseMode, 'jobs seen': jobSeq };
+    if (part.key === 'board') return { machines: 7, mode: baseMode, 'jobs seen': jobSeq };
     const m = part.machine?.key;
     if (!m) return {};
     const s = { ...stats[m] };
@@ -104,6 +107,7 @@ export function mountAnatomy(container, ui) {
     vectordb: { machine: 'vectordb' },
     kb: { machine: 'router', which: 'kb' },
     agent: { machine: 'router', which: 'agent' },
+    gateway: { machine: 'gateway' },
     inference: { machine: 'inference' },
   };
   for (const a of Object.values(activity)) Object.assign(a, { level: 0, target: 0 });
@@ -125,7 +129,7 @@ export function mountAnatomy(container, ui) {
   function getJob(e) {
     let job = jobs.get(e.jobId);
     if (!job) {
-      job = { flow: e.flow, color: JOB_COLORS[jobSeq % JOB_COLORS.length], lane: jobSeq % 3, q: Promise.resolve(), input: '', stageStart: new Map(), tokens: 0, tokenAt: 0, pendingAnswer: null, landed: 0, text: '', answered: false };
+      job = { flow: e.flow, color: JOB_COLORS[jobSeq % JOB_COLORS.length], lane: jobSeq % 3, q: Promise.resolve(), input: '', stageStart: new Map(), tokens: 0, tokenAt: 0, pendingAnswer: null, landed: 0, text: '', answered: false, arrived: false, hits: 0 };
       jobSeq++;
       jobs.set(e.jobId, job);
     }
@@ -136,10 +140,34 @@ export function mountAnatomy(container, ui) {
     job.q = job.q.then(fn).catch((err) => console.warn('step failed', err));
   }
 
+  /** the question packet travels client -> harness once, on whichever stage comes first (kb for app-side retrieval, agent for the tool path) */
+  function questionArrives(job) {
+    if (job.arrived) return;
+    job.arrived = true;
+    machines.client.type([1, 3, 5, 7], 60);
+    machines.client.screen(`> ASK ${job.input.slice(0, 20)}`, 'question sent…', job.color);
+    enqueue(job, async () => {
+      setActivity('client', true);
+      await tracks.send('client-router', { color: job.color, lane: 0, count: 46 });
+      setActivity('client', false);
+    });
+  }
+
   function stageStart(e, job) {
     job.stageStart.set(e.stage, e.ts);
     switch (e.stage) {
       case 'spaces': {
+        if (e.data?.op === 'tool') {
+          // get_document: the gateway reads an object back out of the bucket
+          stats.spaces['last key'] = e.data?.args?.key || '—';
+          enqueue(job, async () => {
+            machines.gateway.port('spaces');
+            await tracks.send('gateway-spaces', { color: job.color, lane: 0, count: 36 });
+            setActivity('spaces', true);
+            job.readDrawer = machines.spaces.open(0);
+          });
+          break;
+        }
         stats.spaces['last key'] = e.data?.key || '—';
         stats.spaces.bytes += e.data?.bytes || 0;
         machines.client.type([0, 4, 8, 2, 6], 60);
@@ -163,7 +191,17 @@ export function mountAnatomy(container, ui) {
         });
         break;
       case 'vectordb':
-        if (e.data?.op === 'search') {
+        if (e.data?.op === 'tool') {
+          // search_facts routed by the gateway
+          stats.vectordb.searches++;
+          stats.vectordb['last query'] = '…';
+          enqueue(job, async () => {
+            machines.gateway.port('pgvector');
+            await tracks.send('gateway-vectordb', { color: job.color, lane: 0, count: 24, speed: 10 });
+            setActivity('vectordb', true);
+            machines.vectordb.startScan();
+          });
+        } else if (e.data?.op === 'search') {
           stats.vectordb.searches++;
           enqueue(job, async () => {
             await tracks.send('router-vectordb', { color: job.color, lane: 0, count: 34 });
@@ -179,24 +217,43 @@ export function mountAnatomy(container, ui) {
         }
         break;
       case 'kb':
-        stats.router.queries++;
-        machines.client.type([1, 3, 5, 7], 60);
-        machines.client.screen(`> ASK ${job.input.slice(0, 20)}`, 'question sent…', job.color);
+        // app-side retrieval (fallback 1 / legacy backends): the app embeds + searches itself
+        questionArrives(job);
         enqueue(job, async () => {
-          setActivity('client', true);
-          await tracks.send('client-router', { color: job.color, lane: 0, count: 46 });
-          setActivity('client', false);
           setActivity('kb', true);
           machines.router.sweep(true);
         });
         break;
       case 'agent':
-        stats.router.prompts++;
+        // v4: the harness receives the question first and calls tools itself
+        stats.router.questions++;
+        if (e.data?.session) stats.router.session = e.data.session;
+        if (e.data?.fallback) stats.router.fallbacks++;
+        questionArrives(job);
         enqueue(job, async () => {
           setActivity('agent', true);
+          machines.router.sweep(true);
           machines.router.setSlots(Math.max(1, job.hits || 0));
         });
         break;
+      case 'gateway': {
+        // a tool call leaves the harness for the gateway, which routes it to pgvector or Spaces
+        const target = e.data?.target === 'spaces' ? 'spaces' : 'pgvector';
+        stats.gateway['tool calls']++;
+        stats.router['tool calls']++;
+        if (target === 'spaces') stats.gateway.documents++;
+        else stats.gateway.searches++;
+        stats.gateway['last tool'] = `${e.data?.tool || 'tool'} → ${target}`;
+        enqueue(job, async () => {
+          machines.gateway.seek();
+          await tracks.send('router-gateway', { color: job.color, lane: 0, count: 30 });
+          setActivity('gateway', true);
+          machines.gateway.port('harness');
+          machines.gateway.route(target);
+          machines.gateway.pointAt(target === 'spaces' ? machines.spaces.center : machines.vectordb.center);
+        });
+        break;
+      }
       case 'inference':
         stats.inference.model = e.data?.model || stats.inference.model;
         job.tokens = 0;
@@ -252,6 +309,17 @@ export function mountAnatomy(container, ui) {
     const latency = started != null ? e.ts - started : null;
     switch (e.stage) {
       case 'spaces':
+        if (e.data?.op === 'tool') {
+          enqueue(job, async () => {
+            await wait(400);
+            machines.spaces.trigger();
+            machines.spaces.close(job.readDrawer ?? 0);
+            await tracks.send('gateway-spaces', { color: job.color, lane: 1, count: 30, reverse: true });
+            machines.gateway.port('spaces');
+            setActivity('spaces', false);
+          });
+          break;
+        }
         stats.spaces.objects++;
         stats.spaces['last PUT'] = `${latencyMs(latency)} ms`;
         enqueue(job, async () => {
@@ -273,18 +341,20 @@ export function mountAnatomy(container, ui) {
         break;
       case 'vectordb':
         if (e.data?.count !== undefined) stats.vectordb.rows = e.data.count;
-        if (e.data?.op === 'search') {
+        if (e.data?.op === 'search' || e.data?.op === 'tool') {
+          const viaTool = e.data.op === 'tool';
           const hits = e.data?.hits || [];
           job.hits = hits.length;
           stats.vectordb['last hits'] = hits.length;
           stats.vectordb['top score'] = hits[0]?.score ?? '—';
-          stats.vectordb['last query'] = `${latencyMs(latency)} ms`;
+          stats.vectordb['last query'] = `${latencyMs(e.data?.ms ?? latency)} ms`;
           enqueue(job, async () => {
             await wait(900); // let the scanner make a visible sweep even when the search is instant
             machines.vectordb.stopScan();
             const found = machines.vectordb.hit(hits.map((h) => h.id));
             machines.router.pointAt(found.map((f) => f.pos));
-            await tracks.send('router-vectordb', { color: job.color, lane: 1, count: 30, reverse: true });
+            await tracks.send(viaTool ? 'gateway-vectordb' : 'router-vectordb', { color: job.color, lane: 1, count: viaTool ? 24 : 30, speed: viaTool ? 10 : 14, reverse: true });
+            if (viaTool) machines.gateway.port('pgvector');
             setActivity('vectordb', false);
           });
         } else {
@@ -306,9 +376,26 @@ export function mountAnatomy(container, ui) {
           setActivity('kb', false);
         });
         break;
+      case 'gateway':
+        stats.gateway['last latency'] = `${latencyMs(e.data?.ms ?? latency)} ms`;
+        stats.router['context chunks'] += e.data?.hits?.length || 0;
+        enqueue(job, async () => {
+          // the result travels back from the gateway to the harness
+          await tracks.send('router-gateway', { color: job.color, lane: 1, count: 30, reverse: true });
+          machines.gateway.port('harness');
+          machines.router.sweep(false);
+          machines.router.setSlots(Math.max(1, job.hits || 0));
+          await wait(250);
+          setActivity('gateway', false);
+          machines.gateway.rest();
+        });
+        break;
       case 'agent':
+        if (e.data?.firstTokenMs != null) stats.router['first token'] = `${latencyMs(e.data.firstTokenMs)} ms`;
+        if (e.data?.totalMs != null) stats.router['last answer'] = `${latencyMs(e.data.totalMs)} ms`;
         enqueue(job, async () => {
           await wait(450);
+          machines.router.sweep(false);
           machines.router.promptReady();
           await wait(400);
           setActivity('agent', false);
@@ -378,6 +465,7 @@ export function mountAnatomy(container, ui) {
             machines.vectordb.stopScan();
             machines.inference.spinDown();
             machines.router.sweep(false);
+            machines.gateway.rest();
           }
           enqueue(job, async () => {
             await wait(1500);
@@ -397,6 +485,14 @@ export function mountAnatomy(container, ui) {
         else if (e.status === 'error') {
           const started = job.stageStart.get(e.stage);
           latency = started != null ? e.ts - started : undefined;
+          if (e.stage === 'gateway') stats.gateway.errors++;
+          if (e.stage === 'gateway' || e.data?.op === 'tool') {
+            enqueue(job, async () => {
+              machines.vectordb.stopScan();
+              machines.gateway.rest();
+              setActivity(e.stage, false);
+            });
+          }
           ui.toast(`${e.stage} error: ${e.detail}`, 'err');
         }
         break;
@@ -408,8 +504,16 @@ export function mountAnatomy(container, ui) {
         else wait(12000).then(() => finishAnswer(job));
         break;
       }
+      case 'tool': {
+        // the MCP server (or the harness stream) reported a tool call; the gateway/vectordb/spaces
+        // stage events carry the animation, this only feeds the counters
+        if (e.jobId) getJob(e);
+        if (e.data?.source !== 'harness') stats.gateway['last tool'] = `${e.data?.tool || 'tool'} → ${e.data?.target || '?'}${e.data?.phase === 'error' ? ' ✗' : ''}`;
+        break;
+      }
       case 'fallback':
-        ui.toast(`Live ${e.flow} failed (${e.data.reason}). Replaying "${e.data.recording}".`, 'warn', 7000);
+        if (e.data?.recording) ui.toast(`Live ${e.flow} failed (${e.data.reason}). Replaying "${e.data.recording}".`, 'warn', 7000);
+        else ui.toast(`Harness failed (${e.data?.reason || 'unknown'}). Falling back to the ${e.data?.to === 'agent' ? 'Managed Agent' : e.data?.to || 'fallback path'}.`, 'warn', 7000);
         break;
       case 'replay':
         if (e.status === 'start') ui.setMode(`replay · ${e.data.name}`, 'warn');

@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
  * Central event bus. Every pipeline stage emits here; the SSE endpoint and the
  * recorder both subscribe. Events are plain JSON objects:
  *   { id, ts, type, flow, jobId, stage?, status?, detail?, data?, replay? }
+ *   type: hello | job | stage | tool | answer | fallback | replay | recorder
  */
 export class EventBus extends EventEmitter {
   constructor({ historySize = 300 } = {}) {
@@ -34,6 +35,10 @@ export class EventBus extends EventEmitter {
       },
       stage(stage, status, detail = '', data = {}) {
         return bus.publish({ type: 'stage', flow, jobId, stage, status, detail, data, ...extra });
+      },
+      /** A tool call seen by the MCP server / Action Gateway (phase start|done|error). */
+      tool(data = {}) {
+        return bus.publish({ type: 'tool', flow, jobId, data, ...extra });
       },
       answer(text, sources = []) {
         return bus.publish({ type: 'answer', flow, jobId, data: { text, sources }, ...extra });

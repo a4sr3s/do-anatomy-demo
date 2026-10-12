@@ -11,7 +11,7 @@ import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { useStore, type LogEntry } from '@/anatomy/store';
 import { fmtTimeNY } from '@/anatomy/format';
 
-const SOURCES = ['spaces', 'functions', 'vectordb', 'kb', 'agent', 'inference', 'job', 'system'] as const;
+const SOURCES = ['spaces', 'functions', 'vectordb', 'kb', 'agent', 'gateway', 'tool', 'inference', 'job', 'system'] as const;
 type Source = (typeof SOURCES)[number];
 
 const sourceOf = (who: string): Source => (SOURCES.includes(who as Source) ? (who as Source) : 'system');
@@ -22,6 +22,8 @@ const WHO_CLASS: Record<string, string> = {
   vectordb: 'text-stage-vectordb',
   kb: 'text-stage-kb',
   agent: 'text-stage-agent',
+  gateway: 'text-stage-gateway',
+  tool: 'text-stage-gateway',
   inference: 'text-stage-inference',
   job: 'text-foreground',
 };
@@ -116,8 +118,9 @@ function LogRow({ entry: l }: { entry: LogEntry }) {
         {l.replay ? ' ↻' : ''}
       </span>
       <span className="truncate">
-        <span className={cn('font-medium', WHO_CLASS[l.who] ?? 'text-muted-foreground')}>{l.who}</span> <span className={STATUS_CLASS[l.status]}>{l.status}</span>{' '}
-        <span className={l.status === 'progress' ? 'text-muted-foreground' : 'text-foreground'}>{l.what}</span>
+        <span className={cn('font-medium', WHO_CLASS[l.who] ?? 'text-muted-foreground', l.who === 'tool' && 'uppercase tracking-wider')}>{l.who}</span>{' '}
+        <span className={STATUS_CLASS[l.status]}>{l.status}</span>{' '}
+        <span className={cn(l.status === 'progress' ? 'text-muted-foreground' : 'text-foreground', l.who === 'tool' && 'font-mono text-stage-gateway')}>{l.what}</span>
       </span>
       <span className="tabular-nums text-warning">{l.latency != null ? `${l.latency} ms` : ''}</span>
     </li>

@@ -1,6 +1,14 @@
-# DigitalOcean App Platform spec.
+# DigitalOcean App Platform spec (architecture v4).
 # Deploy:  doctl apps create --spec .do/app.yaml
 # Update:  doctl apps update <APP_ID> --spec .do/app.yaml
+#
+# Two service components share one app:
+#   web  - Express API + built frontend, routed at /
+#   mcp  - the "anatomy-data" MCP tool server, routed at /mcp (prefix preserved,
+#          so the server itself serves /mcp and /mcp/health). The Harness Runtime
+#          session (or the Action Gateway) calls it over the public URL; it
+#          reports tool calls to the web service over the internal URL
+#          http://web:8080/api/internal/tool-event.
 name: do-anatomy-demo
 region: nyc
 services:
@@ -15,6 +23,8 @@ services:
     http_port: 8080
     instance_count: 1
     instance_size_slug: apps-s-1vcpu-0.5gb
+    routes:
+      - path: /
     health_check:
       http_path: /api/health
       initial_delay_seconds: 10
@@ -62,17 +72,97 @@ services:
         value: ""
       - key: VECTOR_DIM
         value: "128"
-      # Managed Agent: when set, questions are answered through the agent
-      # (pgvector retrieval still runs first). Kept SECRET so the endpoint
-      # hostname does not leak through the spec or deploy logs.
+      # Managed Agent: fallback 2 (answers when the harness fails before its
+      # first token). Kept SECRET so the endpoint hostname does not leak.
       - key: DO_AGENT_ENDPOINT
         value: ""
         type: SECRET
       - key: DO_AGENT_KEY
         value: ""
         type: SECRET
+      # ---- v4: Harness Runtime answers questions through the MCP tools ----
+      - key: ANSWER_BACKEND
+        value: harness
+      # inline  -> the session manifest declares the MCP server directly (MCP_PUBLIC_URL + MCP_AUTH_TOKEN)
+      # gateway -> the session selects the tools from the Action Gateway catalog (HARNESS_GATEWAY_TOOLS)
+      # none    -> no tools; the app retrieves and passes context in the prompt
+      - key: HARNESS_TOOLS_MODE
+        value: inline
+      - key: MCP_PUBLIC_URL
+        value: https://do-anatomy-demo-lfmw4.ondigitalocean.app/mcp
+      # Comma list of Action Gateway tool slugs once the MCP server is registered as a
+      # custom provider, e.g. anatomy-data_search_facts,anatomy-data_get_document
+      - key: HARNESS_GATEWAY_TOOLS
+        value: ""
+      - key: HARNESS_SESSION_NAME
+        value: alexis-anatomy-harness-v4
+      - key: HARNESS_MODEL
+        value: openai-gpt-oss-20b
+      # DigitalOcean API token with Managed Agents access (DIGITALOCEAN_ACCESS_TOKEN also works)
+      - key: HARNESS_API_TOKEN
+        value: ""
+        type: SECRET
+      # Serverless Inference key used by the model inside the session
+      - key: HARNESS_INFERENCE_API_KEY
+        value: ""
+        type: SECRET
+      # Shared secret: bearer token for /mcp and x-tool-event-token for /api/internal/tool-event.
+      # Must be the same value on both services.
+      - key: MCP_AUTH_TOKEN
+        value: ""
+        type: SECRET
+
+  - name: mcp
+    github:
+      repo: a4sr3s/do-anatomy-demo
+      branch: main
+      deploy_on_push: true
+    environment_slug: node-js
+    build_command: npm ci
+    run_command: npm run start:mcp
+    http_port: 8081
+    instance_count: 1
+    instance_size_slug: apps-s-1vcpu-0.5gb
+    routes:
+      - path: /mcp
+        preserve_path_prefix: true
+    health_check:
+      http_path: /mcp/health
+      initial_delay_seconds: 10
+    envs:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "8081"
+      - key: MCP_AUTH_TOKEN
+        value: ""
+        type: SECRET
+      - key: DATABASE_URL
+        value: ""
+        type: SECRET
+      - key: DATABASE_CA_CERT
+        value: ""
+        type: SECRET
+      - key: DO_SPACES_KEY
+        value: ""
+        type: SECRET
+      - key: DO_SPACES_SECRET
+        value: ""
+        type: SECRET
+      - key: DO_SPACES_REGION
+        value: nyc3
+      - key: DO_SPACES_BUCKET
+        value: alexis-anatomy-demo
+      # Must match the web service so search_facts embeds exactly like ingest did.
+      - key: VECTOR_DIM
+        value: "128"
+      - key: DO_EMBEDDING_MODEL
+        value: ""
+      # Internal App Platform URL of the web component: every tool call is reported here.
+      - key: TOOL_EVENT_URL
+        value: http://web:8080/api/internal/tool-event
 # Optional: attach a Managed Postgres (pgvector-capable) database and bind
-# DATABASE_URL to ${db.DATABASE_URL} instead of a static secret.
+# DATABASE_URL to ${db.DATABASE_URL} on both services instead of a static secret.
 # databases:
 #   - name: db
 #     engine: PG
