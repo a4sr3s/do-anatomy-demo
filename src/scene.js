@@ -1,176 +1,242 @@
+/**
+ * Renderer, orthographic isometric camera, OrbitControls, bloom composer,
+ * picking (hover / click / double-click focus) and the frame loop.
+ */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
-import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
-import { NODES, EDGES } from './components.js';
-import { buildShape } from './shapes.js';
+import { Solid, C } from './kit.js';
 
-const FRUSTUM = 11;
-const CENTER = new THREE.Vector3(-2, 0.6, 0);
-
-/** Build the isometric three.js scene with labelled, glowing DO components. */
-export function createScene(container, { onHover, onSelect } = {}) {
-  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  renderer.setClearColor(0x050a16, 1);
+export function createScene(container, { onHover, onSelect, onFps } = {}) {
+  const useBloom = !/[?&]nobloom/.test(location.search);
+  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+  const pr = Math.min(window.devicePixelRatio || 1, 1.5);
+  renderer.setPixelRatio(pr);
+  renderer.setClearColor(C.bg, 1);
+  renderer.toneMapping = THREE.NoToneMapping;
   container.appendChild(renderer.domElement);
 
-  const labelRenderer = new CSS2DRenderer();
-  Object.assign(labelRenderer.domElement.style, { position: 'absolute', top: '0', left: '0', pointerEvents: 'none' });
-  container.appendChild(labelRenderer.domElement);
-
   const scene = new THREE.Scene();
-  scene.fog = new THREE.Fog(0x050a16, 30, 70);
-
-  const aspect = () => container.clientWidth / Math.max(1, container.clientHeight);
-  const camera = new THREE.OrthographicCamera(-FRUSTUM * aspect(), FRUSTUM * aspect(), FRUSTUM, -FRUSTUM, 0.1, 200);
-  camera.position.copy(CENTER).add(new THREE.Vector3(16, 16, 16));
-  camera.lookAt(CENTER);
-  camera.zoom = 1.25;
-  camera.updateProjectionMatrix();
+  const FRUSTUM = 12; // half-height in world units at zoom 1
+  const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -300, 300);
+  const AZ = THREE.MathUtils.degToRad(38);
+  const EL = THREE.MathUtils.degToRad(31);
+  const home = { target: new THREE.Vector3(-2, 0, 1), zoom: 1 };
+  const dir = new THREE.Vector3(Math.sin(AZ) * Math.cos(EL), Math.sin(EL), Math.cos(AZ) * Math.cos(EL));
+  camera.position.copy(home.target).addScaledVector(dir, 120);
+  camera.lookAt(home.target);
+  // background: a plane riding on the camera (the composer's clear would be sRGB-encoded twice)
+  scene.add(camera);
+  const backdrop = new THREE.Mesh(new THREE.PlaneGeometry(4000, 4000), new THREE.MeshBasicMaterial({ color: C.bg }));
+  backdrop.position.z = -280;
+  camera.add(backdrop);
 
   const controls = new OrbitControls(camera, renderer.domElement);
-  controls.target.copy(CENTER);
+  controls.target.copy(home.target);
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
-  controls.minZoom = 0.6;
-  controls.maxZoom = 3;
-  controls.maxPolarAngle = Math.PI / 2 - 0.05;
+  controls.minZoom = 0.12;
+  controls.maxZoom = 6;
+  controls.maxPolarAngle = Math.PI / 2 - 0.08;
+  controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
   controls.update();
 
-  // lights + ground
-  scene.add(new THREE.AmbientLight(0x6f86b8, 0.5));
-  const key = new THREE.DirectionalLight(0xffffff, 0.9);
-  key.position.set(8, 14, 6);
-  scene.add(key);
-  const grid = new THREE.GridHelper(40, 40, 0x1a3d73, 0x0c1b36);
-  grid.position.set(-2, 0, 0);
-  scene.add(grid);
-  const ground = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.MeshBasicMaterial({ color: 0x060d1d, transparent: true, opacity: 0.9 }));
-  ground.rotation.x = -Math.PI / 2;
-  ground.position.set(-2, -0.01, 0);
-  scene.add(ground);
-
-  // edges (pipes)
-  const pipeMat = new THREE.LineBasicMaterial({ color: 0x2a5aa8, transparent: true, opacity: 0.55 });
-  for (const [a, b] of EDGES) {
-    const pa = new THREE.Vector3(...NODES[a].pos).setY(0.25);
-    const pb = new THREE.Vector3(...NODES[b].pos).setY(0.25);
-    scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([pa, pb]), pipeMat));
-  }
-
-  // nodes
-  const nodes = {};
-  const pickables = [];
-  for (const [k, def] of Object.entries(NODES)) {
-    const view = buildShape(k, def);
-    view.group.position.set(...def.pos);
-    scene.add(view.group);
-    view.group.traverse((o) => {
-      if (o.isMesh) {
-        o.userData.key = k;
-        pickables.push(o);
-      }
-    });
-    const el = document.createElement('div');
-    el.className = 'label';
-    el.innerHTML = `${def.label}<small>${def.sub}</small><span class="pill" hidden></span>`;
-    const label = new CSS2DObject(el);
-    label.position.set(0, -0.9, 0);
-    view.group.add(label);
-    nodes[k] = { ...view, key: k, def, label: el, pill: el.querySelector('.pill'), activity: 0, target: 0, hover: 0, spin: 0, pulse: 0 };
-  }
-
-  // post-processing bloom
-  const composer = new EffectComposer(renderer);
+  // ---- post ---------------------------------------------------------------
+  const size = () => ({ w: container.clientWidth || window.innerWidth, h: container.clientHeight || window.innerHeight });
+  const { w: w0, h: h0 } = size();
+  const target = new THREE.WebGLRenderTarget(w0 * pr, h0 * pr, { type: THREE.HalfFloatType, samples: 4 });
+  const composer = new EffectComposer(renderer, target);
   composer.addPass(new RenderPass(scene, camera));
-  const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.9, 0.6, 0.55);
+  const bloom = new UnrealBloomPass(new THREE.Vector2(w0, h0), 0.75, 0.5, 0.78);
   composer.addPass(bloom);
   composer.addPass(new OutputPass());
 
   function resize() {
-    const w = container.clientWidth, h = container.clientHeight;
+    const { w, h } = size();
+    const aspect = w / h;
+    camera.left = -FRUSTUM * aspect;
+    camera.right = FRUSTUM * aspect;
+    camera.top = FRUSTUM;
+    camera.bottom = -FRUSTUM;
+    camera.updateProjectionMatrix();
     renderer.setSize(w, h);
     composer.setSize(w, h);
-    labelRenderer.setSize(w, h);
     bloom.setSize(w, h);
-    camera.left = -FRUSTUM * aspect();
-    camera.right = FRUSTUM * aspect();
-    camera.updateProjectionMatrix();
   }
   window.addEventListener('resize', resize);
   resize();
 
-  // picking
-  const ray = new THREE.Raycaster();
-  const ptr = new THREE.Vector2();
-  let hovered = null;
-  function pick(ev) {
-    const r = renderer.domElement.getBoundingClientRect();
-    ptr.set(((ev.clientX - r.left) / r.width) * 2 - 1, -((ev.clientY - r.top) / r.height) * 2 + 1);
-    ray.setFromCamera(ptr, camera);
-    const hit = ray.intersectObjects(pickables, false)[0];
-    return hit ? hit.object.userData.key : null;
-  }
-  renderer.domElement.addEventListener('pointermove', (ev) => {
-    const k = pick(ev);
-    if (k !== hovered) {
-      if (hovered) nodes[hovered].hover = 0;
-      hovered = k;
-      if (k) nodes[k].hover = 1;
-      renderer.domElement.style.cursor = k ? 'pointer' : 'grab';
+  /** Fit the given world-space box into the top `frac` of the viewport. */
+  function fitHome(box3, { frac = 0.7, pad = 1.0 } = {}) {
+    camera.updateMatrixWorld();
+    const pts = [];
+    for (let i = 0; i < 8; i++) pts.push(new THREE.Vector3(i & 1 ? box3.max.x : box3.min.x, i & 2 ? box3.max.y : box3.min.y, i & 4 ? box3.max.z : box3.min.z));
+    camera.zoom = 1;
+    camera.updateProjectionMatrix();
+    let mx = 0;
+    let my = 0;
+    const center = box3.getCenter(new THREE.Vector3());
+    const cNdc = center.clone().project(camera);
+    for (const p of pts) {
+      p.project(camera);
+      mx = Math.max(mx, Math.abs(p.x - cNdc.x));
+      my = Math.max(my, Math.abs(p.y - cNdc.y));
     }
-    onHover?.(k, ev.clientX, ev.clientY);
-  });
+    home.zoom = Math.min(1 / (mx * pad), frac / (my * pad));
+    // shift the target so the box centre sits in the upper part of the screen
+    const up = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion);
+    const shift = (1 - frac) * 0.5 * (FRUSTUM / home.zoom);
+    home.target.copy(center).addScaledVector(up, -shift);
+    goHome(true);
+  }
+
+  // ---- camera tweens ------------------------------------------------------
+  let tween = null;
+  function flyTo(targetPos, zoom, duration = 0.9) {
+    tween = { from: controls.target.clone(), to: targetPos.clone(), z0: camera.zoom, z1: zoom, t: 0, d: duration };
+  }
+  function goHome(instant = false) {
+    if (instant) {
+      const offset = camera.position.clone().sub(controls.target);
+      controls.target.copy(home.target);
+      camera.position.copy(home.target).add(offset);
+      camera.zoom = home.zoom;
+      camera.updateProjectionMatrix();
+      controls.update();
+      return;
+    }
+    flyTo(home.target, home.zoom);
+  }
+  function focusOn(center, zoom = 2.6) {
+    // keep the subject in the upper part of the screen, clear of the overlay panels
+    const up = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion);
+    const target = center.clone().addScaledVector(up, -0.15 * (FRUSTUM / zoom));
+    flyTo(target, zoom);
+  }
+  controls.addEventListener('start', () => (tween = null));
+
+  // ---- picking ------------------------------------------------------------
+  const raycaster = new THREE.Raycaster();
+  const pointer = new THREE.Vector2();
+  const pickables = [];
+  let hovered = null;
   let downAt = null;
-  renderer.domElement.addEventListener('pointerdown', (ev) => (downAt = [ev.clientX, ev.clientY]));
-  renderer.domElement.addEventListener('pointerup', (ev) => {
-    if (!downAt || Math.hypot(ev.clientX - downAt[0], ev.clientY - downAt[1]) > 6) return;
-    const k = pick(ev);
-    if (k) onSelect?.(k);
+  let lastClick = 0;
+  const el = renderer.domElement;
+  function pick(ev) {
+    const r = el.getBoundingClientRect();
+    pointer.set(((ev.clientX - r.left) / r.width) * 2 - 1, -((ev.clientY - r.top) / r.height) * 2 + 1);
+    raycaster.setFromCamera(pointer, camera);
+    const hits = raycaster.intersectObjects(pickables, false);
+    for (const h of hits) {
+      const part = h.object.userData.part;
+      if (part) return part;
+    }
+    return null;
+  }
+  function setHover(part, ev) {
+    if (hovered === part) {
+      if (part) onHover?.(part, ev.clientX, ev.clientY);
+      return;
+    }
+    if (hovered) hovered.solids.forEach((s) => (s.hover = 0));
+    hovered = part;
+    if (hovered) hovered.solids.forEach((s) => (s.hover = 0.55));
+    el.style.cursor = part ? 'pointer' : '';
+    onHover?.(part, ev?.clientX, ev?.clientY);
+  }
+  el.addEventListener('pointermove', (ev) => {
+    if (downAt && Math.hypot(ev.clientX - downAt.x, ev.clientY - downAt.y) > 4) downAt = null;
+    setHover(pick(ev), ev);
+  });
+  el.addEventListener('pointerleave', (ev) => setHover(null, ev));
+  el.addEventListener('pointerdown', (ev) => (downAt = { x: ev.clientX, y: ev.clientY }));
+  el.addEventListener('pointerup', (ev) => {
+    if (!downAt) return;
+    downAt = null;
+    const part = pick(ev);
+    const now = performance.now();
+    if (now - lastClick < 320 && part) {
+      focusOn(part.machine.center, part.machine.focusZoom || 2.6);
+    } else onSelect?.(part);
+    lastClick = now;
+  });
+  window.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' || (ev.key === '0' && !/input|textarea/i.test(document.activeElement?.tagName))) goHome();
   });
 
-  // animation loop
-  const timer = new THREE.Timer();
-  const tickers = new Set();
+  // ---- loop ---------------------------------------------------------------
+  const tickers = [];
+  const timers = []; // { left, resolve } in animation seconds (already speed-scaled)
+  let speed = 1;
+  let last = performance.now();
+  let frames = 0;
+  let fpsAt = last;
+  let running = true;
   function frame(now) {
-    timer.update(now);
-    const dt = Math.min(timer.getDelta(), 0.1);
-    const t = timer.getElapsed();
-    for (const n of Object.values(nodes)) {
-      const goal = Math.max(n.target, n.hover * 0.45);
-      n.activity += (goal - n.activity) * Math.min(1, dt * 6);
-      n.pulse = Math.max(0, n.pulse - dt * 2.2);
-      n.apply({ activity: n.activity, pulse: n.pulse, spin: n.spin, dt, t });
-      n.label.classList.toggle('active', n.activity > 0.5);
-    }
-    for (const fn of tickers) fn(dt, t);
-    controls.update();
-    composer.render();
-    labelRenderer.render(scene, camera);
+    if (!running) return;
     requestAnimationFrame(frame);
+    let dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    frames++;
+    if (now - fpsAt >= 500) {
+      onFps?.(Math.round((frames * 1000) / (now - fpsAt)));
+      frames = 0;
+      fpsAt = now;
+    }
+    if (tween) {
+      tween.t += dt;
+      const u = Math.min(1, tween.t / tween.d);
+      const e = 1 - Math.pow(1 - u, 3);
+      const offset = camera.position.clone().sub(controls.target);
+      controls.target.lerpVectors(tween.from, tween.to, e);
+      camera.position.copy(controls.target).add(offset);
+      camera.zoom = tween.z0 + (tween.z1 - tween.z0) * e;
+      camera.updateProjectionMatrix();
+      if (u >= 1) tween = null;
+    }
+    controls.update();
+    dt *= speed;
+    for (let i = timers.length - 1; i >= 0; i--) {
+      timers[i].left -= dt;
+      if (timers[i].left <= 0) timers.splice(i, 1)[0].resolve();
+    }
+    for (const t of tickers) t(dt, now / 1000);
+    Solid.tickAll(dt);
+    if (useBloom) composer.render();
+    else renderer.render(scene, camera);
   }
-  frame();
+  requestAnimationFrame(frame);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) running = false;
+    else if (!running) {
+      running = true;
+      last = performance.now();
+      requestAnimationFrame(frame);
+    }
+  });
 
   return {
     scene,
     camera,
-    nodes,
-    onTick: (fn) => tickers.add(fn),
-    nodePosition: (k) => new THREE.Vector3(...NODES[k].pos),
-    setActivity: (k, v) => nodes[k] && (nodes[k].target = v),
-    pulse: (k, v = 1) => nodes[k] && (nodes[k].pulse = Math.max(nodes[k].pulse, v)),
-    setSpin: (k, on) => nodes[k] && (nodes[k].spin = on ? 1 : 0),
-    setFill: (ratio) => nodes.vectordb.setFill?.(ratio),
-    setPill: (k, text) => {
-      const n = nodes[k];
-      if (!n) return;
-      n.pill.textContent = text || '';
-      n.pill.hidden = !text;
+    renderer,
+    controls,
+    bloom,
+    pickables,
+    onTick: (fn) => tickers.push(fn),
+    /** resolve after `seconds` of animation time (follows the speed control and the frame clock) */
+    waitAnim: (seconds) => new Promise((resolve) => timers.push({ left: seconds, resolve })),
+    setSpeed: (s) => (speed = s),
+    fitHome,
+    goHome,
+    focusOn,
+    registerPickable(solid) {
+      solid.traverse((o) => {
+        if (o.isMesh && o.userData.part) pickables.push(o);
+      });
     },
-    resetAll: () => Object.values(nodes).forEach((n) => { n.target = 0; n.spin = 0; n.pill.hidden = true; }),
   };
 }

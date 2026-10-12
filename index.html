@@ -3,77 +3,73 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Anatomy of a DigitalOcean Data Pipeline</title>
+    <title>Anatomy of a DigitalOcean AI Data Pipeline</title>
     <link rel="stylesheet" href="/src/style.css" />
   </head>
   <body>
     <div id="scene"></div>
 
-    <header id="topbar">
-      <div class="brand">
-        <span class="dot"></span>
-        <strong>Anatomy of a Data Pipeline</strong>
-        <span class="muted">DigitalOcean Solutions</span>
+    <div id="hud">
+      <div class="hud-tl"><span class="fig">Fig 1</span><span class="hint">DRAG ORBIT · SCROLL ZOOM · RIGHT-DRAG PAN · HOVER / CLICK INSPECT · DOUBLE-CLICK FOCUS · ESC RESET</span></div>
+      <div class="hud-tr">
+        <span id="fps" class="chip">-- fps</span>
+        <span id="conn-badge" class="chip dim">sse</span>
+        <span id="mode-badge" class="chip">connecting…</span>
       </div>
-      <div class="status">
-        <span id="mode-badge" class="badge">connecting…</span>
-        <span id="conn-badge" class="badge dim">SSE</span>
-      </div>
-      <div class="replay" id="replay-controls">
-        <button id="rec-btn" class="ghost" title="Record live events to recordings/*.json">● Record</button>
-        <select id="rec-select" title="Saved recordings"></select>
-        <select id="rec-speed" title="Replay speed">
-          <option value="0.5">0.5×</option>
-          <option value="1" selected>1×</option>
-          <option value="2">2×</option>
-          <option value="4">4×</option>
-        </select>
-        <button id="play-btn" class="ghost">▶ Replay</button>
-        <button id="stop-btn" class="ghost" hidden>■ Stop</button>
-      </div>
-    </header>
+      <div class="hud-title">DIGITALOCEAN · AI DATA PIPELINE</div>
+      <div id="legend" class="legend"></div>
+      <div id="toast" class="toast" hidden></div>
+    </div>
 
-    <aside id="left">
-      <section class="panel">
-        <h2>Submit a fact</h2>
-        <p class="hint">Spaces → Functions (chunk + embed) → pgvector</p>
-        <textarea id="fact-input" rows="3" placeholder="e.g. Our Q3 launch event is in Austin on October 22nd."></textarea>
+    <div id="panels">
+      <section id="controls" class="panel">
         <div class="row">
-          <button id="fact-btn" class="primary">Ingest fact</button>
-          <span id="fact-status" class="muted"></span>
+          <label class="k" for="fact-input">fact</label>
+          <input id="fact-input" class="str" type="text" spellcheck="false" placeholder="&quot;The Q3 launch is in Austin on Oct 22&quot;" />
+          <button id="fact-btn" class="btn fn">SUBMIT FACT</button>
+        </div>
+        <div class="row">
+          <label class="k" for="ask-input">ask</label>
+          <input id="ask-input" class="str" type="text" spellcheck="false" placeholder="&quot;When is the Q3 launch?&quot;" />
+          <button id="ask-btn" class="btn fn">ASK</button>
+        </div>
+        <div class="row">
+          <span class="k">speed</span>
+          <span class="seg" id="speed">
+            <button data-speed="0.5">.5x</button><button data-speed="1" class="on">1x</button><button data-speed="2">2x</button>
+          </span>
+          <span class="k">auto</span>
+          <label class="toggle"><input id="auto" type="checkbox" /><span class="track"></span><span class="val">traffic</span></label>
+        </div>
+        <div class="row">
+          <span class="k">replay</span>
+          <select id="rec-select" title="Saved recordings"></select>
+          <button id="play-btn" class="btn">▶ PLAY</button>
+          <button id="stop-btn" class="btn warn" hidden>■ STOP</button>
+          <button id="rec-btn" class="btn ghost" title="Record live events to recordings/*.json">● REC</button>
+        </div>
+        <div class="row">
+          <span class="k">view</span>
+          <button id="reset-btn" class="btn ghost">RESET VIEW</button>
+          <span id="form-status" class="muted"></span>
         </div>
       </section>
-      <section class="panel">
-        <h2>Ask a question</h2>
-        <p class="hint">Knowledge Base → Agent → Serverless Inference</p>
-        <input id="ask-input" type="text" placeholder="e.g. Where is the Q3 launch event?" />
-        <div class="row">
-          <button id="ask-btn" class="primary">Ask</button>
-          <span id="ask-status" class="muted"></span>
+
+      <section id="inspector" class="panel">
+        <div class="insp-head"><span id="insp-title">Hover or click any part</span><span id="insp-sub" class="muted"></span></div>
+        <p id="insp-desc" class="muted">Six machines on one board: a fact goes CLIENT → SPACES → FUNCTIONS → VECTOR DB; a question goes CLIENT → KNOWLEDGE BASE → VECTOR DB → AGENT → INFERENCE → CLIENT. Every motion is a backend event.</p>
+        <dl id="insp-stats" class="stats"></dl>
+        <div id="answer" class="answer">
+          <span class="k">answer</span>
+          <span id="answer-text" class="muted">ask a question and the tokens land here as they arrive</span>
         </div>
       </section>
-      <section class="panel answer" id="answer-panel">
-        <h2>Answer</h2>
-        <div id="answer-text" class="answer-text muted">Ask something to see the agent answer stream in here.</div>
-        <div id="answer-sources" class="sources"></div>
-      </section>
-    </aside>
 
-    <aside id="right">
-      <section class="panel" id="explainer">
-        <h2 id="explainer-title">Hover or click a component</h2>
-        <p id="explainer-sub" class="muted">Drag to rotate · wheel to zoom · right-drag to pan</p>
-        <p id="explainer-body"></p>
-        <p id="explainer-status" class="stage-status"></p>
-      </section>
-      <section class="panel log">
-        <h2>Live events <span id="log-count" class="muted"></span></h2>
+      <section id="logpanel" class="panel">
+        <div class="log-head"><span class="k">event log</span><span id="log-count" class="muted"></span></div>
         <ul id="event-log"></ul>
       </section>
-    </aside>
-
-    <div id="tooltip" class="tooltip" hidden></div>
-    <div id="toast" class="toast" hidden></div>
+    </div>
 
     <script type="module" src="/src/main.js"></script>
   </body>

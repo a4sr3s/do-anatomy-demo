@@ -1,76 +1,118 @@
 /**
- * The six DigitalOcean components in the scene: positions (isometric layout
- * forms a U so packets visibly loop around), colours and explainers.
+ * Every pickable part of the scene: title + description for the inspector.
+ * Machines group parts; `stats` are filled live by main.js.
  */
-export const NODES = {
+export const MACHINES = {
+  client: {
+    key: 'client',
+    label: 'CLIENT',
+    title: 'Client',
+    stage: null,
+    desc: 'Your app or terminal. The keypad posts a fact (POST /api/facts) or a question (POST /api/ask) to the API; the answer streams back along the long return track.',
+    color: '#38e8ff',
+  },
   spaces: {
-    label: 'Spaces',
-    sub: 'Object storage',
-    shape: 'bucket',
-    pos: [-6, 0, 2.6],
-    color: 0x39d0ff,
-    blurb:
-      'S3-compatible object storage. Every submitted fact is written here as a text object. Durable, cheap, and the natural landing zone for raw data before it enters the AI pipeline.',
-    stage: 'Fact lands as an object; a trigger kicks off processing.',
+    key: 'spaces',
+    label: 'SPACES · OBJECT STORAGE',
+    title: 'Spaces · Object Storage',
+    stage: 'spaces',
+    desc: 'S3-compatible object storage. Each submitted fact is PUT as a text object into a bucket; a drawer slides open, the glowing document slab is filed, and the object event triggers the next stage.',
+    color: '#38e8ff',
   },
   functions: {
-    label: 'Functions',
-    sub: 'Chunk + embed',
-    shape: 'gear',
-    pos: [-2, 0, 2.6],
-    color: 0xffb84d,
-    blurb:
-      'Serverless Functions run code on demand without managing servers. This one splits the fact into chunks and turns each chunk into an embedding vector. It spins while it works.',
-    stage: 'Text is chunked, then each chunk becomes a 128-dim vector.',
+    key: 'functions',
+    label: 'FUNCTIONS · CHUNK & EMBED',
+    title: 'Functions · Chunk & Embed',
+    stage: 'functions',
+    desc: 'A serverless Function wakes on the object event. The gears mesh while it runs; the press cuts the document into chunks, then stamps each chunk into a 128-dimension embedding vector.',
+    color: '#ffb347',
   },
   vectordb: {
-    label: 'Managed Postgres',
-    sub: 'pgvector',
-    shape: 'db',
-    pos: [2, 0, 2.6],
-    color: 0x3fe0a8,
-    blurb:
-      'Managed PostgreSQL with the pgvector extension stores embeddings next to the text and answers nearest-neighbour queries with a single SQL ORDER BY. The cylinder fills as vectors are inserted.',
-    stage: 'Vectors are inserted; questions run cosine similarity search here.',
+    key: 'vectordb',
+    label: 'VECTOR DB · PGVECTOR',
+    title: 'Managed Postgres · pgvector',
+    stage: 'vectordb',
+    desc: 'Managed PostgreSQL with the pgvector extension. Every chunk is a glowing cube in one of twelve chambers (cube count = rows in the table). A question runs a cosine-similarity search: the scanner sweeps the enclosure and the nearest cubes flash.',
+    color: '#4dff9a',
   },
-  kb: {
-    label: 'Knowledge Base',
-    sub: 'Retrieval',
-    shape: 'book',
-    pos: [2, 0, -2.6],
-    color: 0xb48bff,
-    blurb:
-      'The Knowledge Base is the retrieval layer of the GenAI Platform: it embeds the incoming question, searches the vector store, and assembles the most relevant chunks as grounded context.',
-    stage: 'Question is embedded and matched against stored chunks.',
-  },
-  agent: {
-    label: 'Managed Agent',
-    sub: 'GenAI Platform',
-    shape: 'agent',
-    pos: [-2, 0, -2.6],
-    color: 0x0080ff,
-    blurb:
-      'A Managed Agent orchestrates the conversation: it takes the retrieved context, applies instructions and guardrails, and builds the prompt that goes to the model. No servers, no prompt plumbing to host.',
-    stage: 'Agent composes a grounded prompt from retrieved context.',
+  router: {
+    key: 'router',
+    label: 'KNOWLEDGE BASE / MANAGED AGENT',
+    title: 'Knowledge Base / Managed Agent',
+    stage: 'kb',
+    desc: 'The GenAI Platform retrieval and orchestration layer. The Knowledge Base embeds the question and asks pgvector for the nearest chunks; the dial needle points at the chambers that were retrieved. The Managed Agent stacks that context into a grounded prompt and dispatches it to inference.',
+    color: '#b77bff',
   },
   inference: {
-    label: 'Serverless Inference',
-    sub: 'OpenAI-compatible',
-    shape: 'chip',
-    pos: [-6, 0, -2.6],
-    color: 0xff5d73,
-    blurb:
-      'Serverless Inference exposes open models like Llama behind an OpenAI-compatible endpoint. Pay per token, scale to zero, stream the answer back. The halo pulses as tokens arrive.',
-    stage: 'Model generates the answer, streamed token by token.',
+    key: 'inference',
+    label: 'INFERENCE · GPU',
+    title: 'Serverless Inference · GPU',
+    stage: 'inference',
+    desc: 'An OpenAI-compatible endpoint serving open models on GPUs. The platters spin up, the arm seeks across the glowing track rings and every generated token leaves as a particle on the return track to the client.',
+    color: '#ff6b8a',
   },
 };
 
-export const EDGES = [
-  ['spaces', 'functions'],
-  ['functions', 'vectordb'],
-  ['vectordb', 'kb'],
-  ['kb', 'agent'],
-  ['agent', 'inference'],
+/** stage name from an SSE event -> machine key */
+export const STAGE_MACHINE = { spaces: 'spaces', functions: 'functions', vectordb: 'vectordb', kb: 'router', agent: 'router', inference: 'inference' };
+
+const P = (key, machine, title, desc) => ({ key, machine, title, desc, solids: [] });
+
+export const PARTS = {
+  board: P('board', null, 'Base board', 'Everything sits on one bevelled board. Tracks carry data between machines; labels are engraved beside each one.'),
+  track: P('track', null, 'Data track', 'Parallel pipes at 90° and 45°. Each stream of particles is one job; the colour is the job’s colour so you can follow it through every machine.'),
+
+  'client.keypad': P('client.keypad', 'client', 'Keypad', 'Nine round keys. They press down when a request is sent: a fact or a question leaves the client as a stream of particles.'),
+  'client.screen': P('client.screen', 'client', 'Terminal screen', 'Shows the current request and the answer as its tokens arrive back from inference.'),
+  'client.plinth': P('client.plinth', 'client', 'Client housing', 'The client machine: an app, a CLI, a browser. It only knows the API.'),
+
+  'spaces.drawer': P('spaces.drawer', 'spaces', 'Object drawer', 'One drawer per bucket prefix. It slides open to receive the document object and closes once the PUT is durable.'),
+  'spaces.body': P('spaces.body', 'spaces', 'Bucket cabinet', 'The Spaces bucket. Cheap, durable, S3-compatible; the natural landing zone for raw data.'),
+  'spaces.lamp': P('spaces.lamp', 'spaces', 'Event trigger lamp', 'Flashes when the object is stored: the event that invokes the Function.'),
+  'spaces.doc': P('spaces.doc', 'spaces', 'Document object', 'A stored fact, as a text object. Colour = the job that wrote it.'),
+
+  'functions.gears': P('functions.gears', 'functions', 'Meshing gears', 'Turn while the Function runs; the drive for the press.'),
+  'functions.press': P('functions.press', 'functions', 'Chunk & embed press', 'Slams down to cut the document into chunks, then once per chunk to stamp its embedding vector.'),
+  'functions.anvil': P('functions.anvil', 'functions', 'Anvil', 'Where the document lands. Chunks appear here as small cubes before they leave for the vector store.'),
+  'functions.base': P('functions.base', 'functions', 'Function runtime', 'Serverless: nothing runs until the Spaces event arrives, and it scales to zero afterwards.'),
+
+  'vectordb.enclosure': P('vectordb.enclosure', 'vectordb', 'Vector enclosure', 'Glass case over twelve chambers. Each cube is one row: chunk text + embedding vector.'),
+  'vectordb.chamber': P('vectordb.chamber', 'vectordb', 'Chamber', 'One of twelve chambers (rows fill them round-robin). The needle on the router points here when a cube in it is retrieved.'),
+  'vectordb.scanner': P('vectordb.scanner', 'vectordb', 'Similarity scanner', 'Sweeps the enclosure during a cosine-similarity search (ORDER BY embedding <=> query LIMIT 3).'),
+  'vectordb.plinth': P('vectordb.plinth', 'vectordb', 'Managed Postgres', 'The database engine. The readout shows the live row count.'),
+  'vectordb.cube': P('vectordb.cube', 'vectordb', 'Vector row', 'One chunk and its 128-dim embedding. Flashes white when a search retrieves it.'),
+
+  'router.dial': P('router.dial', 'router', 'Retrieval dial', 'Knowledge Base. The needle sweeps while searching and settles pointing at the chamber of each retrieved chunk.'),
+  'router.needle': P('router.needle', 'router', 'Needle', 'Points physically at the retrieved chamber in the vector enclosure.'),
+  'router.knob': P('router.knob', 'router', 'Embedding knob', 'Turns one notch when the question is embedded.'),
+  'router.tray': P('router.tray', 'router', 'Prompt tray', 'Managed Agent. One slot lights per retrieved chunk; the prompt lamp comes on when the grounded prompt is ready.'),
+  'router.base': P('router.base', 'router', 'GenAI Platform', 'Knowledge Base + Managed Agent share one housing: retrieval on the left, orchestration on the right.'),
+
+  'inference.platters': P('inference.platters', 'inference', 'Platters', 'Spin while the model generates. Track rings light in the job colour as tokens stream.'),
+  'inference.arm': P('inference.arm', 'inference', 'Actuator arm', 'Seeks to a different track for every token.'),
+  'inference.fan': P('inference.fan', 'inference', 'GPU fan', 'Spins up with the load.'),
+  'inference.heatsink': P('inference.heatsink', 'inference', 'Heatsink', 'Fins at the back of the engine.'),
+  'inference.base': P('inference.base', 'inference', 'Inference endpoint', 'OpenAI-compatible /chat/completions with stream: true. Pay per token, scale to zero.'),
+};
+
+export const SAMPLE_FACTS = [
+  'The Q3 launch event is in Austin on October 22nd and starts at 9am.',
+  'Our support SLA promises a first response within 4 hours for business customers.',
+  'The Paris office moved to 12 Rue de Rivoli in March 2026.',
+  'Spaces buckets in region nyc3 replicate objects across three availability zones.',
+  'The on-call rotation hands over every Monday at 10am Eastern.',
+  'pgvector supports HNSW indexes for approximate nearest-neighbour search.',
+  'The marketing newsletter goes out on the first Tuesday of each month.',
+  'Serverless inference bills per million tokens with no idle cost.',
 ];
 
-export const STAGE_NAMES = Object.keys(NODES);
+export const SAMPLE_QUESTIONS = [
+  'When is the Q3 launch event?',
+  'What is the support SLA first response time?',
+  'Where is the Paris office?',
+  'How are Spaces objects replicated in nyc3?',
+  'When does the on-call rotation hand over?',
+  'Which index does pgvector support?',
+  'When does the newsletter go out?',
+  'How is serverless inference billed?',
+];

@@ -1,14 +1,30 @@
+/**
+ * Wires the backend SSE stream to the machines. Every motion in the scene is
+ * triggered here by a backend event (hello / job / stage / answer / replay /
+ * recorder / fallback); the frontend never invents pipeline activity.
+ */
+import * as THREE from 'three';
 import { createScene } from './scene.js';
-import { createPacketSystem } from './packets.js';
+import { buildBoard, boardLabel, BOARD } from './board.js';
+import { buildTracks } from './tracks.js';
+import { buildClient } from './machines/client.js';
+import { buildSpaces } from './machines/spaces.js';
+import { buildFunctions } from './machines/functions.js';
+import { buildVectorDb } from './machines/vectordb.js';
+import { buildRouter } from './machines/router.js';
+import { buildInference } from './machines/inference.js';
 import { createUI } from './ui.js';
 import { connectEvents, api } from './events.js';
-import { NODES } from './components.js';
+import { MACHINES, PARTS, SAMPLE_FACTS, SAMPLE_QUESTIONS } from './components.js';
+import { JOB_COLORS } from './kit.js';
 
-const FILL_FULL_AT = 12; // chunks needed to show the vector DB "full"
-
+// ---- UI --------------------------------------------------------------------
 const ui = createUI({
   onSubmitFact: (text) => api('/facts', { method: 'POST', body: { text } }),
   onAsk: (question) => api('/ask', { method: 'POST', body: { question } }),
+  onSpeed: (s) => view.setSpeed(s),
+  onAuto: (on) => setAuto(on),
+  onResetView: () => view.goHome(),
   onReplay: async (name, speed) => {
     try {
       await api(`/recordings/${encodeURIComponent(name)}/replay`, { method: 'POST', body: { speed } });
@@ -34,89 +50,385 @@ const ui = createUI({
   },
 });
 
+// ---- scene -----------------------------------------------------------------
 const view = createScene(document.getElementById('scene'), {
-  onHover: (key, x, y) => ui.hover(key, x, y),
-  onSelect: (key) => ui.showExplainer(key, true),
+  onHover: (part) => ui.hover(part),
+  onSelect: (part) => ui.select(part),
+  onFps: (n) => ui.setFps(n),
 });
-const packets = createPacketSystem(view.scene);
-view.onTick((dt) => packets.update(dt));
+view.scene.add(buildBoard(PARTS));
+const tracks = buildTracks(view.scene, PARTS);
+const machines = {
+  client: buildClient(PARTS),
+  spaces: buildSpaces(PARTS),
+  functions: buildFunctions(PARTS),
+  vectordb: buildVectorDb(PARTS),
+  router: buildRouter(PARTS),
+  inference: buildInference(PARTS),
+};
+for (const m of Object.values(machines)) view.scene.add(m.group);
+for (const p of Object.values(PARTS)) if (p.machine) p.machineRef = machines[p.machine];
+// labels on the board
+const LABELS = [
+  ['CLIENT · APP / CLI', -16.2, 3.4],
+  [MACHINES.spaces.label, -7.5, -2.0],
+  [MACHINES.functions.label, -1, -2.0],
+  [MACHINES.vectordb.label, 7.8, -0.9],
+  ['KNOWLEDGE BASE / AGENT · GENAI PLATFORM', -1, 7.0],
+  [MACHINES.inference.label, 8.5, 7.1],
+];
+for (const [text, x, z] of LABELS) view.scene.add(boardLabel(text, x, z));
+// register every pickable mesh; parts know their machine for double-click focus
+for (const p of Object.values(PARTS)) {
+  p.machine = p.machine ? { ...MACHINES[p.machine], center: machines[p.machine].center, focusZoom: machines[p.machine].focusZoom, key: p.machine } : { center: new THREE.Vector3(BOARD.x, 0, BOARD.z), focusZoom: 1 };
+  for (const s of p.solids) view.registerPickable(s);
+}
+view.registerPickable(tracks.group);
+view.fitHome(new THREE.Box3(new THREE.Vector3(BOARD.x - BOARD.w / 2, -1, BOARD.z - BOARD.d / 2), new THREE.Vector3(BOARD.x + BOARD.w / 2, 3, BOARD.z + BOARD.d / 2)));
+window.addEventListener('resize', () => view.fitHome(new THREE.Box3(new THREE.Vector3(BOARD.x - BOARD.w / 2, -1, BOARD.z - BOARD.d / 2), new THREE.Vector3(BOARD.x + BOARD.w / 2, 3, BOARD.z + BOARD.d / 2))));
 
-// ---- event -> animation mapping -------------------------------------------
-const jobs = new Map(); // jobId -> { flow, last: stageKey }
+view.onTick((dt, t) => {
+  for (const m of Object.values(machines)) m.update(dt, t);
+  tracks.update(dt, view.camera.zoom);
+  // activity glow follows the stage state (one slot per stage; kb and agent share the router)
+  for (const a of Object.values(activity)) {
+    a.level += (a.target - a.level) * (1 - Math.exp(-dt * 5));
+    machines[a.machine].setActive(a.level, a.which);
+  }
+});
+
+// ---- live stats -------------------------------------------------------------
+const stats = {
+  client: { facts: 0, questions: 0, 'last request': '—', 'last answer': '—' },
+  spaces: { objects: 0, 'last key': '—', bytes: 0, 'last PUT': '—' },
+  functions: { invocations: 0, chunks: 0, embeddings: 0, 'last run': '—' },
+  vectordb: { rows: 0, inserts: 0, searches: 0, 'last hits': '—', 'top score': '—', 'last query': '—' },
+  router: { queries: 0, 'context chunks': 0, prompts: 0, 'last retrieval': '—' },
+  inference: { tokens: 0, model: '—', 'tok/s': '—', 'last generation': '—' },
+};
+ui.setStatsProvider((part) => {
+  if (part.key === 'track') return { 'streams in flight': tracks.inFlight, routes: Object.keys(tracks.tracks).length };
+  if (part.key === 'board') return { machines: 6, mode: baseMode, 'jobs seen': jobSeq };
+  const m = part.machine?.key;
+  if (!m) return {};
+  const s = { ...stats[m] };
+  if (part.key === 'vectordb.cube' || part.key === 'vectordb.chamber') s.chambers = 12;
+  return s;
+});
+
+// ---- event -> animation mapping ---------------------------------------------
+const jobs = new Map(); // jobId -> { flow, color, last, q, input, stageStart: Map }
+const activity = {
+  client: { machine: 'client' },
+  spaces: { machine: 'spaces' },
+  functions: { machine: 'functions' },
+  vectordb: { machine: 'vectordb' },
+  kb: { machine: 'router', which: 'kb' },
+  agent: { machine: 'router', which: 'agent' },
+  inference: { machine: 'inference' },
+};
+for (const a of Object.values(activity)) Object.assign(a, { level: 0, target: 0 });
 let baseMode = 'mock';
-let resetTimer;
+let jobSeq = 0;
+let recentJobs = [];
+const latencyMs = (ms) => (ms < 1 ? '<1' : Math.round(ms));
 
-function stageStart(e) {
-  const job = jobs.get(e.jobId) || { flow: e.flow, last: null };
-  jobs.set(e.jobId, job);
-  const color = NODES[e.stage]?.color;
-  const to = view.nodePosition(e.stage);
-  const arrive = () => {
-    view.setActivity(e.stage, 1);
-    view.pulse(e.stage, 0.8);
-  };
-  if (job.last && job.last !== e.stage) packets.fly(view.nodePosition(job.last), to, { color, onArrive: arrive });
-  else packets.dropIn(to, { color, onArrive: arrive });
-  view.setActivity(e.stage, 0.55);
-  job.last = e.stage;
-  view.setPill(e.stage, e.detail);
-  ui.setStageStatus(e.stage, e.detail);
+function setActivity(key, on) {
+  activity[key].target = on ? 1 : 0;
 }
 
+/** is any other running job still using this stage? (keeps the glow on for overlapping jobs) */
+function anyActive(stageKey, exceptJobId) {
+  for (const [id, j] of jobs) if (id !== exceptJobId && j.stageStart.has(stageKey) && !j.finished) return true;
+  return false;
+}
+
+function getJob(e) {
+  let job = jobs.get(e.jobId);
+  if (!job) {
+    job = { flow: e.flow, color: JOB_COLORS[jobSeq % JOB_COLORS.length], lane: jobSeq % 3, q: Promise.resolve(), input: '', stageStart: new Map(), tokens: 0, tokenAt: 0, pendingAnswer: null, landed: 0, text: '', answered: false };
+    jobSeq++;
+    jobs.set(e.jobId, job);
+  }
+  return job;
+}
+/** queue a step on the job so streams and machine moves stay in order */
+function enqueue(job, fn) {
+  job.q = job.q.then(fn).catch((err) => console.warn('step failed', err));
+}
+
+function stageStart(e, job) {
+  job.stageStart.set(e.stage, e.ts);
+  switch (e.stage) {
+    case 'spaces': {
+      stats.spaces['last key'] = e.data?.key || '—';
+      stats.spaces.bytes += e.data?.bytes || 0;
+      machines.client.type([0, 4, 8, 2, 6], 60);
+      machines.client.screen(`> PUT ${job.input.slice(0, 20)}`, 'posting fact…', job.color);
+      enqueue(job, async () => {
+        setActivity('client', true);
+        await tracks.send('client-spaces', { color: job.color, lane: 0, count: 42 });
+        setActivity('client', false);
+        setActivity('spaces', true);
+        const d = machines.spaces.open();
+        job.drawer = d;
+      });
+      break;
+    }
+    case 'functions':
+      stats.functions.invocations++;
+      enqueue(job, async () => {
+        await tracks.send('spaces-functions', { color: job.color, lane: 0, count: 30 });
+        setActivity('functions', true);
+        machines.functions.load(job.color);
+      });
+      break;
+    case 'vectordb':
+      if (e.data?.op === 'search') {
+        stats.vectordb.searches++;
+        enqueue(job, async () => {
+          await tracks.send('router-vectordb', { color: job.color, lane: 0, count: 34 });
+          setActivity('vectordb', true);
+          machines.vectordb.startScan();
+        });
+      } else {
+        stats.vectordb.inserts++;
+        enqueue(job, async () => {
+          await tracks.send('functions-vectordb', { color: job.color, lane: 0, count: 34 });
+          setActivity('vectordb', true);
+        });
+      }
+      break;
+    case 'kb':
+      stats.router.queries++;
+      machines.client.type([1, 3, 5, 7], 60);
+      machines.client.screen(`> ASK ${job.input.slice(0, 20)}`, 'question sent…', job.color);
+      enqueue(job, async () => {
+        setActivity('client', true);
+        await tracks.send('client-router', { color: job.color, lane: 0, count: 46 });
+        setActivity('client', false);
+        setActivity('kb', true);
+        machines.router.sweep(true);
+      });
+      break;
+    case 'agent':
+      stats.router.prompts++;
+      enqueue(job, async () => {
+        setActivity('agent', true);
+        machines.router.setSlots(Math.max(1, job.hits || 0));
+      });
+      break;
+    case 'inference':
+      stats.inference.model = e.data?.model || stats.inference.model;
+      job.tokens = 0;
+      job.tokenAt = e.ts;
+      enqueue(job, async () => {
+        await tracks.send('router-inference', { color: job.color, lane: 0, count: 40 });
+        setActivity('inference', true);
+        machines.inference.spinUp(job.color);
+      });
+      break;
+  }
+}
+
+function stageProgress(e, job) {
+  switch (e.stage) {
+    case 'functions':
+      if (e.data?.step === 'chunk') {
+        stats.functions.chunks += e.data.chunks || 0;
+        enqueue(job, () => machines.functions.chunk(e.data.chunks || 1, job.color));
+      } else if (e.data?.step === 'embed') {
+        stats.functions.embeddings++;
+        enqueue(job, () => machines.functions.embed(e.data.index || 0));
+      }
+      break;
+    case 'kb':
+      if (e.data?.step === 'embed') enqueue(job, () => machines.router.turnKnob());
+      break;
+    case 'inference':
+      if (e.data?.token !== undefined) {
+        job.tokens++;
+        stats.inference.tokens++;
+        const dtSec = Math.max(0.05, (e.ts - job.tokenAt) / 1000);
+        stats.inference['tok/s'] = (job.tokens / dtSec).toFixed(1);
+        machines.inference.token();
+        const token = e.data.token;
+        // each token is a short burst on the return track (one lane per job so they land in order);
+        // the text lands when the particles do
+        tracks.send('inference-client', { color: job.color, lane: job.lane, count: 7, speed: 24, spacing: 0.14, size: 6 }).then(() => {
+          if (job.answered) return;
+          job.text += token;
+          ui.answerAppend(token);
+          job.landed++;
+          machines.client.screen(`> ${job.input.slice(0, 22)}`, job.text.slice(-24), job.color);
+          if (job.pendingAnswer && job.landed >= job.tokens) finishAnswer(job);
+        });
+      }
+      break;
+  }
+}
+
+function stageDone(e, job) {
+  const started = job.stageStart.get(e.stage);
+  const latency = started != null ? e.ts - started : null;
+  switch (e.stage) {
+    case 'spaces':
+      stats.spaces.objects++;
+      stats.spaces['last PUT'] = `${latencyMs(latency)} ms`;
+      enqueue(job, async () => {
+        await wait(250);
+        machines.spaces.file(job.drawer ?? 0, job.color);
+        machines.spaces.trigger();
+        await wait(600);
+        machines.spaces.close(job.drawer ?? 0);
+        setActivity('spaces', false);
+      });
+      break;
+    case 'functions':
+      stats.functions['last run'] = `${latencyMs(latency)} ms`;
+      enqueue(job, async () => {
+        await wait(700);
+        machines.functions.clear();
+        setActivity('functions', false);
+      });
+      break;
+    case 'vectordb':
+      if (e.data?.count !== undefined) stats.vectordb.rows = e.data.count;
+      if (e.data?.op === 'search') {
+        const hits = e.data?.hits || [];
+        job.hits = hits.length;
+        stats.vectordb['last hits'] = hits.length;
+        stats.vectordb['top score'] = hits[0]?.score ?? '—';
+        stats.vectordb['last query'] = `${latencyMs(latency)} ms`;
+        enqueue(job, async () => {
+          await wait(900); // let the scanner make a visible sweep even when the search is instant
+          machines.vectordb.stopScan();
+          const found = machines.vectordb.hit(hits.map((h) => h.id));
+          machines.router.pointAt(found.map((f) => f.pos));
+          await tracks.send('router-vectordb', { color: job.color, lane: 1, count: 30, reverse: true });
+          setActivity('vectordb', false);
+        });
+      } else {
+        const count = e.data?.count;
+        enqueue(job, async () => {
+          if (count !== undefined) machines.vectordb.setCount(count, job.color);
+          await wait(500);
+          setActivity('vectordb', false);
+          machines.client.screen('> stored', `${count ?? '?'} rows in pgvector`, job.color);
+        });
+      }
+      break;
+    case 'kb':
+      stats.router['context chunks'] += e.data?.hits || 0;
+      stats.router['last retrieval'] = `${latencyMs(latency)} ms`;
+      enqueue(job, async () => {
+        machines.router.sweep(false);
+        await wait(250);
+        setActivity('kb', false);
+      });
+      break;
+    case 'agent':
+      enqueue(job, async () => {
+        await wait(450);
+        machines.router.promptReady();
+        await wait(400);
+        setActivity('agent', false);
+      });
+      break;
+    case 'inference':
+      stats.inference['last generation'] = `${latencyMs(latency)} ms`;
+      enqueue(job, async () => {
+        await wait(300);
+        machines.inference.spinDown();
+        setActivity('inference', false);
+      });
+      break;
+  }
+  return latency;
+}
+
+function finishAnswer(job) {
+  if (job.answered || !job.pendingAnswer) return;
+  const { text, sources } = job.pendingAnswer;
+  job.pendingAnswer = null;
+  job.answered = true;
+  ui.answerSet(text, sources);
+  stats.client['last answer'] = text.slice(0, 60);
+  machines.client.screen('> answer', text.slice(0, 26), job.color);
+  machines.client.setLed(job.color);
+  machines.client.type([4], 0);
+}
+
+const wait = (ms) => view.waitAnim(ms / 1000);
+
+let catchUpCutoff = 0;
 function handleEvent(e) {
-  ui.log(e);
+  let latency;
+  // the server replays recent history after `hello`; log it, don't re-animate it
+  if (e.type !== 'hello' && e.ts && e.ts < catchUpCutoff) {
+    ui.log(e, { stale: true });
+    return;
+  }
   switch (e.type) {
     case 'hello':
+      catchUpCutoff = e.ts - 1500;
       baseMode = e.data.mode;
       ui.setMode(`${baseMode} mode`, baseMode === 'real' ? 'ok' : '');
       ui.setRecorderStatus(e.data.recorder);
-      if (e.data.pipeline?.chunks) view.setFill(e.data.pipeline.chunks / FILL_FULL_AT);
+      if (e.data.pipeline?.chunks !== undefined) {
+        stats.vectordb.rows = e.data.pipeline.chunks;
+        machines.vectordb.setCount(e.data.pipeline.chunks, '#4dff9a', false);
+      }
       break;
-    case 'job':
+    case 'job': {
+      const job = getJob(e);
       if (e.status === 'start') {
-        clearTimeout(resetTimer);
-        jobs.set(e.jobId, { flow: e.flow, last: null });
-        if (e.flow === 'query') ui.answerReset();
+        job.input = e.data?.input || '';
+        if (e.flow === 'ingest') stats.client.facts++;
+        else stats.client.questions++;
+        stats.client['last request'] = job.input.slice(0, 50);
+        if (e.flow === 'query') ui.answerReset(job.input);
+        machines.client.setLed(job.color);
+        recentJobs = [{ flow: e.flow, input: job.input, color: job.color }, ...recentJobs].slice(0, 5);
+        ui.setLegend(recentJobs);
       } else {
-        const job = jobs.get(e.jobId);
-        jobs.delete(e.jobId);
-        if (e.status === 'done' && job?.last === 'inference') packets.flyUp(view.nodePosition('inference'), { color: NODES.inference.color });
-        if (e.status === 'error') ui.toast(`Pipeline error: ${e.data?.message || 'unknown'}`, 'err');
-        resetTimer = setTimeout(() => { if (!jobs.size) view.resetAll(); }, 2500);
+        job.finished = true;
+        if (e.status === 'error') {
+          ui.toast(`Pipeline error: ${e.data?.message || 'unknown'}`, 'err');
+          for (const k of Object.keys(activity)) setActivity(k, false);
+          machines.vectordb.stopScan();
+          machines.inference.spinDown();
+          machines.router.sweep(false);
+        }
+        enqueue(job, async () => {
+          await wait(1500);
+          if (e.flow === 'query') machines.router.rest();
+          machines.router.setSlots(0);
+          for (const k of Object.keys(activity)) if (!anyActive(k, e.jobId)) setActivity(k, false);
+          jobs.delete(e.jobId);
+        });
       }
       break;
-    case 'stage':
-      if (e.status === 'start') stageStart(e);
-      else if (e.status === 'progress') {
-        if (e.stage === 'functions') view.setSpin('functions', true);
-        if (e.data?.token !== undefined) {
-          ui.answerAppend(e.data.token);
-          view.pulse('inference', 0.5);
-        } else if (e.detail) {
-          view.setPill(e.stage, e.detail);
-          ui.setStageStatus(e.stage, e.detail);
-        }
-      } else if (e.status === 'done') {
-        view.setActivity(e.stage, 0.3);
-        view.setSpin(e.stage, false);
-        if (e.detail) { view.setPill(e.stage, e.detail); ui.setStageStatus(e.stage, e.detail); }
-        if (e.stage === 'vectordb') {
-          if (e.data?.count !== undefined) view.setFill(e.data.count / FILL_FULL_AT);
-          view.pulse('vectordb', 1);
-          // packet returns from DB to KB after a search
-          if (e.data?.op === 'search' && jobs.get(e.jobId)) {
-            packets.fly(view.nodePosition('vectordb'), view.nodePosition('kb'), { color: NODES.kb.color, onArrive: () => view.pulse('kb', 0.6) });
-            jobs.get(e.jobId).last = 'kb';
-          }
-        }
-      } else if (e.status === 'error') {
-        view.setPill(e.stage, `✖ ${e.detail}`);
-        ui.setStageStatus(e.stage, `error: ${e.detail}`);
+    }
+    case 'stage': {
+      const job = getJob(e);
+      if (e.status === 'start') stageStart(e, job);
+      else if (e.status === 'progress') stageProgress(e, job);
+      else if (e.status === 'done') latency = stageDone(e, job);
+      else if (e.status === 'error') {
+        const started = job.stageStart.get(e.stage);
+        latency = started != null ? e.ts - started : undefined;
+        ui.toast(`${e.stage} error: ${e.detail}`, 'err');
       }
       break;
-    case 'answer':
-      ui.answerSet(e.data.text, e.data.sources);
+    }
+    case 'answer': {
+      const job = getJob(e);
+      job.pendingAnswer = { text: e.data.text, sources: e.data.sources || [] };
+      if (job.landed >= job.tokens) finishAnswer(job);
+      else wait(12000).then(() => finishAnswer(job));
       break;
+    }
     case 'fallback':
       ui.toast(`Live ${e.flow} failed (${e.data.reason}). Replaying "${e.data.recording}".`, 'warn', 7000);
       break;
@@ -129,6 +441,7 @@ function handleEvent(e) {
       refreshRecordings();
       break;
   }
+  ui.log(e, { latency: latency != null ? latencyMs(latency) : undefined });
 }
 
 async function refreshRecordings() {
@@ -140,5 +453,28 @@ async function refreshRecordings() {
   }
 }
 
+// ---- auto traffic -----------------------------------------------------------
+let autoTimer = null;
+let autoIdx = 0;
+function setAuto(on) {
+  clearInterval(autoTimer);
+  autoTimer = null;
+  if (!on) return;
+  const tick = async () => {
+    const i = autoIdx++;
+    try {
+      if (i % 2 === 0) await api('/facts', { method: 'POST', body: { text: SAMPLE_FACTS[(i / 2) % SAMPLE_FACTS.length] } });
+      else await api('/ask', { method: 'POST', body: { question: SAMPLE_QUESTIONS[Math.floor(i / 2) % SAMPLE_QUESTIONS.length] } });
+    } catch (err) {
+      ui.toast(`auto traffic: ${err.message}`, 'err');
+    }
+  };
+  tick();
+  autoTimer = setInterval(tick, 9000);
+}
+
 connectEvents({ onEvent: handleEvent, onState: (s) => ui.setConn(s) });
 refreshRecordings();
+
+// debug / verification hook (used by the headless capture scripts)
+window.__anatomy = { machines, tracks, view, jobs, stats, PARTS };
