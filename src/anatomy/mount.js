@@ -53,13 +53,13 @@ export function mountAnatomy(container, ui) {
   //  - the gateway's label sits in the gap between its front face (z 1.4) and the harness's
   //    back-right corner (x -1.5, z 2.6), left of the band the inference platters occlude
   //    (x > ~3.7 for z > 0);
-  //  - the App Platform label is shifted left of its press (its sub-line would otherwise
-  //    vanish behind the gateway turret) and slightly smaller so it clears the
-  //    gateway-spaces track leg at x -4.9.
+  //  - the App Platform label is shifted left of its press (its CHUNK & EMBED sub-line would
+  //    otherwise vanish behind the gateway turret) and slightly smaller; further back (z < -2.5)
+  //    the press itself hides the name.
   const LABELS = [
     ['CLIENT · APP / CLI', -16.2, 3.4],
     [MACHINES.spaces.label, -7.5, -2.0],
-    [MACHINES.functions.label, -2.2, -2.3, { size: 0.46 }],
+    [MACHINES.functions.label, -3.0, -2.25, { size: 0.46 }],
     [MACHINES.vectordb.label, 7.8, -0.9],
     [MACHINES.gateway.label, 0.7, 1.7],
     [`${MACHINES.router.label} · ${MACHINES.router.sublabel.replace(' · ', ' / ').toUpperCase()}`, -3.8, 7.0],
