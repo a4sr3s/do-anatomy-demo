@@ -84,7 +84,7 @@ services:
       - key: HARNESS_GATEWAY_TOOLS
         value: ""
       - key: HARNESS_SESSION_NAME
-        value: alexis-anatomy-harness-v4
+        value: alexis-anatomy-harness-v5
       - key: HARNESS_MODEL
         value: openai-gpt-oss-20b
       # DigitalOcean API token with Managed Agents access (DIGITALOCEAN_ACCESS_TOKEN also works)

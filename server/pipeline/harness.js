@@ -70,7 +70,7 @@ export function harnessConfig(env) {
   return {
     token: env.HARNESS_API_TOKEN || env.DIGITALOCEAN_ACCESS_TOKEN || '',
     inferenceKey: env.HARNESS_INFERENCE_API_KEY || '',
-    sessionName: env.HARNESS_SESSION_NAME || 'alexis-anatomy-harness-v4',
+    sessionName: env.HARNESS_SESSION_NAME || 'alexis-anatomy-harness-v5',
     model: env.HARNESS_MODEL || 'openai-gpt-oss-20b',
     size: env.HARNESS_SIZE || 'mars-1vcpu-1gb',
     idleTimeout: env.HARNESS_IDLE_TIMEOUT || '30m',
