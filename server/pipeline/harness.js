@@ -70,7 +70,7 @@ export function harnessConfig(env) {
   return {
     token: env.HARNESS_API_TOKEN || env.DIGITALOCEAN_ACCESS_TOKEN || '',
     inferenceKey: env.HARNESS_INFERENCE_API_KEY || '',
-    sessionName: env.HARNESS_SESSION_NAME || 'alexis-anatomy-harness-v4',
+    sessionName: env.HARNESS_SESSION_NAME || 'alexis-anatomy-harness-v4b',
     model: env.HARNESS_MODEL || 'openai-gpt-oss-20b',
     size: env.HARNESS_SIZE || 'mars-1vcpu-1gb',
     idleTimeout: env.HARNESS_IDLE_TIMEOUT || '30m',
@@ -195,20 +195,49 @@ export function isDontKnow(text) {
  * after a first ANSWER: line (often glued on without a space, e.g.
  * "...yet.We must search again"), calls another tool and writes a second
  * ANSWER: line. So streaming stops at the end of the first answer line: a
- * newline, a sentence end glued to a capital letter, or a tool call (close()).
- * The final text is the last ANSWER: segment, cut the same way; the `answer`
- * event carries it and replaces whatever was streamed.
+ * newline, a sentence end glued to a capital letter, a leaked Harmony/channel
+ * control token, or a tool call (close()). The final text is the last ANSWER:
+ * segment, cut the same way; the `answer` event carries it and replaces
+ * whatever was streamed.
+ *
+ * Nothing before the marker is ever emitted or returned: a run that never
+ * writes ANSWER: finishes with `{ text: '', noMarker: true }` and the caller
+ * decides what to answer (server/pipeline/real.js runs its guard path).
  */
 const GLUED_SENTENCE = /[a-z0-9)\]"'’][.!?](?=[A-Z])/;
+/**
+ * gpt-oss Harmony chat-template leaks that sometimes trail an answer when the
+ * model keeps going: `<|end|>`, `<|start|>assistant<|channel|>analysis<|message|>…`,
+ * `<|return|>`, or the same without the control tokens (`assistantfinal`,
+ * `assistantanalysis`, `analysisWe should…`). A lone `<|` is cut too so a
+ * control token split across streamed deltas never leaks its first half.
+ */
+const HARMONY_JUNK = /<\||\bassistant(?:final|analysis|commentary)\b|(?<=^|[\s.!?])(?:analysis|final|commentary)(?=[A-Z<])/;
+const HARMONY_WORDS = ['assistantfinal', 'assistantanalysis', 'assistantcommentary', 'analysis', 'final', 'commentary'];
+/** Trailing text that may be the first half of a Harmony token split across deltas: held back until the next delta decides. */
+function partialJunkAt(text) {
+  const m = /(?:^|[\s.!?])([A-Za-z]{1,20})$/.exec(text);
+  if (m && HARMONY_WORDS.some((w) => w.startsWith(m[1]))) return text.length - m[1].length;
+  return text.endsWith('<') ? text.length - 1 : -1;
+}
 
 function firstAnswerLine(text) {
   const t = String(text || '').replace(/^\s+/, '');
   let end = t.length;
   const nl = t.search(/\r?\n/);
   if (nl !== -1) end = nl;
+  const junk = HARMONY_JUNK.exec(t.slice(0, end));
+  if (junk) end = junk.index;
   const glued = GLUED_SENTENCE.exec(t.slice(0, end));
   if (glued) end = glued.index + 2;
-  return { text: t.slice(0, end), complete: end < t.length };
+  return { text: t.slice(0, end).replace(/\s+$/, ''), complete: end < t.length };
+}
+
+/** Last defence for a finished answer: drop any Harmony/channel junk and whatever follows it. */
+export function stripHarmonyJunk(text) {
+  const t = String(text || '');
+  const junk = HARMONY_JUNK.exec(t);
+  return (junk ? t.slice(0, junk.index) : t).trim();
 }
 
 export class MarkerFilter {
@@ -232,7 +261,12 @@ export class MarkerFilter {
     const seg = this.raw.slice(this.start);
     const next = seg.indexOf(MARKER);
     const line = firstAnswerLine(next === -1 ? seg : seg.slice(0, next));
-    const out = line.text.slice(this.emitted.length);
+    let visible = line.text;
+    if (!line.complete && next === -1) {
+      const hold = partialJunkAt(visible);
+      if (hold !== -1) visible = visible.slice(0, hold).replace(/\s+$/, '');
+    }
+    const out = visible.length > this.emitted.length ? visible.slice(this.emitted.length) : '';
     if (out) { this.emitted += out; this.onToken(out, this.i++); }
     if (line.complete || next !== -1) this.closed = true;
   }
@@ -240,17 +274,31 @@ export class MarkerFilter {
   close() {
     if (this.found && this.emitted) this.closed = true;
   }
-  /** Final answer: the last ANSWER: segment; if the model never used the marker, the whole text. */
+  /**
+   * Final answer: the last ANSWER: segment. If the model never used the marker
+   * nothing is emitted and the text is empty (`noMarker: true`): pre-marker
+   * text is reasoning and never reaches the audience.
+   */
   finish() {
-    if (!this.found) {
-      const t = this.raw.trim();
-      if (t) this.onToken(t, this.i++);
-      return { text: t, tokens: this.i };
-    }
+    if (!this.found) return { text: '', tokens: this.i, noMarker: true };
     const at = this.raw.lastIndexOf(MARKER);
-    const last = firstAnswerLine(this.raw.slice(at + MARKER.length)).text.trim();
-    return { text: last || this.emitted.trim(), tokens: this.i };
+    const last = stripHarmonyJunk(firstAnswerLine(this.raw.slice(at + MARKER.length)).text);
+    return { text: last || stripHarmonyJunk(this.emitted), tokens: this.i, noMarker: false };
   }
+}
+
+/**
+ * A harness tool event that cannot have grounded the answer: OpenCode reports a
+ * malformed tool call (bad JSON arguments, unknown tool) as tool `invalid`, and
+ * failed calls arrive as `run.tool_call_failed` / `status: "error"` / `error`.
+ */
+export function isInvalidToolEvent(type, d = {}) {
+  const name = normalizeToolName(d.tool || d.name || d.tool_name);
+  if (name === 'invalid') return true;
+  if (/fail|error|invalid/i.test(String(type || ''))) return true;
+  const status = String(d.status || d.state || '').toLowerCase();
+  if (/^(error|failed|failure|invalid)$/.test(status)) return true;
+  return d.error != null && d.error !== false && d.error !== '';
 }
 
 const KNOWN_EVENTS = new Set(['run.started', 'run.token_delta', 'run.usage_recorded', 'run.completed', 'run.failed', 'run.log']);
@@ -365,7 +413,8 @@ export class HarnessClient {
     const alive = () => {
       if (firstTimer) { clearTimeout(firstTimer); firstTimer = null; }
     };
-    const stats = { firstTokenMs: null, model: null, tokensIn: 0, tokensOut: 0, harnessToolEvents: 0 };
+    const stats = { firstTokenMs: null, model: null, tokensIn: 0, tokensOut: 0, harnessToolEvents: 0, invalidTool: 0 };
+    const invalidCalls = new Set(); // call ids of malformed/failed tool calls, so their completion events are flagged too
     // "first token" = first answer token streamed to the audience (text after ANSWER:); hidden
     // reasoning and tool activity only count as liveness for the first-token timeout.
     let sawOutput = false;
@@ -426,9 +475,16 @@ export class HarnessClient {
           } else if (isToolEventType(e.type)) {
             // tool-call events from the harness itself (names vary by adapter); the MCP server's own events are primary
             alive();
-            stats.harnessToolEvents++;
             filter.close();
-            hooks.onToolEvent?.({ type: e.type, data: d, ts: e.ts || Date.now() });
+            const callId = d.call_id ?? d.callId ?? d.tool_call_id ?? d.id;
+            let invalid = isInvalidToolEvent(e.type, d);
+            if (callId != null) {
+              if (invalid) invalidCalls.add(callId);
+              else if (invalidCalls.has(callId)) invalid = true;
+            }
+            if (invalid) stats.invalidTool++;
+            else stats.harnessToolEvents++;
+            hooks.onToolEvent?.({ type: e.type, data: d, ts: e.ts || Date.now(), invalid });
           } else if (!KNOWN_EVENTS.has(e.type) && !this.seenEventTypes.has(e.type)) {
             this.seenEventTypes.add(e.type);
             this.log.debug?.(`[harness] unhandled event type ${e.type}`);

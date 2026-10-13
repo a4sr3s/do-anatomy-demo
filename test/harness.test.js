@@ -13,7 +13,7 @@ const BASE_ENV = { HARNESS_API_TOKEN: 'tok', HARNESS_INFERENCE_API_KEY: 'k', MCP
  * session, events -> scripted stream, input -> run id. `onInput` lets a test
  * react to the prompt (e.g. simulate the MCP server reporting tool events).
  */
-function fakeHarness(deltas, { fail = false, sessions, extraEvents = [], onInput, hang = false, name = 'alexis-anatomy-harness-v4' } = {}) {
+function fakeHarness(deltas, { fail = false, sessions, extraEvents = [], onInput, hang = false, name = 'alexis-anatomy-harness-v4b' } = {}) {
   const calls = [];
   const runId = 'run-1';
   const state = { sessions: sessions || [{ session_id: 'sess-1', name, status: 'SESSION_STATUS_PAUSED', labels: { manifest: '__match__' } }] };
@@ -82,15 +82,49 @@ function setup(env, harness, { mcpHealthy = true } = {}) {
 const starts = (events) => events.filter((e) => e.type === 'stage' && e.status === 'start').map((e) => e.stage);
 const tokensOf = (events) => events.filter((e) => e.type === 'stage' && e.stage === 'inference' && e.status === 'progress').map((e) => e.data.token).join('');
 
-test('harness: MarkerFilter hides text before ANSWER: and falls back to raw text', () => {
+test('harness: MarkerFilter hides text before ANSWER: and never falls back to pre-marker text', () => {
   const out = [];
   const f = new MarkerFilter((t) => out.push(t));
   ['We need to', ' answer. ANS', 'WER:', ' 40', ' droplets.'].forEach((t) => f.push(t));
   assert.equal(out.join(''), '40 droplets.');
-  assert.equal(f.finish().text, '40 droplets.');
+  assert.deepEqual(f.finish(), { text: '40 droplets.', tokens: 2, noMarker: false });
+  // no marker at all: reasoning is never emitted and never returned
+  const n = [];
+  const g = new MarkerFilter((t) => n.push(t));
+  ['We should search again. ', 'The user asks about droplets; ', 'I will reply that I do not know.'].forEach((t) => g.push(t));
+  assert.deepEqual(g.finish(), { text: '', tokens: 0, noMarker: true });
+  assert.deepEqual(n, []);
+  const e = new MarkerFilter((t) => n.push(t));
+  assert.deepEqual(e.finish(), { text: '', tokens: 0, noMarker: true });
+  assert.deepEqual(n, []);
+});
+
+test('harness: MarkerFilter strips trailing Harmony/channel junk from streamed tokens and from the answer', () => {
+  const cases = [
+    ['ANSWER: Acme runs 40 GPU droplets.<|end|><|start|>assistant<|channel|>analysis<|message|>We should check.', 'Acme runs 40 GPU droplets.'],
+    ['ANSWER: Acme runs 40 GPU droplets.<|return|>', 'Acme runs 40 GPU droplets.'],
+    ['ANSWER: Acme runs 40 GPU droplets.assistantfinalANSWER: Acme runs 40 GPU droplets.', 'Acme runs 40 GPU droplets.'],
+    ['ANSWER: Acme runs 40 GPU droplets. analysisWe must verify.', 'Acme runs 40 GPU droplets.'],
+    ['ANSWER: I do not know that yet.<|channel|>final<|message|>', 'I do not know that yet.'],
+    ['<|channel|>final<|message|>ANSWER: 40 droplets.<|end|>', '40 droplets.'],
+  ];
+  for (const [input, want] of cases) {
+    const out = [];
+    const f = new MarkerFilter((t) => out.push(t));
+    // stream in small deltas so control tokens are split across pushes
+    for (let i = 0; i < input.length; i += 4) f.push(input.slice(i, i + 4));
+    assert.equal(out.join(''), want, `stream: ${input}`);
+    assert.equal(f.finish().text, want, `finish: ${input}`);
+    assert.ok(out.every((t) => !/<\||assistant|analysis/.test(t)), `no junk token leaks: ${input}`);
+  }
+  // the same text in one push
   const g = new MarkerFilter(() => {});
-  g.push('plain answer ');
-  assert.equal(g.finish().text, 'plain answer');
+  g.push('ANSWER: 40 droplets.<|end|><|start|>assistant<|channel|>analysis<|message|>hmm');
+  assert.equal(g.finish().text, '40 droplets.');
+  // a real sentence containing "analysis" as a word is kept
+  const k = new MarkerFilter(() => {});
+  k.push('ANSWER: The analysis runs nightly on 3 droplets.');
+  assert.equal(k.finish().text, 'The analysis runs nightly on 3 droplets.');
 });
 
 test('harness: MarkerFilter streams only the first answer line; thinking after it never streams, the last ANSWER: wins', () => {
@@ -122,7 +156,7 @@ test('harness: config defaults (v4 session name, gateway tools, DIGITALOCEAN_ACC
   const cfg = harnessConfig({ DIGITALOCEAN_ACCESS_TOKEN: 'dop' });
   assert.equal(cfg.token, 'dop');
   assert.equal(harnessConfig({ HARNESS_API_TOKEN: 'h', DIGITALOCEAN_ACCESS_TOKEN: 'dop' }).token, 'h');
-  assert.equal(cfg.sessionName, 'alexis-anatomy-harness-v4');
+  assert.equal(cfg.sessionName, 'alexis-anatomy-harness-v4b');
   assert.equal(cfg.toolsMode, 'gateway');
   assert.equal(cfg.size, 'mars-1vcpu-1gb');
   assert.equal(cfg.idleTimeout, '30m');
@@ -137,7 +171,7 @@ test('harness: config defaults (v4 session name, gateway tools, DIGITALOCEAN_ACC
 
 test('harness: inline manifest declares the anatomy-data MCP server, its secret slot and allow rules', () => {
   const m = buildManifest(harnessConfig({ ...BASE_ENV, HARNESS_TOOLS_MODE: 'inline' }));
-  assert.match(m, /^name: alexis-anatomy-harness-v4$/m);
+  assert.match(m, /^name: alexis-anatomy-harness-v4b$/m);
   assert.match(m, /^agent: opencode$/m);
   assert.match(m, /^size: mars-1vcpu-1gb$/m);
   assert.match(m, /^idle_timeout: 30m$/m);
@@ -217,7 +251,7 @@ test('harness: the Harness Runtime is the only answer backend (ANSWER_BACKEND / 
   assert.equal(new RealPipeline(bus, { DIGITALOCEAN_ACCESS_TOKEN: 'dop' }).describe().inferenceVia, 'harness');
   const d = new RealPipeline(bus, BASE_ENV).describe();
   assert.equal(d.toolsMode, 'gateway');
-  assert.equal(d.harnessSession, 'alexis-anatomy-harness-v4');
+  assert.equal(d.harnessSession, 'alexis-anatomy-harness-v4b');
   assert.ok(!('agent' in d) && !('answerBackend' in d));
 });
 
@@ -231,10 +265,10 @@ test('harness: warmUp() finds or creates the session at boot without emitting jo
     const out = await p.warmUp(log);
     assert.equal(out.ok, true);
     assert.equal(out.created, false);
-    assert.equal(out.session, 'alexis-anatomy-harness-v4');
+    assert.equal(out.session, 'alexis-anatomy-harness-v4b');
     assert.equal(out.sessionId, 'sess-1');
     assert.equal(events.length, 0, 'warm-up is silent on the SSE bus');
-    assert.match(logs[0], /\[warm-up\] harness session alexis-anatomy-harness-v4 resumed \(sess-1\)/);
+    assert.match(logs[0], /\[warm-up\] harness session alexis-anatomy-harness-v4b resumed \(sess-1\)/);
     assert.equal(p.describe().harnessSessionId, 'sess-1');
     // a following question reuses the warm session: no second list / create call
     const before = h.calls.length;
@@ -734,6 +768,186 @@ test('harness: tool-call events in the harness SSE stream are forwarded as tool 
     assert.equal(debug.length, 1, 'unknown types are logged once');
   } finally {
     restore();
+  }
+});
+
+/** Fake harness whose runs are scripted per call: `runs[i]` is { text?, deltas?, extraEvents? } for the i-th run. */
+function scriptedHarness(runs, { onInput } = {}) {
+  let n = 0;
+  const h = fakeHarness([], { onInput });
+  const base = h.impl;
+  h.impl = async (url, init) => {
+    if (String(url).endsWith('/events')) {
+      const r = runs[Math.min(n++, runs.length - 1)];
+      const deltas = r.deltas || [r.text];
+      const evs = [
+        { type: 'run.started', run_id: 'run-1', data: {} },
+        ...(r.extraEvents || []).map((e) => ({ ...e, run_id: 'run-1' })),
+        ...deltas.map((text) => ({ type: 'run.token_delta', run_id: 'run-1', data: { text, is_reasoning: false } })),
+        { type: 'run.completed', run_id: 'run-1', data: { total_tokens_in: 10, total_tokens_out: 3 } },
+      ];
+      return new Response(evs.map(sseFrame).join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    }
+    return base(url, init);
+  };
+  return h;
+}
+
+const REASONING = 'We need to search for the droplets. The tool returned something odd; let me think about it. I should answer that I do not know.';
+
+test('harness: a normal ANSWER: stream reports noMarker false, no invalid tool, and strips Harmony junk after the line', async () => {
+  const h = fakeHarness(['Let me check. ', 'ANSWER: Acme', ' runs 40 GPU droplets.', '<|end|><|start|>assistant<|channel|>analysis<|message|>Done.'], {
+    extraEvents: [{ type: 'run.tool_call_started', data: { tool: 'do_actions_anatomy-data_search_facts', input: { query: 'q', k: 3 }, call_id: 'c1' } }, { type: 'run.tool_call_completed', data: { call_id: 'c1' } }],
+  });
+  const toolEvents = [];
+  const tokens = [];
+  const c = new HarnessClient(harnessConfig(BASE_ENV), h.impl);
+  const out = await c.ask('q', { onToolEvent: (t) => toolEvents.push(t), onToken: (t) => tokens.push(t) });
+  assert.equal(out.text, 'Acme runs 40 GPU droplets.');
+  assert.equal(out.noMarker, false);
+  assert.equal(out.invalidTool, 0);
+  assert.equal(out.harnessToolEvents, 2);
+  assert.deepEqual(toolEvents.map((t) => t.invalid), [false, false]);
+  assert.equal(tokens.join(''), 'Acme runs 40 GPU droplets.');
+  assert.ok(tokens.every((t) => !/<\||assistant|Let me check/.test(t)));
+
+  // through the pipeline: the junk never reaches the inference token events or the answer
+  const { p, events, restore } = setup(BASE_ENV, fakeHarness(['ANSWER: Acme runs 40 GPU droplets.', '<|end|><|start|>assistant<|channel|>analysis<|message|>Done.'], {
+    extraEvents: [{ type: 'run.tool_call_started', data: { tool: 'do_actions_anatomy-data_search_facts', input: { query: 'q', k: 3 }, call_id: 'c1' } }, { type: 'run.tool_call_completed', data: { call_id: 'c1' } }],
+  }));
+  try {
+    const res = await p.ask('q');
+    assert.equal(res.answer, 'Acme runs 40 GPU droplets.');
+    assert.equal(res.fallback, null);
+    assert.equal(tokensOf(events), 'Acme runs 40 GPU droplets.');
+    assert.ok(!events.some((e) => e.data?.discarded));
+    assert.ok(events.filter((e) => e.type === 'tool').every((e) => e.data.invalid === false));
+  } finally {
+    restore();
+  }
+});
+
+test('harness: reasoning without ANSWER: on the tool path leaks no token and goes through the guard path', async () => {
+  // run 1: a real search_facts call (MCP-reported) but the model only reasons and never writes ANSWER:
+  // run 2 (context in prompt after the app-side guard search): a clean answer
+  let pipeline;
+  const prompts = [];
+  const h = scriptedHarness([{ deltas: REASONING.split(/(?<=\. )/) }, { text: 'ANSWER: 40 droplets.' }], {
+    onInput: (t) => {
+      prompts.push(t);
+      if (prompts.length === 1) {
+        pipeline.handleToolEvent({ phase: 'start', callId: 'c1', tool: 'search_facts', args: { query: 'How many droplets?', k: 3 }, target: 'pgvector' });
+        pipeline.handleToolEvent({ phase: 'done', callId: 'c1', tool: 'search_facts', args: { query: 'How many droplets?', k: 3 }, target: 'pgvector', ms: 50, summary: '1 hit', hits: [{ id: 7, score: 0.9, chunk: FACT, object_key: 'facts/1.txt' }] });
+      }
+    },
+  });
+  const { p, events, restore } = setup(BASE_ENV, h);
+  pipeline = p;
+  try {
+    const out = await p.ask('How many droplets?');
+    assert.equal(out.answer, '40 droplets.');
+    assert.equal(out.fallback, 'context');
+    assert.equal(out.reason, 'no ANSWER: line');
+    assert.equal(out.timing.toolCalls, 1, 'the real tool call still counts');
+    assert.equal(prompts.length, 2);
+    assert.match(prompts[1], /Context:\n\[1\] Acme Robotics runs 40 GPU droplets/);
+    assert.equal(tokensOf(events), '40 droplets.', 'no reasoning token was streamed');
+    assert.ok(!events.some((e) => e.type === 'stage' && e.data?.token !== undefined && /search|think|know/.test(e.data.token)));
+    const discard = events.find((e) => e.data?.discarded);
+    assert.ok(discard);
+    assert.equal(discard.data.reason, 'no ANSWER: line');
+    assert.equal(discard.data.noMarker, true);
+    assert.equal(discard.data.streamed, 0);
+    assert.equal(discard.data.held, 0);
+    assert.match(discard.detail, /without an ANSWER: line: nothing after ANSWER: was produced, so nothing was streamed; the app runs search_facts itself/);
+    // the guard search animates through the gateway (source app) after the model's own call
+    const tool = events.filter((e) => e.type === 'tool');
+    assert.deepEqual(tool.map((e) => [e.data.phase, e.data.source]), [['start', 'mcp'], ['done', 'mcp'], ['start', 'app'], ['done', 'app']]);
+    assert.deepEqual(starts(events), ['agent', 'inference', 'gateway', 'vectordb', 'gateway', 'vectordb', 'inference']);
+    assert.equal(events.find((e) => e.type === 'answer').data.text, '40 droplets.');
+  } finally {
+    restore();
+  }
+
+  // the context run is held to the same rule: no ANSWER: there either -> "I do not know that yet.", streamed as the only token
+  const prompts2 = [];
+  const h2 = scriptedHarness([{ text: REASONING }, { text: 'Hmm, the context says 40 but I am not sure. ' }], { onInput: (t) => prompts2.push(t) });
+  const second = setup(BASE_ENV, h2);
+  try {
+    const out = await second.p.ask('How many droplets?');
+    assert.equal(out.answer, DONT_KNOW_TEXT);
+    assert.equal(out.fallback, 'context');
+    assert.equal(out.reason, 'no tool call');
+    assert.equal(prompts2.length, 2);
+    assert.equal(tokensOf(second.events), DONT_KNOW_TEXT);
+    assert.ok(second.events.some((e) => e.stage === 'agent' && e.status === 'progress' && e.data.noMarker && /Context run produced no ANSWER: line/.test(e.detail)));
+    assert.equal(second.events.find((e) => e.type === 'answer').data.text, DONT_KNOW_TEXT);
+  } finally {
+    second.restore();
+  }
+});
+
+test('harness: an invalid tool call (malformed search_facts call, model rambles) never counts as a tool call; the guard answers, no reasoning leaks', async () => {
+  // OpenCode reports a malformed do_actions_anatomy-data_search_facts call as tool `invalid`; the model then
+  // rambles in plain text and never writes ANSWER:. No MCP-reported tool event arrives (the call never reached the server).
+  const prompts = [];
+  const extraEvents = [
+    { type: 'run.tool_call_started', data: { tool: 'invalid', input: { tool: 'do_actions_anatomy-data_search_facts', error: 'Invalid JSON arguments' }, call_id: 'c1' } },
+    { type: 'run.tool_call_completed', data: { call_id: 'c1', status: 'error', error: 'The arguments provided to the tool are invalid' } },
+  ];
+  const ramble = ['The tool call failed because the arguments were malformed. ', 'Acme Robotics runs 40 GPU droplets in SFO3 according to my memory. ', 'I should answer from what I remember.'];
+
+  // HarnessClient level: the invalid events are counted apart and flagged to the hook
+  const c = new HarnessClient(harnessConfig(BASE_ENV), fakeHarness(ramble, { extraEvents }).impl);
+  const seen = [];
+  const tokens = [];
+  const out = await c.ask('q', { onToolEvent: (t) => seen.push(t), onToken: (t) => tokens.push(t) });
+  assert.deepEqual({ text: out.text, noMarker: out.noMarker, invalidTool: out.invalidTool, harnessToolEvents: out.harnessToolEvents }, { text: '', noMarker: true, invalidTool: 2, harnessToolEvents: 0 });
+  assert.deepEqual(seen.map((t) => t.invalid), [true, true], 'the completion event of an invalid call is flagged too');
+  assert.deepEqual(tokens, []);
+
+  // pipeline level, nothing stored: guard search, instant "I do not know that yet.", one model run
+  const { p, events, restore } = setup(BASE_ENV, fakeHarness(ramble, { extraEvents, onInput: (t) => prompts.push(t) }));
+  const queries = [];
+  p.db = async () => ({ query: async (sql, params) => { queries.push({ sql, params }); return { rows: [] }; } });
+  try {
+    const res = await p.ask('How many droplets does Acme run?');
+    assert.equal(res.answer, DONT_KNOW_TEXT);
+    assert.equal(res.fallback, 'guard');
+    assert.equal(res.reason, 'invalid tool call, no matching facts');
+    assert.equal(res.timing.toolCalls, 0);
+    assert.deepEqual(res.sources, []);
+    assert.equal(prompts.length, 1, 'no second model run');
+    assert.equal(queries.length, 1, 'the app ran the search itself');
+    assert.equal(tokensOf(events), DONT_KNOW_TEXT, 'the rambling never streamed');
+    assert.ok(!events.some((e) => e.type === 'stage' && e.data?.token !== undefined && /memory|malformed|40 GPU/.test(e.data.token)));
+    assert.equal(events.find((e) => e.type === 'answer').data.text, DONT_KNOW_TEXT);
+    const discard = events.find((e) => e.data?.discarded);
+    assert.equal(discard.data.reason, 'invalid tool call');
+    assert.equal(discard.data.invalidTool, 2);
+    assert.match(discard.detail, /Harness made 2 invalid\/failed tool calls and no clean answer/);
+    const tool = events.filter((e) => e.type === 'tool');
+    assert.deepEqual(tool.map((e) => [e.data.source, e.data.phase, e.data.tool, e.data.invalid]), [['harness', 'start', 'invalid', true], ['harness', 'done', 'invalid', true], ['app', 'start', 'search_facts', undefined], ['app', 'done', 'search_facts', undefined]]);
+    assert.equal(tool[0].data.target, undefined, 'an invalid call reaches no target');
+    assert.equal(events.at(-1).data.reason, 'invalid tool call, no matching facts');
+  } finally {
+    restore();
+  }
+
+  // pipeline level, a matching fact stored: guard search finds it, one context run gives the clean answer
+  const prompts2 = [];
+  const h2 = scriptedHarness([{ deltas: ramble, extraEvents }, { text: 'ANSWER: 40 droplets.' }], { onInput: (t) => prompts2.push(t) });
+  const second = setup(BASE_ENV, h2);
+  try {
+    const res = await second.p.ask('How many droplets does Acme run?');
+    assert.equal(res.answer, '40 droplets.');
+    assert.equal(res.fallback, 'context');
+    assert.equal(res.reason, 'invalid tool call');
+    assert.equal(prompts2.length, 2);
+    assert.equal(tokensOf(second.events), '40 droplets.');
+    assert.deepEqual(res.sources.map((s) => s.id), [7]);
+  } finally {
+    second.restore();
   }
 });
 

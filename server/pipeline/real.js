@@ -37,15 +37,21 @@ export function fmtArgs(args = {}) {
  *   (MCP health check fails, HARNESS_TOOLS_MODE=none, or the agent answered
  *   "don't know" after a failed tool call): the app retrieves itself (stages
  *   kb -> vectordb) and passes the context in the prompt.
- * Guard (no tool call): the session keeps its history, so an answer produced
- *   without any tool call is ungrounded (it may describe a fact deleted since)
- *   and is never shown: on the tool path answer tokens are held back until a tool
- *   call has been observed. If the run ends without one, the app runs search_facts
- *   itself, reporting it through the same tool / gateway / vectordb events the
- *   MCP server would send (source 'app') so the scene animates the search. With
- *   no hits the answer is "I do not know that yet." instantly (no second model
- *   run, `fallback: "guard"`); with hits there is exactly one more model run with
- *   the context in the prompt (`fallback: "context"`, `reason: "no tool call"`).
+ * Guard (no tool call / no ANSWER: line / invalid tool call): the session keeps
+ *   its history, so an answer produced without any tool call is ungrounded (it
+ *   may describe a fact deleted since) and is never shown: on the tool path
+ *   answer tokens are held back until a tool call has been observed. Malformed
+ *   or failed harness tool calls (OpenCode's `invalid` tool) never count as one.
+ *   Text before ANSWER: is reasoning and is never streamed; a run that ends
+ *   without an ANSWER: line has no answer at all. In each case the model text is
+ *   discarded and the app runs search_facts itself, reporting it through the
+ *   same tool / gateway / vectordb events the MCP server would send (source
+ *   'app') so the scene animates the search. With no hits the answer is "I do
+ *   not know that yet." instantly (no second model run, `fallback: "guard"`);
+ *   with hits there is exactly one more model run with the context in the prompt
+ *   (`fallback: "context"`, `reason: "no tool call" | "no ANSWER: line" |
+ *   "invalid tool call"`). That run is held to the same rule: no ANSWER: line
+ *   means "I do not know that yet."
  * Anything else surfaces as an error; server/app.js then replays a recording
  *   (REPLAY_FALLBACK). There is no other model backend.
  */
@@ -368,12 +374,15 @@ export class RealPipeline {
    */
   async askViaHarness(question, ev, jobId, t0) {
     const h = this.cfg.harness;
-    const run = { jobId, ev, toolCalls: 0, toolDone: 0, toolErrors: 0, harnessToolEvents: 0, hits: [], seen: new Set() };
+    const run = { jobId, ev, toolCalls: 0, toolDone: 0, toolErrors: 0, harnessToolEvents: 0, invalidToolEvents: 0, hits: [], seen: new Set() };
     this.activeRun = run;
     let firstTokenMs = null;
     let streamed = 0;
     // A tool call "observed" for this run: reported by the MCP server (primary) or seen on the harness SSE stream.
+    // Malformed / failed harness tool calls (tool `invalid`, run.tool_call_failed) are counted apart and never count as seen.
     const toolSeen = () => run.toolCalls > 0 || run.harnessToolEvents > 0;
+    // A clean answer: the model wrote an ANSWER: line (MarkerFilter returns '' + noMarker when it never did).
+    const clean = (out) => Boolean(out && out.text && !out.noMarker);
     // Tool path: the warm session keeps its conversation history, so an answer produced without any tool
     // call may be a stale earlier turn (e.g. a fact deleted since). Answer tokens are held back until a
     // tool call has been seen; if the run completes without one, the held answer is discarded unseen.
@@ -403,7 +412,11 @@ export class RealPipeline {
     const hooks = (label) => ({
       onSession: describe,
       onStarted: (ms) => ev.stage('agent', 'progress', `Harness run started (+${ms} ms)${label ? ` · ${label}` : ''}`, { step: 'run', ms, via: 'harness' }),
-      onToolEvent: (t) => { run.harnessToolEvents++; ev.tool(this.harnessToolEvent(run, t)); },
+      onToolEvent: (t) => {
+        if (t.invalid) run.invalidToolEvents++;
+        else run.harnessToolEvents++;
+        ev.tool({ ...this.harnessToolEvent(run, t), invalid: Boolean(t.invalid) });
+      },
       onToken,
     });
     const contextRun = async (detail, why, because, found = null) => {
@@ -414,9 +427,13 @@ export class RealPipeline {
       const context = sources.map((s, i) => `[${i + 1}] ${s.chunk}`).join('\n');
       ev.stage('inference', 'start', `Serverless inference via harness: ${h.model}`, { model: h.model, via: 'harness', toolsMode: 'none' });
       harnessOut = await this.harness.ask(buildPrompt(question, context), hooks(detail));
-      answer = harnessOut.text;
       fallback = why;
       reason = because || null;
+      if (clean(harnessOut)) { answer = harnessOut.text; return; }
+      // same rule as the tool path: no ANSWER: line means no answer; reasoning is never shown
+      ev.stage('agent', 'progress', `Context run produced no ANSWER: line: answering "${DONT_KNOW_TEXT}"`, { fallback, reason, noMarker: true, via: 'harness' });
+      if (streamed === 0) forward(DONT_KNOW_TEXT, 0);
+      answer = DONT_KNOW_TEXT;
     };
 
     try {
@@ -433,27 +450,31 @@ export class RealPipeline {
         harnessOut = await this.harness.ask(buildToolPrompt(question, { gateway: h.toolsMode === 'gateway' }), hooks('tool path'));
         answer = harnessOut.text;
         sources = run.hits.slice();
-        if (!toolSeen()) {
-          // GUARD: no tool call at all -> the answer is ungrounded (likely recalled from an earlier turn,
-          // possibly about a fact that has since been deleted). Discard it; the app runs the search itself.
+        if (!toolSeen() || !clean(harnessOut)) {
+          // GUARD: no (valid) tool call at all -> the answer is ungrounded (likely recalled from an earlier
+          // turn, possibly about a fact that has since been deleted); no ANSWER: line (the model only
+          // reasoned, or rambled after a malformed tool call) -> there is no answer at all. Either way the
+          // model text is discarded and the app runs the search itself.
+          const why = run.invalidToolEvents > 0 && !clean(harnessOut) ? 'invalid tool call' : !toolSeen() ? 'no tool call' : 'no ANSWER: line';
           const held = gate.held.length;
           gate.held.length = 0;
           gate.enabled = false;
-          const what = streamed > 0 ? 'the ungrounded answer already streamed was discarded; the final answer replaces it' : `ungrounded answer discarded unseen (${held} held token${held === 1 ? '' : 's'})`;
-          ev.stage('agent', 'progress', `Harness answered without calling any tool: ${what}; the app runs search_facts itself`, { guard: 'search', reason: 'no tool call', discarded: true, streamed, held, via: 'harness' });
+          const what = streamed > 0 ? 'the ungrounded answer already streamed was discarded; the final answer replaces it' : held ? `ungrounded answer discarded unseen (${held} held token${held === 1 ? '' : 's'})` : 'nothing after ANSWER: was produced, so nothing was streamed';
+          const lead = why === 'no tool call' ? 'Harness answered without calling any tool' : why === 'invalid tool call' ? `Harness made ${run.invalidToolEvents} invalid/failed tool call${run.invalidToolEvents === 1 ? '' : 's'} and no clean answer` : 'Harness finished without an ANSWER: line';
+          ev.stage('agent', 'progress', `${lead}: ${what}; the app runs search_facts itself`, { guard: 'search', reason: why, discarded: true, streamed, held, invalidTool: run.invalidToolEvents, noMarker: Boolean(harnessOut.noMarker), via: 'harness' });
           answer = '';
           const found = await this.guardSearch(question, run);
           if (!found.length) {
             // nothing stored matches: the answer is known without a second model run
             fallback = 'guard';
-            reason = 'no tool call, no matching facts';
+            reason = `${why}, no matching facts`;
             sources = [];
             ev.stage('agent', 'progress', `No matching facts: answering "${DONT_KNOW_TEXT}" without a second model run`, { fallback, reason, via: 'harness' });
             forward(DONT_KNOW_TEXT, 0);
             answer = DONT_KNOW_TEXT;
           } else {
-            ev.stage('agent', 'progress', `${found.length} matching chunk${found.length === 1 ? '' : 's'}: one model run with the context passed in prompt`, { fallback: 'context', reason: 'no tool call', hits: found.length, via: 'harness' });
-            await contextRun('context (no tool call)', 'context', 'no tool call', found);
+            ev.stage('agent', 'progress', `${found.length} matching chunk${found.length === 1 ? '' : 's'}: one model run with the context passed in prompt`, { fallback: 'context', reason: why, hits: found.length, via: 'harness' });
+            await contextRun(`context (${why})`, 'context', why, found);
           }
         } else {
           if (gate.held.length) flushHeld();
