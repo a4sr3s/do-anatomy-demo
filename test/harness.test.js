@@ -13,7 +13,7 @@ const BASE_ENV = { HARNESS_API_TOKEN: 'tok', HARNESS_INFERENCE_API_KEY: 'k', MCP
  * session, events -> scripted stream, input -> run id. `onInput` lets a test
  * react to the prompt (e.g. simulate the MCP server reporting tool events).
  */
-function fakeHarness(deltas, { fail = false, sessions, extraEvents = [], onInput, hang = false, name = 'alexis-anatomy-harness-v5' } = {}) {
+function fakeHarness(deltas, { fail = false, sessions, extraEvents = [], onInput, hang = false, name = 'alexis-anatomy-harness-v4' } = {}) {
   const calls = [];
   const runId = 'run-1';
   const state = { sessions: sessions || [{ session_id: 'sess-1', name, status: 'SESSION_STATUS_PAUSED', labels: { manifest: '__match__' } }] };
@@ -122,7 +122,7 @@ test('harness: config defaults (v4 session name, gateway tools, DIGITALOCEAN_ACC
   const cfg = harnessConfig({ DIGITALOCEAN_ACCESS_TOKEN: 'dop' });
   assert.equal(cfg.token, 'dop');
   assert.equal(harnessConfig({ HARNESS_API_TOKEN: 'h', DIGITALOCEAN_ACCESS_TOKEN: 'dop' }).token, 'h');
-  assert.equal(cfg.sessionName, 'alexis-anatomy-harness-v5');
+  assert.equal(cfg.sessionName, 'alexis-anatomy-harness-v4');
   assert.equal(cfg.toolsMode, 'gateway');
   assert.equal(cfg.size, 'mars-1vcpu-1gb');
   assert.equal(cfg.idleTimeout, '30m');
@@ -137,7 +137,7 @@ test('harness: config defaults (v4 session name, gateway tools, DIGITALOCEAN_ACC
 
 test('harness: inline manifest declares the anatomy-data MCP server, its secret slot and allow rules', () => {
   const m = buildManifest(harnessConfig({ ...BASE_ENV, HARNESS_TOOLS_MODE: 'inline' }));
-  assert.match(m, /^name: alexis-anatomy-harness-v5$/m);
+  assert.match(m, /^name: alexis-anatomy-harness-v4$/m);
   assert.match(m, /^agent: opencode$/m);
   assert.match(m, /^size: mars-1vcpu-1gb$/m);
   assert.match(m, /^idle_timeout: 30m$/m);
@@ -217,7 +217,7 @@ test('harness: the Harness Runtime is the only answer backend (ANSWER_BACKEND / 
   assert.equal(new RealPipeline(bus, { DIGITALOCEAN_ACCESS_TOKEN: 'dop' }).describe().inferenceVia, 'harness');
   const d = new RealPipeline(bus, BASE_ENV).describe();
   assert.equal(d.toolsMode, 'gateway');
-  assert.equal(d.harnessSession, 'alexis-anatomy-harness-v5');
+  assert.equal(d.harnessSession, 'alexis-anatomy-harness-v4');
   assert.ok(!('agent' in d) && !('answerBackend' in d));
 });
 
@@ -231,10 +231,10 @@ test('harness: warmUp() finds or creates the session at boot without emitting jo
     const out = await p.warmUp(log);
     assert.equal(out.ok, true);
     assert.equal(out.created, false);
-    assert.equal(out.session, 'alexis-anatomy-harness-v5');
+    assert.equal(out.session, 'alexis-anatomy-harness-v4');
     assert.equal(out.sessionId, 'sess-1');
     assert.equal(events.length, 0, 'warm-up is silent on the SSE bus');
-    assert.match(logs[0], /\[warm-up\] harness session alexis-anatomy-harness-v5 resumed \(sess-1\)/);
+    assert.match(logs[0], /\[warm-up\] harness session alexis-anatomy-harness-v4 resumed \(sess-1\)/);
     assert.equal(p.describe().harnessSessionId, 'sess-1');
     // a following question reuses the warm session: no second list / create call
     const before = h.calls.length;
