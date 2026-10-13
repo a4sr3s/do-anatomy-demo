@@ -295,6 +295,10 @@ test('harness: session reuse by manifest fingerprint; stale base session -> new 
   c = new HarnessClient(cfg, h.impl);
   assert.deepEqual(await c.ensureSession(), { id: 'var', name: `${cfg.sessionName}-${hash}`, created: false, stale: false });
   assert.ok(!h.calls.some((x) => x.method === 'POST' && x.url.endsWith('/sessions')), 'no new base session');
+  // 6. the live API returns no labels at all -> the base name is trusted, no variant is created
+  h = fakeHarness([], { sessions: [{ session_id: 'base', name: cfg.sessionName, status: 'SESSION_STATUS_READY', labels: null }, { session_id: 'var', name: `${cfg.sessionName}-${hash}`, status: 'SESSION_STATUS_READY' }] });
+  c = new HarnessClient(cfg, h.impl);
+  assert.deepEqual(await c.ensureSession(), { id: 'base', name: cfg.sessionName, created: false, stale: false });
 });
 
 test('harness: tool path streams the answer, attributes MCP tool events to the job and reports timing', async () => {

@@ -82,7 +82,7 @@ How a question is answered (the Harness Runtime is the only answer path):
 
 On boot the server warms the harness up in the background: it finds or creates the named session (`[warm-up] …` in the logs) so the first question on stage does not pay for session creation. Failures are only logged; the first question retries.
 
-Session manifest fingerprint: the non-secret manifest parts (agent, size, model, tools mode, MCP URL / gateway tools) are hashed into the session label `manifest`. If the named session exists with a different label the app creates `<name>-<hash>` instead of reusing a stale config (nothing is ever deleted).
+Session manifest fingerprint: the non-secret manifest parts (agent, size, model, tools mode, MCP URL / gateway tools) are hashed into the session label `manifest`. If the named session exists with a different label the app creates `<name>-<hash>` instead of reusing a stale config (nothing is ever deleted). The sessions API currently returns no labels, so in practice an existing base session is reused by name; change `HARNESS_SESSION_NAME` after a manifest change. If the base session is gone, an existing `<name>-<hash>` is reused before anything new is created. The session keeps its conversation history, so a long-lived session can drift (gpt-oss-20b starts skipping or mangling tool calls); renaming the session gives the demo a clean one.
 
 Getting the credentials:
 

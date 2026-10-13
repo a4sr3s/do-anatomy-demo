@@ -279,7 +279,10 @@ export class HarnessClient {
    */
   async findSession() {
     const [base] = await this.listByName(this.cfg.sessionName);
-    if (base && (base.labels?.manifest || '') === this.hash) return { session: base, name: this.cfg.sessionName, stale: false };
+    // The sessions API (list and get) does not return labels, so a missing label cannot prove the
+    // base is stale: trust the name then. Only a label that is present and differs means stale.
+    const label = base?.labels?.manifest;
+    if (base && (label == null || label === this.hash)) return { session: base, name: this.cfg.sessionName, stale: false };
     const alt = `${this.cfg.sessionName}-${this.hash}`;
     // the sessions API does not return labels, so a variant named after the current hash is
     // looked up even when the base is gone (else deleting an unused base session would make
