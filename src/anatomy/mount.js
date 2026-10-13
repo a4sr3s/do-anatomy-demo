@@ -59,7 +59,7 @@ export function mountAnatomy(container, ui) {
   const LABELS = [
     ['CLIENT · APP / CLI', -16.2, 3.4],
     [MACHINES.spaces.label, -7.5, -2.0],
-    [MACHINES.functions.label, -3.0, -2.25, { size: 0.46 }],
+    [MACHINES.functions.label, -1.0, -2.25, { size: 0.46 }],
     [MACHINES.vectordb.label, 7.8, -0.9],
     [MACHINES.gateway.label, 0.7, 1.7],
     [`${MACHINES.router.label} · ${MACHINES.router.sublabel.replace(' · ', ' / ').toUpperCase()}`, -3.8, 7.0],
