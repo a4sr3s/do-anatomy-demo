@@ -93,6 +93,31 @@ test('harness: MarkerFilter hides text before ANSWER: and falls back to raw text
   assert.equal(g.finish().text, 'plain answer');
 });
 
+test('harness: MarkerFilter streams only the first answer line; thinking after it never streams, the last ANSWER: wins', () => {
+  // live gpt-oss output: a first ANSWER line, then plain-text thinking glued on, another search, a second ANSWER line
+  const out = [];
+  const f = new MarkerFilter((t) => out.push(t));
+  ['ANSWER: I do not', ' know that yet.', 'We must keep repeating? ', 'Maybe search again.', 'No hits. Then answer not known.', 'ANSWER: I do not know that yet.'].forEach((t) => f.push(t));
+  assert.equal(out.join(''), 'I do not know that yet.');
+  assert.equal(f.finish().text, 'I do not know that yet.');
+  // a newline ends the answer line too; a tool call (close) stops streaming; the final text is the last segment
+  const n = [];
+  const g = new MarkerFilter((t) => n.push(t));
+  g.push('ANSWER: Odalys Ferro keeps it.\nLet me double-check with get_document.');
+  assert.equal(n.join(''), 'Odalys Ferro keeps it.');
+  const h = new MarkerFilter((t) => n.push(t));
+  n.length = 0;
+  h.push('ANSWER: Not sure');
+  h.close();
+  h.push(' yet, searching again. ANSWER: Odalys Ferro keeps 3 cats.');
+  assert.equal(n.join(''), 'Not sure');
+  assert.equal(h.finish().text, 'Odalys Ferro keeps 3 cats.');
+  // ordinary punctuation inside the line is kept (U.S. and "3.5" are not sentence breaks)
+  const k = new MarkerFilter(() => {});
+  k.push('ANSWER: It runs in the U.S. East region on 3.5 GHz CPUs.');
+  assert.equal(k.finish().text, 'It runs in the U.S. East region on 3.5 GHz CPUs.');
+});
+
 test('harness: config defaults (v4 session name, gateway tools, DIGITALOCEAN_ACCESS_TOKEN fallback)', () => {
   const cfg = harnessConfig({ DIGITALOCEAN_ACCESS_TOKEN: 'dop' });
   assert.equal(cfg.token, 'dop');
@@ -265,6 +290,11 @@ test('harness: session reuse by manifest fingerprint; stale base session -> new 
   h = fakeHarness([], { sessions: [] });
   c = new HarnessClient(cfg, h.impl);
   assert.deepEqual(await c.ensureSession(), { id: 'sess-1', name: cfg.sessionName, created: true, stale: false });
+  // 5. the base was deleted but the variant lives on (the sessions API returns no labels) -> reuse the variant
+  h = fakeHarness([], { sessions: [{ session_id: 'var', name: `${cfg.sessionName}-${hash}`, status: 'SESSION_STATUS_READY', labels: null }] });
+  c = new HarnessClient(cfg, h.impl);
+  assert.deepEqual(await c.ensureSession(), { id: 'var', name: `${cfg.sessionName}-${hash}`, created: false, stale: false });
+  assert.ok(!h.calls.some((x) => x.method === 'POST' && x.url.endsWith('/sessions')), 'no new base session');
 });
 
 test('harness: tool path streams the answer, attributes MCP tool events to the job and reports timing', async () => {

@@ -181,38 +181,66 @@ export function isDontKnow(text) {
 /**
  * Splits streamed text at the ANSWER: marker so any visible "thinking" the
  * model emits before it (gpt-oss does) is not streamed to the audience.
+ *
+ * The answer is one line. gpt-oss sometimes keeps "thinking" in plain text
+ * after a first ANSWER: line (often glued on without a space, e.g.
+ * "...yet.We must search again"), calls another tool and writes a second
+ * ANSWER: line. So streaming stops at the end of the first answer line: a
+ * newline, a sentence end glued to a capital letter, or a tool call (close()).
+ * The final text is the last ANSWER: segment, cut the same way; the `answer`
+ * event carries it and replaces whatever was streamed.
  */
+const GLUED_SENTENCE = /[a-z0-9)\]"'’][.!?](?=[A-Z])/;
+
+function firstAnswerLine(text) {
+  const t = String(text || '').replace(/^\s+/, '');
+  let end = t.length;
+  const nl = t.search(/\r?\n/);
+  if (nl !== -1) end = nl;
+  const glued = GLUED_SENTENCE.exec(t.slice(0, end));
+  if (glued) end = glued.index + 2;
+  return { text: t.slice(0, end), complete: end < t.length };
+}
+
 export class MarkerFilter {
   constructor(onToken) {
     this.onToken = onToken;
     this.raw = '';
     this.found = false;
+    this.closed = false;
     this.emitted = '';
     this.i = 0;
   }
   push(text) {
     this.raw += text;
+    if (this.closed) return;
     if (!this.found) {
       const at = this.raw.lastIndexOf(MARKER);
       if (at === -1) return;
       this.found = true;
       this.start = at + MARKER.length;
     }
-    if (!this.emitted) {
-      const rest = this.raw.slice(this.start);
-      this.start += rest.length - rest.replace(/^\s+/, '').length;
-    }
-    const out = this.raw.slice(this.start + this.emitted.length);
+    const seg = this.raw.slice(this.start);
+    const next = seg.indexOf(MARKER);
+    const line = firstAnswerLine(next === -1 ? seg : seg.slice(0, next));
+    const out = line.text.slice(this.emitted.length);
     if (out) { this.emitted += out; this.onToken(out, this.i++); }
+    if (line.complete || next !== -1) this.closed = true;
   }
-  /** Final answer; if the model never used the marker, the whole text is the answer. */
+  /** The model moved on (e.g. another tool call): stop streaming the current answer line. */
+  close() {
+    if (this.found && this.emitted) this.closed = true;
+  }
+  /** Final answer: the last ANSWER: segment; if the model never used the marker, the whole text. */
   finish() {
     if (!this.found) {
       const t = this.raw.trim();
       if (t) this.onToken(t, this.i++);
       return { text: t, tokens: this.i };
     }
-    return { text: this.emitted.trim(), tokens: this.i };
+    const at = this.raw.lastIndexOf(MARKER);
+    const last = firstAnswerLine(this.raw.slice(at + MARKER.length)).text.trim();
+    return { text: last || this.emitted.trim(), tokens: this.i };
   }
 }
 
@@ -253,7 +281,10 @@ export class HarnessClient {
     const [base] = await this.listByName(this.cfg.sessionName);
     if (base && (base.labels?.manifest || '') === this.hash) return { session: base, name: this.cfg.sessionName, stale: false };
     const alt = `${this.cfg.sessionName}-${this.hash}`;
-    const [variant] = base ? await this.listByName(alt) : [];
+    // the sessions API does not return labels, so a variant named after the current hash is
+    // looked up even when the base is gone (else deleting an unused base session would make
+    // the next boot create a fresh base instead of reusing the variant)
+    const [variant] = await this.listByName(alt);
     if (variant) return { session: variant, name: alt, stale: Boolean(base) };
     return { session: null, name: base ? alt : this.cfg.sessionName, stale: Boolean(base) };
   }
@@ -384,6 +415,7 @@ export class HarnessClient {
             // tool-call events from the harness itself (names vary by adapter); the MCP server's own events are primary
             alive();
             stats.harnessToolEvents++;
+            filter.close();
             hooks.onToolEvent?.({ type: e.type, data: d, ts: e.ts || Date.now() });
           } else if (!KNOWN_EVENTS.has(e.type) && !this.seenEventTypes.has(e.type)) {
             this.seenEventTypes.add(e.type);
