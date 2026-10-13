@@ -13,6 +13,7 @@ import { actions } from '@/anatomy/controller';
 import { store, useStore, type Health } from '@/anatomy/store';
 import { fmtDuration } from '@/anatomy/format';
 import { api } from '@/events.js';
+import { stageLabel } from '@/components.js';
 
 const SPEEDS = ['0.5', '1', '2'];
 
@@ -63,12 +64,12 @@ function servicesFor(h: Health): Service[] {
     ];
   }
   return [
+    { name: 'App Platform', detail: 'web service · API + chunk & embed in-process', up: true },
     { name: 'Spaces', detail: 'object storage · PutObject / GetObject', up: Boolean(p.spaces) },
     { name: 'Managed Postgres', detail: `pgvector · ${p.chunks ?? 0} rows`, up: Boolean(p.database) },
     { name: 'Harness Runtime', detail: p.harness ? `${p.harnessModel ?? 'opencode'} · session ${p.harnessSession ?? ''}` : 'HARNESS_API_TOKEN not set', up: Boolean(p.harness) },
-    { name: 'Action Gateway / MCP', detail: `tools mode ${p.toolsMode ?? 'inline'}${p.mcp ? '' : ' · MCP_PUBLIC_URL not set'}`, up: p.toolsMode === 'none' ? null : Boolean(p.mcp) },
-    { name: 'Managed Agent', detail: p.agent ? 'fallback 2 · chat/completions' : 'no fallback agent', up: Boolean(p.agent) },
-    { name: 'Serverless Inference', detail: `via ${p.inferenceVia ?? 'none'}`, up: Boolean(p.inference) || p.inferenceVia === 'agent' || p.inferenceVia === 'harness' },
+    { name: 'Action Gateway / MCP', detail: `tools mode ${p.toolsMode ?? 'gateway'}${p.mcp ? '' : ' · MCP_PUBLIC_URL not set'}`, up: p.toolsMode === 'none' ? null : Boolean(p.mcp) },
+    { name: 'Serverless Inference', detail: p.inferenceVia === 'harness' ? `${p.harnessModel ?? 'gpt-oss-20b'} · via harness session` : 'needs the harness token', up: p.inferenceVia === 'harness' },
     { name: 'Embeddings', detail: String(p.embedding ?? 'local-hash'), up: null },
   ];
 }
@@ -96,7 +97,7 @@ function BackendGroup() {
             <dl className="flex flex-col gap-1 text-xs">
               <Row k="events" v={conn === 'open' ? 'sse live' : 'sse reconnecting'} ok={conn === 'open'} />
               <Row k="recorder" v={recorder.recording ? `recording "${recorder.recording}"` : recorder.replaying ? `replaying "${recorder.replaying}"` : 'idle'} ok={null} />
-              {health && <Row k="stages" v={health.stages.join(' → ')} ok={null} />}
+              {health && <Row k="stages" v={health.stages.map(stageLabel).join(' → ')} ok={null} />}
             </dl>
             {health && (
               <>

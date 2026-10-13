@@ -48,15 +48,21 @@ export function mountAnatomy(container, ui) {
   };
   for (const m of Object.values(machines)) view.scene.add(m.group);
   for (const p of Object.values(PARTS)) if (p.machine) p.machineRef = machines[p.machine];
-  // labels on the board
+  // labels on the board (engraved in front of each machine). From the default camera
+  // (azimuth 38°, elevation 31°) a machine hides the board behind-left of it, so:
+  //  - the gateway's label sits in the gap between its front face (z 1.4) and the harness's
+  //    back-right corner (x -1.5, z 2.6), left of the band the inference platters occlude
+  //    (x > ~3.7 for z > 0);
+  //  - the App Platform label is shifted left of its press (its sub-line would otherwise
+  //    vanish behind the gateway turret) and slightly smaller so it clears the
+  //    gateway-spaces track leg at x -4.9.
   const LABELS = [
     ['CLIENT · APP / CLI', -16.2, 3.4],
     [MACHINES.spaces.label, -7.5, -2.0],
-    [MACHINES.functions.label, -1, -2.0],
+    [MACHINES.functions.label, -2.2, -2.3, { size: 0.46 }],
     [MACHINES.vectordb.label, 7.8, -0.9],
-    // in front of the gateway, right of the harness base's shadow and left of the inference platters' shadow
-    [MACHINES.gateway.label, 1.3, 1.6],
-    [`${MACHINES.router.label} · ${MACHINES.router.sublabel.replace(' · ', ' / ').toUpperCase()}`, -1, 7.0],
+    [MACHINES.gateway.label, 0.7, 1.7],
+    [`${MACHINES.router.label} · ${MACHINES.router.sublabel.replace(' · ', ' / ').toUpperCase()}`, -3.8, 7.0],
     [MACHINES.inference.label, 8.5, 7.1],
   ];
   for (const [text, x, z, opts] of LABELS) view.scene.add(boardLabel(text, x, z, opts));
@@ -73,7 +79,7 @@ export function mountAnatomy(container, ui) {
   view.onTick((dt, t) => {
     for (const m of Object.values(machines)) m.update(dt, t);
     tracks.update(dt, view.camera.zoom);
-    // activity glow follows the stage state (one slot per stage; kb and agent share the router)
+    // activity glow follows the stage state (one slot per stage; kb (app-side retrieval) and agent (harness) share the router machine)
     for (const a of Object.values(activity)) {
       a.level += (a.target - a.level) * (1 - Math.exp(-dt * 5));
       machines[a.machine].setActive(a.level, a.which);
@@ -84,7 +90,7 @@ export function mountAnatomy(container, ui) {
   const stats = {
     client: { facts: 0, questions: 0, deletes: 0, 'last request': '—', 'last answer': '—' },
     spaces: { objects: 0, 'last key': '—', bytes: 0, 'last PUT': '—', deletes: 0 },
-    functions: { invocations: 0, chunks: 0, embeddings: 0, 'last run': '—' },
+    functions: { runs: 0, chunks: 0, embeddings: 0, 'last run': '—' },
     vectordb: { rows: 0, inserts: 0, searches: 0, deletes: 0, 'last hits': '—', 'top score': '—', 'last query': '—' },
     router: { questions: 0, 'tool calls': 0, 'context chunks': 0, session: '—', 'first token': '—', 'last answer': '—', fallbacks: 0 },
     gateway: { 'tool calls': 0, searches: 0, documents: 0, errors: 0, 'last tool': '—', 'last latency': '—' },
@@ -196,7 +202,8 @@ export function mountAnatomy(container, ui) {
         break;
       }
       case 'functions':
-        stats.functions.invocations++;
+        // chunk + embed inside the App Platform app (the `functions` stage name is the wire contract)
+        stats.functions.runs++;
         enqueue(job, async () => {
           await tracks.send('spaces-functions', { color: job.color, lane: 0, count: 30 });
           setActivity('functions', true);
@@ -237,7 +244,7 @@ export function mountAnatomy(container, ui) {
         }
         break;
       case 'kb':
-        // app-side retrieval (fallback 1 / legacy backends): the app embeds + searches itself
+        // app-side retrieval (context-in-prompt fallback): the app embeds + searches itself
         questionArrives(job);
         enqueue(job, async () => {
           setActivity('kb', true);
@@ -245,7 +252,7 @@ export function mountAnatomy(container, ui) {
         });
         break;
       case 'agent':
-        // v4: the harness receives the question first and calls tools itself
+        // the Harness Runtime receives the question first and calls tools itself
         stats.router.questions++;
         if (e.data?.session) stats.router.session = e.data.session;
         if (e.data?.fallback) stats.router.fallbacks++;
@@ -578,7 +585,7 @@ export function mountAnatomy(container, ui) {
       }
       case 'fallback':
         if (e.data?.recording) ui.toast(`Live ${e.flow} failed (${e.data.reason}). Replaying "${e.data.recording}".`, 'warn', 7000);
-        else ui.toast(`Harness failed (${e.data?.reason || 'unknown'}). Falling back to the ${e.data?.to === 'agent' ? 'Managed Agent' : e.data?.to || 'fallback path'}.`, 'warn', 7000);
+        else ui.toast(`Harness failed (${e.data?.reason || 'unknown'}). Falling back to ${e.data?.to || 'the fallback path'}.`, 'warn', 7000);
         break;
       case 'replay':
         if (e.status === 'start') ui.setMode(`replay · ${e.data.name}`, 'warn');

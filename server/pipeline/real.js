@@ -21,22 +21,26 @@ export function fmtArgs(args = {}) {
  * lazily so mock mode never loads them. Configuration comes from env vars
  * documented in .env.example.
  *
- * Architecture v4 question flow (ANSWER_BACKEND=harness, the default):
- *   client -> Harness Runtime session (OpenCode + gpt-oss on Serverless Inference)
+ * Ingest: client -> Spaces (PutObject) -> chunk + embed in this App Platform
+ *   web service (stage `functions`, kept as the wire name) -> pgvector INSERT.
+ *
+ * Question flow (the only answer path):
+ *   client -> Harness Runtime session (OpenCode + gpt-oss-20b on Serverless Inference)
  *          -> Action Gateway / inline MCP -> anatomy-data MCP server (mcp/)
  *          -> pgvector (search_facts) / Spaces (get_document)
  *   The MCP server reports each tool call to POST /api/internal/tool-event,
  *   which lands in handleToolEvent() below and is attributed to the active
  *   question job so the scene can animate it.
- * Fallback 1: tool path unavailable (MCP health check fails, HARNESS_TOOLS_MODE=none,
- *   the agent answered without calling any tool, or it answered "don't know"
- *   without any usable tool result): the app retrieves itself and passes the
+ * Context-in-prompt fallback (still inside the harness): tool path unavailable
+ *   (MCP health check fails, HARNESS_TOOLS_MODE=none, the agent answered without
+ *   calling any tool, or it answered "don't know" without any usable tool
+ *   result): the app retrieves itself (stages kb -> vectordb) and passes the
  *   context in the prompt. The session keeps its history, so an answer without a
  *   tool call is treated as ungrounded (it may describe a fact deleted since) and
  *   is never shown: on the tool path answer tokens are held back until a tool
  *   call has been observed.
- * Fallback 2: the harness fails before producing anything: the old Managed
- *   Agent path (DO_AGENT_ENDPOINT) answers with app-side retrieval.
+ * Anything else surfaces as an error; server/app.js then replays a recording
+ *   (REPLAY_FALLBACK). There is no other model backend.
  */
 export class RealPipeline {
   constructor(bus, env = process.env) {
@@ -52,19 +56,16 @@ export class RealPipeline {
         bucket: env.DO_SPACES_BUCKET,
         endpoint: env.DO_SPACES_ENDPOINT || `https://${env.DO_SPACES_REGION || 'nyc3'}.digitaloceanspaces.com`,
       },
-      functionUrl: env.DO_FUNCTION_URL || '',
       databaseUrl: env.DATABASE_URL,
       table: env.PGVECTOR_TABLE || 'anatomy_chunks',
+      // DO_INFERENCE_URL / DO_INFERENCE_KEY only serve the optional remote embedding model;
+      // answer generation always happens inside the harness session.
       inference: {
         url: embedding.url,
         key: env.DO_INFERENCE_KEY,
-        model: env.DO_INFERENCE_MODEL || 'llama3.3-70b-instruct',
         embeddingModel: embedding.embeddingModel,
       },
       embedding,
-      agent: { endpoint: (env.DO_AGENT_ENDPOINT || '').replace(/\/$/, ''), key: env.DO_AGENT_KEY },
-      // ANSWER_BACKEND=harness|agent picks who answers questions (see README).
-      answerBackend: (env.ANSWER_BACKEND || 'harness').toLowerCase(),
       harness: harnessConfig(env),
       mcpToken: env.MCP_AUTH_TOKEN || '',
       dim: embedding.dim,
@@ -86,24 +87,42 @@ export class RealPipeline {
       spaces: Boolean(this.cfg.spaces.key && this.cfg.spaces.bucket),
       database: Boolean(this.cfg.databaseUrl),
       inference: Boolean(this.cfg.inference.key),
-      agent: Boolean(this.cfg.agent.endpoint),
       harness: Boolean(h.token),
       harnessModel: h.model,
-      harnessSession: h.sessionName,
+      harnessSession: this.harness.sessionName || h.sessionName,
+      harnessSessionId: this.harness.sessionId,
       toolsMode: h.toolsMode,
       mcp: Boolean(h.mcpUrl),
-      answerBackend: this.cfg.answerBackend,
       inferenceVia: this.inferenceVia(),
       embedding: this.cfg.inference.embeddingModel || 'local-hash',
     };
   }
 
-  /** Which service answers questions: the Harness Runtime, a Managed Agent, direct Serverless Inference, or nothing configured. */
+  /** How the model is reached: `harness` (Serverless Inference inside the Harness Runtime session) or nothing configured. */
   inferenceVia() {
-    if (this.cfg.answerBackend === 'harness' && this.cfg.harness.token) return 'harness';
-    if (this.cfg.agent.endpoint) return 'agent';
-    if (this.cfg.inference.key) return 'serverless';
-    return null;
+    return this.cfg.harness.token ? 'harness' : null;
+  }
+
+  /**
+   * Startup warm-up: find or create the harness session now so the first
+   * question of the demo does not pay for session creation / resume. Never
+   * throws; errors are logged (the first question retries from scratch).
+   * Resolves { ok, skipped?, session?, created?, error? }.
+   */
+  async warmUp(log = console) {
+    if (!this.cfg.harness.token) {
+      log.log('[warm-up] skipped: HARNESS_API_TOKEN not set');
+      return { ok: false, skipped: true, reason: 'HARNESS_API_TOKEN not set' };
+    }
+    const t0 = Date.now();
+    try {
+      const s = await this.harness.ensureSession();
+      log.log(`[warm-up] harness session ${s.name} ${s.created ? 'created' : 'resumed'} (${s.id}) in ${Date.now() - t0} ms${s.stale ? ' · base session has a stale manifest' : ''}`);
+      return { ok: true, session: s.name, sessionId: s.id, created: s.created, ms: Date.now() - t0 };
+    } catch (err) {
+      log.error(`[warm-up] harness session not ready: ${err.message}`);
+      return { ok: false, error: err.message };
+    }
   }
 
   // ---- lazy clients -------------------------------------------------------
@@ -165,20 +184,13 @@ export class RealPipeline {
       await s3.send(new PutObjectCommand({ Bucket: this.cfg.spaces.bucket, Key: key, Body: text, ContentType: 'text/plain' }));
       ev.stage('spaces', 'done', 'Object stored in Spaces', { key });
 
-      let chunks, embeddings;
-      if (this.cfg.functionUrl) {
-        ev.stage('functions', 'start', 'Invoking DigitalOcean Function', { key });
-        const res = await fetch(this.cfg.functionUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key, text }) });
-        if (!res.ok) throw new Error(`Function returned ${res.status}`);
-        ({ chunks, embeddings } = await res.json());
-        ev.stage('functions', 'progress', `Function returned ${chunks.length} chunks`, { step: 'chunk', chunks: chunks.length });
-      } else {
-        ev.stage('functions', 'start', 'Chunk + embed (in-process, DO_FUNCTION_URL not set)', { key });
-        chunks = chunkText(text);
-        ev.stage('functions', 'progress', `Chunked into ${chunks.length} chunks`, { step: 'chunk', chunks: chunks.length });
-        embeddings = await this.embed(chunks);
-        chunks.forEach((_, i) => ev.stage('functions', 'progress', `Embedded chunk ${i + 1}/${chunks.length}`, { step: 'embed', index: i, total: chunks.length }));
-      }
+      // chunk + embed happen right here, in the App Platform web service (no DO Function involved);
+      // the stage keeps its wire name `functions` so recordings and the frontend contract stay stable
+      ev.stage('functions', 'start', 'App Platform: chunk + embed in-process', { key, where: 'app-platform' });
+      const chunks = chunkText(text);
+      ev.stage('functions', 'progress', `Chunked into ${chunks.length} chunks`, { step: 'chunk', chunks: chunks.length });
+      const embeddings = await this.embed(chunks);
+      chunks.forEach((_, i) => ev.stage('functions', 'progress', `Embedded chunk ${i + 1}/${chunks.length} (${this.cfg.dim} dims)`, { step: 'embed', index: i, total: chunks.length }));
       ev.stage('functions', 'done', `Produced ${chunks.length} vectors`, { chunks: chunks.length });
 
       ev.stage('vectordb', 'start', `INSERT ${chunks.length} rows into ${this.cfg.table}`, {});
@@ -300,11 +312,10 @@ export class RealPipeline {
 
   // ---- query --------------------------------------------------------------
   /**
-   * Answer a question. With ANSWER_BACKEND=harness (default) the Harness
-   * Runtime agent retrieves through the MCP tools itself (see class docs);
-   * the legacy backends retrieve from pgvector first and then generate via the
-   * Managed Agent (DO_AGENT_ENDPOINT) or Serverless Inference (DO_INFERENCE_KEY).
-   * Resolves { jobId, answer, sources, timing: {firstTokenMs, totalMs, toolCalls}, backend, fallback?, reason? }.
+   * Answer a question through the Harness Runtime: the agent retrieves through
+   * the MCP tools itself (see class docs), falling back to context in the
+   * prompt when the tool path is unavailable. Resolves
+   * { jobId, answer, sources, timing: {firstTokenMs, totalMs, toolCalls}, backend: 'harness', fallback?, reason? }.
    */
   async ask(question) {
     const jobId = randomUUID();
@@ -312,44 +323,11 @@ export class RealPipeline {
     const t0 = Date.now();
     ev.job('start', { input: question });
     try {
-      const via = this.inferenceVia();
-      if (!via) throw new Error('DO_INFERENCE_KEY missing and no DO_AGENT_ENDPOINT configured (nor HARNESS_API_TOKEN with ANSWER_BACKEND=harness): set a Harness Runtime token, a Managed Agent endpoint + key, or a Model Access Key');
-      if (via === 'agent' && !this.cfg.agent.key) throw new Error('DO_AGENT_KEY missing (required with DO_AGENT_ENDPOINT)');
-
-      let result;
-      if (via === 'harness') {
-        // one harness run at a time so tool events are attributed to the right job
-        const run = this.askQueue.then(() => this.askViaHarness(question, ev, jobId, t0));
-        this.askQueue = run.catch(() => {});
-        result = await run;
-      } else {
-        // legacy: retrieval over our own vector store first, then generate
-        const sources = await this.retrieve(question, ev);
-        const context = sources.map((s, i) => `[${i + 1}] ${s.chunk}`).join('\n');
-        const guidance = 'Answer using only the provided context. If the context is empty or does not cover the question, say you do not know yet. Be concise.';
-        let firstTokenMs = null;
-        const onToken = (token, index) => {
-          if (firstTokenMs == null) firstTokenMs = Date.now() - t0;
-          ev.stage('inference', 'progress', '', { token, index });
-        };
-        let answer;
-        if (via === 'agent') answer = await this.askAgent(question, context, guidance, sources, ev, onToken);
-        else {
-          // direct Serverless Inference with a Model Access Key
-          ev.stage('agent', 'start', 'Composing grounded prompt', { contextChunks: sources.length, via });
-          const messages = [
-            { role: 'system', content: guidance },
-            { role: 'user', content: `Context:\n${context || '(none)'}\n\nQuestion: ${question}` },
-          ];
-          ev.stage('agent', 'done', 'Prompt ready; calling serverless inference', {});
-          ev.stage('inference', 'start', `Serverless inference: ${this.cfg.inference.model}`, { model: this.cfg.inference.model, via });
-          const out = await this.streamChat(messages, onToken);
-          answer = out.text;
-          ev.stage('inference', 'done', 'Completed', { model: out.model || this.cfg.inference.model, tokens: out.tokens, via });
-        }
-        result = { answer, sources, backend: via, timing: { firstTokenMs, totalMs: Date.now() - t0, toolCalls: 0 } };
-      }
-
+      if (!this.inferenceVia()) throw new Error('HARNESS_API_TOKEN missing (or DIGITALOCEAN_ACCESS_TOKEN): questions are answered by the Harness Runtime session');
+      // one harness run at a time so tool events are attributed to the right job
+      const run = this.askQueue.then(() => this.askViaHarness(question, ev, jobId, t0));
+      this.askQueue = run.catch(() => {});
+      const result = await run;
       const { answer, sources } = result;
       ev.answer(answer, sources);
       ev.job('done', { answer, sources, timing: result.timing, backend: result.backend, fallback: result.fallback, reason: result.reason });
@@ -378,8 +356,8 @@ export class RealPipeline {
   }
 
   /**
-   * v4 answer flow through the Harness Runtime. Returns
-   * { answer, sources, backend, timing, fallback }.
+   * Answer flow through the Harness Runtime. Returns
+   * { answer, sources, backend: 'harness', timing, fallback, reason }.
    */
   async askViaHarness(question, ev, jobId, t0) {
     const h = this.cfg.harness;
@@ -410,7 +388,7 @@ export class RealPipeline {
     const timing = () => ({ firstTokenMs, totalMs: Date.now() - t0, toolCalls: run.toolCalls });
     let sources = [];
     let answer = '';
-    let backend = 'harness';
+    const backend = 'harness';
     let fallback = null;
     let reason = null;
     let harnessOut = null;
@@ -422,7 +400,7 @@ export class RealPipeline {
       onToken,
     });
     const contextRun = async (detail, why, because) => {
-      // FALLBACK 1: the app retrieves itself and passes the context in the prompt
+      // context-in-prompt fallback: the app retrieves itself and passes the context in the prompt
       gate.enabled = false;
       gate.held.length = 0;
       sources = await this.retrieve(question, ev);
@@ -435,59 +413,45 @@ export class RealPipeline {
     };
 
     try {
-      try {
-        let toolPath = h.toolsMode !== 'none';
-        let unavailable = h.toolsMode === 'none' ? 'HARNESS_TOOLS_MODE=none' : '';
-        if (toolPath) {
-          const health = await this.mcpHealthy();
-          if (!health.ok) { toolPath = false; unavailable = health.reason; }
-        }
-        if (toolPath) {
-          ev.stage('agent', 'start', `Harness Runtime (OpenCode, ${h.model}) answering with tools (${h.toolsMode})`, { via: 'harness', session: h.sessionName, toolsMode: h.toolsMode, model: h.model });
-          ev.stage('inference', 'start', `Serverless inference via harness: ${h.model}`, { model: h.model, via: 'harness', toolsMode: h.toolsMode });
-          gate.enabled = true;
-          harnessOut = await this.harness.ask(buildToolPrompt(question, { gateway: h.toolsMode === 'gateway' }), hooks('tool path'));
-          answer = harnessOut.text;
-          sources = run.hits.slice();
-          if (!toolSeen()) {
-            // GUARD: no tool call at all -> the answer is ungrounded (likely recalled from an earlier turn,
-            // possibly about a fact that has since been deleted). Discard it and re-ask with fresh context.
-            const held = gate.held.length;
-            gate.held.length = 0;
-            const what = streamed > 0 ? 'the ungrounded answer already streamed was discarded; the final answer replaces it' : `ungrounded answer discarded unseen (${held} held token${held === 1 ? '' : 's'})`;
-            ev.stage('agent', 'progress', `Harness answered without calling any tool: ${what}; re-asking with context passed in prompt`, { fallback: 'context', reason: 'no tool call', discarded: true, streamed, held, via: 'harness' });
-            answer = '';
-            sources = [];
-            await contextRun('context (no tool call)', 'context', 'no tool call');
-          } else {
-            if (gate.held.length) flushHeld();
-            gate.enabled = false;
-            if ((run.toolDone === 0 || run.toolErrors > 0) && isDontKnow(answer)) {
-              // the agent never got a usable tool result: retry once with context in the prompt
-              ev.stage('agent', 'progress', `No usable tool result (${run.toolDone} done, ${run.toolErrors} failed); retrying with context passed in prompt`, { fallback: 'context', via: 'harness' });
-              await contextRun('context retry', 'context-retry');
-            }
-          }
-        } else {
-          ev.stage('agent', 'start', `Harness Runtime (OpenCode, ${h.model}) answering · Tool path unavailable, context passed in prompt (${unavailable})`, { via: 'harness', session: h.sessionName, toolsMode: 'none', model: h.model, fallback: 'context', reason: unavailable });
-          await contextRun('context in prompt', 'context', unavailable);
-        }
-        const t = timing();
-        ev.stage('inference', 'done', 'Completed', { model: harnessOut.model || h.model, tokens: harnessOut.tokens, via: 'harness', ...t });
-        ev.stage('agent', 'done', `Harness answered (first token ${t.firstTokenMs ?? '—'} ms, total ${t.totalMs} ms, ${t.toolCalls} tool call${t.toolCalls === 1 ? '' : 's'})`, { via: 'harness', ...t, runId: harnessOut.runId, backend, fallback, reason });
-      } catch (err) {
-        // FALLBACK 2: the harness failed before producing anything -> old Managed Agent path
-        if (streamed > 0 || err.beforeFirstToken === false || !this.cfg.agent.endpoint || !this.cfg.agent.key) throw err;
-        this.bus.publish({ type: 'fallback', flow: 'query', jobId, data: { reason: err.message, to: 'agent', from: 'harness' } });
-        ev.stage('agent', 'progress', `Harness failed before first token (${err.message}); falling back to Managed Agent`, { fallback: 'agent', via: 'harness' });
-        if (!sources.length) sources = await this.retrieve(question, ev);
-        const context = sources.map((s, i) => `[${i + 1}] ${s.chunk}`).join('\n');
-        const guidance = 'Answer using only the provided context. If the context is empty or does not cover the question, say you do not know yet. Be concise.';
-        answer = await this.askAgent(question, context, guidance, sources, ev, onToken);
-        backend = 'agent';
-        fallback = 'agent';
-        reason = err.message;
+      let toolPath = h.toolsMode !== 'none';
+      let unavailable = h.toolsMode === 'none' ? 'HARNESS_TOOLS_MODE=none' : '';
+      if (toolPath) {
+        const health = await this.mcpHealthy();
+        if (!health.ok) { toolPath = false; unavailable = health.reason; }
       }
+      if (toolPath) {
+        ev.stage('agent', 'start', `Harness Runtime (OpenCode, ${h.model}) answering with tools (${h.toolsMode})`, { via: 'harness', session: h.sessionName, toolsMode: h.toolsMode, model: h.model });
+        ev.stage('inference', 'start', `Serverless inference via harness: ${h.model}`, { model: h.model, via: 'harness', toolsMode: h.toolsMode });
+        gate.enabled = true;
+        harnessOut = await this.harness.ask(buildToolPrompt(question, { gateway: h.toolsMode === 'gateway' }), hooks('tool path'));
+        answer = harnessOut.text;
+        sources = run.hits.slice();
+        if (!toolSeen()) {
+          // GUARD: no tool call at all -> the answer is ungrounded (likely recalled from an earlier turn,
+          // possibly about a fact that has since been deleted). Discard it and re-ask with fresh context.
+          const held = gate.held.length;
+          gate.held.length = 0;
+          const what = streamed > 0 ? 'the ungrounded answer already streamed was discarded; the final answer replaces it' : `ungrounded answer discarded unseen (${held} held token${held === 1 ? '' : 's'})`;
+          ev.stage('agent', 'progress', `Harness answered without calling any tool: ${what}; re-asking with context passed in prompt`, { fallback: 'context', reason: 'no tool call', discarded: true, streamed, held, via: 'harness' });
+          answer = '';
+          sources = [];
+          await contextRun('context (no tool call)', 'context', 'no tool call');
+        } else {
+          if (gate.held.length) flushHeld();
+          gate.enabled = false;
+          if ((run.toolDone === 0 || run.toolErrors > 0) && isDontKnow(answer)) {
+            // the agent never got a usable tool result: retry once with context in the prompt
+            ev.stage('agent', 'progress', `No usable tool result (${run.toolDone} done, ${run.toolErrors} failed); retrying with context passed in prompt`, { fallback: 'context', via: 'harness' });
+            await contextRun('context retry', 'context-retry');
+          }
+        }
+      } else {
+        ev.stage('agent', 'start', `Harness Runtime (OpenCode, ${h.model}) answering · Tool path unavailable, context passed in prompt (${unavailable})`, { via: 'harness', session: h.sessionName, toolsMode: 'none', model: h.model, fallback: 'context', reason: unavailable });
+        await contextRun('context in prompt', 'context', unavailable);
+      }
+      const t = timing();
+      ev.stage('inference', 'done', 'Completed', { model: harnessOut.model || h.model, tokens: harnessOut.tokens, via: 'harness', ...t });
+      ev.stage('agent', 'done', `Harness answered (first token ${t.firstTokenMs ?? '—'} ms, total ${t.totalMs} ms, ${t.toolCalls} tool call${t.toolCalls === 1 ? '' : 's'})`, { via: 'harness', ...t, runId: harnessOut.runId, backend, fallback, reason });
       if (!answer) answer = DONT_KNOW_TEXT;
       return { answer, sources, backend, timing: timing(), fallback, reason };
     } finally {
@@ -575,41 +539,6 @@ export class RealPipeline {
     return { accepted: true, jobId: run.jobId };
   }
 
-  /** Managed Agent path (DO_AGENT_ENDPOINT): the agent owns a KB and calls the model. Mutates `sources`. */
-  async askAgent(question, context, guidance, sources, ev, onToken) {
-    const via = 'agent';
-    let answer;
-    // 2. Managed Agent: it owns a Knowledge Base and calls the model for us.
-    const { endpoint, key } = this.cfg.agent;
-    ev.stage('agent', 'start', 'Managed Agent (KB + model) answering', { contextChunks: sources.length, via });
-    // Agent endpoints apply their own system instructions, so the grounding guidance travels inside the user turn.
-    const messages = [{ role: 'user', content: `${guidance}\n\nContext:\n${context || '(none)'}\n\nQuestion: ${question}` }];
-    ev.stage('inference', 'start', 'Serverless inference via agent', { via });
-    const agentSources = [];
-    const onRetrieval = (retrieved) => {
-      const extra = retrieved
-        .map((r, i) => ({ id: r.id ?? `kb-${agentSources.length + i + 1}`, chunk: r.text || r.content || r.chunk || '', score: r.score ?? null, origin: 'agent-kb' }))
-        .filter((r) => r.chunk);
-      if (!extra.length) return;
-      agentSources.push(...extra);
-      ev.stage('kb', 'progress', `Agent Knowledge Base returned ${agentSources.length} chunk${agentSources.length === 1 ? '' : 's'}`, { step: 'agent-kb', hits: agentSources.length });
-    };
-    const out = await this.streamChat(messages, onToken, {
-      url: `${endpoint}/api/v1`,
-      key,
-      model: null,
-      body: { include_retrieval_info: true },
-      onRetrieval,
-    });
-    answer = out.text;
-    // merge agent KB hits after our own pgvector hits, skipping duplicate text
-    const seen = new Set(sources.map((s) => s.chunk.trim()));
-    for (const s of agentSources) if (!seen.has(s.chunk.trim())) { seen.add(s.chunk.trim()); sources.push(s); }
-    ev.stage('inference', 'done', 'Completed', { model: out.model || undefined, tokens: out.tokens, via });
-    ev.stage('agent', 'done', `Agent responded with ${agentSources.length} KB chunk${agentSources.length === 1 ? '' : 's'}`, { kbHits: agentSources.length });
-    return answer;
-  }
-
   /** Embed the question and run a cosine top-3 search in pgvector, emitting kb/vectordb stage events (app-side retrieval). */
   async retrieve(question, ev) {
     ev.stage('kb', 'start', 'App-side retrieval: embedding the question', { question });
@@ -621,64 +550,5 @@ export class RealPipeline {
     ev.stage('vectordb', 'done', `${sources.length} relevant chunk${sources.length === 1 ? '' : 's'} retrieved`, { count: this.count, hits: sources.map((s) => ({ id: s.id, score: s.score })), op: 'search' });
     ev.stage('kb', 'done', `Context assembled from ${sources.length} chunk${sources.length === 1 ? '' : 's'}`, { hits: sources.length });
     return sources;
-  }
-
-  /**
-   * OpenAI-compatible streaming chat completion (SSE). Works against Serverless
-   * Inference (default) or a Managed Agent endpoint via `opts`:
-   *   url    base URL ending in /v1 (default DO_INFERENCE_URL)
-   *   key    bearer token (default DO_INFERENCE_KEY)
-   *   model  model id; null omits the field (agents pick their own model)
-   *   body   extra request fields, e.g. { include_retrieval_info: true }
-   *   onRetrieval(retrieved_data[]) called when a chunk carries agent KB retrieval info
-   * Only `delta.content` is streamed; `delta.reasoning_content` from reasoning
-   * models is ignored. Resolves { text, model, tokens }.
-   */
-  async streamChat(messages, onToken, opts = {}) {
-    const url = (opts.url || this.cfg.inference.url).replace(/\/$/, '');
-    const key = opts.key ?? this.cfg.inference.key;
-    const model = opts.model === undefined ? this.cfg.inference.model : opts.model;
-    if (!key) throw new Error(opts.url ? 'DO_AGENT_KEY missing' : 'DO_INFERENCE_KEY missing');
-    const payload = { messages, stream: true, temperature: 0.2, ...(model ? { model } : {}), ...(opts.body || {}) };
-    const res = await fetch(`${url}/chat/completions`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) throw new Error(`${opts.url ? 'Agent' : 'Inference'} request failed: ${res.status} ${await res.text()}`);
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    let text = '';
-    let modelSeen = '';
-    let i = 0;
-    const handle = (line) => {
-      const m = line.match(/^data:\s*(.*)$/);
-      if (!m || m[1].trim() === '[DONE]' || !m[1].trim()) return;
-      let json;
-      try {
-        json = JSON.parse(m[1]);
-      } catch {
-        return; /* ignore partial / non-JSON lines */
-      }
-      if (json.model && !modelSeen) modelSeen = json.model;
-      const retrieved = json.retrieval?.retrieved_data;
-      if (Array.isArray(retrieved) && retrieved.length && opts.onRetrieval) opts.onRetrieval(retrieved);
-      const delta = json.choices?.[0]?.delta?.content;
-      if (typeof delta === 'string' && delta) {
-        text += delta;
-        onToken(delta, i++);
-      }
-    };
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split('\n');
-      buf = lines.pop();
-      for (const line of lines) handle(line);
-    }
-    if (buf) handle(buf);
-    return { text, model: modelSeen, tokens: i };
   }
 }

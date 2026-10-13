@@ -566,7 +566,7 @@
       "flow": "query",
       "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "data": {
-        "text": "Based on the knowledge base: DigitalOcean Spaces is S3-compatible object storage. Managed Postgres supports the pgvector extension for similarity search.",
+        "text": "Based on the stored facts: DigitalOcean Spaces is S3-compatible object storage. Managed Postgres supports the pgvector extension for similarity search.",
         "sources": [
           {
             "id": 1,
@@ -586,7 +586,7 @@
       "jobId": "a6c26416-3c78-4bb5-a524-2c450e03e0e2",
       "status": "done",
       "data": {
-        "answer": "Based on the knowledge base: DigitalOcean Spaces is S3-compatible object storage. Managed Postgres supports the pgvector extension for similarity search.",
+        "answer": "Based on the stored facts: DigitalOcean Spaces is S3-compatible object storage. Managed Postgres supports the pgvector extension for similarity search.",
         "sources": [
           {
             "id": 1,

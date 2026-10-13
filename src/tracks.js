@@ -13,16 +13,19 @@ const PIPE_R = 0.11;
 /** Track routes in board coordinates [x, z]. Lanes: 0 = forward, 1 = return. */
 export const ROUTES = {
   'client-spaces': { pts: [[-12.3, -0.45], [-11.5, -0.45], [-10.7, -1.25], [-10.7, -4.5], [-9.7, -4.5]], lanes: 2 },
-  'client-router': { pts: [[-12.3, 1.45], [-11.5, 1.45], [-10.7, 2.25], [-10.7, 4.5], [-3.3, 4.5]], lanes: 2 },
+  // question: client -> Harness Runtime left face (the harness sits at x -6.1..-1.5, z 2.6..6.4)
+  'client-router': { pts: [[-12.3, 1.45], [-11.5, 1.45], [-10.7, 2.25], [-10.7, 4.5], [-6.1, 4.5]], lanes: 2 },
   'spaces-functions': { pts: [[-5.3, -4.5], [-3.3, -4.5]], lanes: 2 },
   'functions-vectordb': { pts: [[1.3, -4.5], [3.5, -4.5]], lanes: 2 },
-  // app-side retrieval (fallback 1 / legacy backends): harness right face straight to pgvector, skirting the gateway on the right
-  'router-vectordb': { pts: [[1.3, 3.2], [4.4, 3.2], [4.4, -1.5]], lanes: 2 },
-  // v4 tool path: harness (back face) -> Action Gateway (left port) -> pgvector (search_facts, back port) / Spaces (get_document, left port)
-  'router-gateway': { pts: [[-2.5, 2.6], [-2.5, 0.5], [-0.2, 0.5]], lanes: 2 },
-  'gateway-vectordb': { pts: [[2.0, -1.0], [2.0, -2.4], [3.5, -2.4]], lanes: 2 },
-  'gateway-spaces': { pts: [[-0.2, -0.5], [-3.8, -0.5], [-4.8, -1.5], [-4.8, -3.4], [-5.3, -3.4]], lanes: 2 },
-  'router-inference': { pts: [[1.3, 5.4], [6, 5.4]], lanes: 2 },
+  // app-side retrieval (context-in-prompt fallback): harness right face straight to pgvector, skirting the gateway on the right
+  'router-vectordb': { pts: [[-1.5, 3.2], [4.4, 3.2], [4.4, -1.5]], lanes: 2 },
+  // live tool path: harness (back face) -> Action Gateway (left port, front half) -> pgvector (search_facts, back port) / Spaces (get_document, left port, back half)
+  'router-gateway': { pts: [[-3.8, 2.6], [-3.8, 0.8], [-0.1, 0.8]], lanes: 2 },
+  'gateway-vectordb': { pts: [[2.4, -0.6], [2.4, -2.4], [3.5, -2.4]], lanes: 2 },
+  // the vertical leg hugs Spaces (x -4.9) so the APP PLATFORM board label in front of the press has room
+  'gateway-spaces': { pts: [[-0.1, -0.1], [-4.0, -0.1], [-4.9, -1.0], [-4.9, -3.4], [-5.3, -3.4]], lanes: 2 },
+  // harness right face -> Serverless Inference left face
+  'router-inference': { pts: [[-1.5, 5.4], [6, 5.4]], lanes: 2 },
   'inference-client': { pts: [[11, 4.5], [12.2, 4.5], [12.2, 8.7], [-11.5, 8.7], [-13.2, 7], [-13.2, 2.6]], lanes: 3 },
 };
 

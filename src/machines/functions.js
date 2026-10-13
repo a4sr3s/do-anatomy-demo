@@ -1,4 +1,4 @@
-/** FUNCTIONS: two meshing gears on a base plate and a press that slams down to chunk and stamp. */
+/** APP PLATFORM · CHUNK & EMBED (stage `functions`): two meshing gears on a base plate and a press that slams down to chunk and stamp. */
 import * as THREE from 'three';
 import { Solid, rrBox, box, cyl, gear, tagPart, lineSegments, follow, Burst } from '../kit.js';
 

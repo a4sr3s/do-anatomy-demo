@@ -3,7 +3,7 @@ import { Badge } from '@/components/ui/badge';
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty';
 import { SidebarGroup, SidebarGroupContent, SidebarGroupLabel } from '@/components/ui/sidebar';
-import { MACHINES } from '@/components.js';
+import { MACHINES, stageLabel } from '@/components.js';
 import { useStore, type Stats } from '@/anatomy/store';
 
 interface Machine {
@@ -29,10 +29,10 @@ export function ArchitectureSection() {
         <SidebarGroupLabel>Pipeline</SidebarGroupLabel>
         <SidebarGroupContent className="flex flex-col gap-2 px-2">
           <p className="text-xs text-muted-foreground">
-            A fact goes CLIENT → SPACES → FUNCTIONS → VECTOR DB. A question goes CLIENT → HARNESS RUNTIME, where an OpenCode agent calls the
-            search_facts tool: ACTION GATEWAY → MCP server → VECTOR DB (or SPACES for get_document) and back, then INFERENCE streams the grounded answer
-            to the CLIENT. If the tool path is down the app retrieves itself and passes context in the prompt; if the harness fails before its first
-            token the Managed Agent answers. Every motion in the scene is a backend event.
+            A fact goes CLIENT → SPACES → APP PLATFORM (chunk &amp; embed in the web service) → PGVECTOR. A question goes CLIENT → HARNESS RUNTIME,
+            where the OpenCode agent calls the search_facts tool: ACTION GATEWAY → MCP server → PGVECTOR (or SPACES for get_document) and back, then
+            SERVERLESS INFERENCE (gpt-oss-20b) streams the grounded answer to the CLIENT. If the tool path is down the app retrieves itself and passes the
+            context in the prompt. Every motion in the scene is a backend event.
           </p>
           {machines.map((m) => (
             <MachineCard key={m.key} machine={m} stats={machineStats[m.key]} />
@@ -85,7 +85,9 @@ function MachineCard({ machine: m, stats }: { machine: Machine; stats?: Stats })
         </CardDescription>
         {m.stage && (
           <CardAction>
-            <Badge variant="outline">{m.stage}</Badge>
+            <Badge variant="outline" title={`stage "${m.stage}"`}>
+              {stageLabel(m.stage)}
+            </Badge>
           </CardAction>
         )}
       </CardHeader>

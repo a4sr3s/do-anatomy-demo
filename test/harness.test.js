@@ -6,7 +6,7 @@ import { MarkerFilter, HarnessClient, buildManifest, buildPrompt, buildToolPromp
 
 const FACT = 'Acme Robotics runs 40 GPU droplets in SFO3.';
 const sseFrame = (e) => `id: x\nevent: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`;
-const BASE_ENV = { ANSWER_BACKEND: 'harness', HARNESS_API_TOKEN: 'tok', HARNESS_INFERENCE_API_KEY: 'k', MCP_PUBLIC_URL: 'https://demo.example/mcp', MCP_AUTH_TOKEN: 'mcp-secret' };
+const BASE_ENV = { HARNESS_API_TOKEN: 'tok', HARNESS_INFERENCE_API_KEY: 'k', MCP_PUBLIC_URL: 'https://demo.example/mcp', MCP_AUTH_TOKEN: 'mcp-secret' };
 
 /**
  * Fake Harness Runtime API: list -> sessions (with labels), create -> new
@@ -56,8 +56,8 @@ function fakeHarness(deltas, { fail = false, sessions, extraEvents = [], onInput
   return { impl, calls, state };
 }
 
-/** Pipeline with a stubbed pgvector, a fake harness and a routed global fetch (MCP health + agent endpoint). */
-function setup(env, harness, { mcpHealthy = true, agentChunks = [] } = {}) {
+/** Pipeline with a stubbed pgvector, a fake harness and a routed global fetch (MCP health only). */
+function setup(env, harness, { mcpHealthy = true } = {}) {
   const bus = new EventBus();
   const events = [];
   bus.on('event', (e) => events.push(e));
@@ -74,10 +74,6 @@ function setup(env, harness, { mcpHealthy = true, agentChunks = [] } = {}) {
   globalThis.fetch = async (url, init = {}) => {
     fetches.push({ url: String(url), init });
     if (String(url).endsWith('/mcp/health')) return mcpHealthy ? Response.json({ ok: true }) : new Response('down', { status: 503 });
-    if (String(url).endsWith('/chat/completions')) {
-      const sse = agentChunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join('') + 'data: [DONE]\n\n';
-      return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } });
-    }
     return new Response('unexpected', { status: 500 });
   };
   return { p, events, fetches, restore: () => (globalThis.fetch = realFetch) };
@@ -180,13 +176,68 @@ test('harness: prompts', () => {
   assert.ok(!isDontKnow('Acme runs 40 GPU droplets in SFO3.'));
 });
 
-test('harness: ANSWER_BACKEND selects the backend (harness is the default)', () => {
+test('harness: the Harness Runtime is the only answer backend (ANSWER_BACKEND / DO_AGENT_* are ignored)', () => {
   const bus = new EventBus();
-  const agentEnv = { DO_AGENT_ENDPOINT: 'https://x.agents.do-ai.run', DO_AGENT_KEY: 'k' };
-  assert.equal(new RealPipeline(bus, { ...agentEnv, HARNESS_API_TOKEN: 't' }).describe().inferenceVia, 'harness');
-  assert.equal(new RealPipeline(bus, { ...agentEnv, ANSWER_BACKEND: 'agent', HARNESS_API_TOKEN: 't' }).describe().inferenceVia, 'agent');
-  assert.equal(new RealPipeline(bus, { ...agentEnv, ANSWER_BACKEND: 'harness' }).describe().inferenceVia, 'agent', 'no token -> agent');
+  const legacyEnv = { DO_AGENT_ENDPOINT: 'https://x.agents.do-ai.run', DO_AGENT_KEY: 'k', ANSWER_BACKEND: 'agent' };
+  assert.equal(new RealPipeline(bus, { ...legacyEnv, HARNESS_API_TOKEN: 't' }).describe().inferenceVia, 'harness');
+  assert.equal(new RealPipeline(bus, legacyEnv).describe().inferenceVia, null, 'no token -> nothing answers (replay fallback upstream)');
   assert.equal(new RealPipeline(bus, { DIGITALOCEAN_ACCESS_TOKEN: 'dop' }).describe().inferenceVia, 'harness');
+  const d = new RealPipeline(bus, BASE_ENV).describe();
+  assert.equal(d.toolsMode, 'gateway');
+  assert.equal(d.harnessSession, 'alexis-anatomy-harness-v4');
+  assert.ok(!('agent' in d) && !('answerBackend' in d));
+});
+
+test('harness: warmUp() finds or creates the session at boot without emitting job events, and never throws', async () => {
+  // 1. a matching session exists -> resumed
+  let h = fakeHarness([]);
+  let { p, events, restore } = setup(BASE_ENV, h);
+  const logs = [];
+  const log = { log: (m) => logs.push(m), error: (m) => logs.push(`ERR ${m}`) };
+  try {
+    const out = await p.warmUp(log);
+    assert.equal(out.ok, true);
+    assert.equal(out.created, false);
+    assert.equal(out.session, 'alexis-anatomy-harness-v4');
+    assert.equal(out.sessionId, 'sess-1');
+    assert.equal(events.length, 0, 'warm-up is silent on the SSE bus');
+    assert.match(logs[0], /\[warm-up\] harness session alexis-anatomy-harness-v4 resumed \(sess-1\)/);
+    assert.equal(p.describe().harnessSessionId, 'sess-1');
+    // a following question reuses the warm session: no second list / create call
+    const before = h.calls.length;
+    await p.ask('q');
+    assert.ok(!h.calls.slice(before).some((c) => c.url.includes('?name=') || (c.method === 'POST' && c.url.endsWith('/sessions'))), 'session already known');
+  } finally {
+    restore();
+  }
+  // 2. nothing exists -> created
+  h = fakeHarness([], { sessions: [] });
+  ({ p, events, restore } = setup(BASE_ENV, h));
+  try {
+    const out = await p.warmUp(log);
+    assert.equal(out.created, true);
+    assert.ok(h.calls.some((c) => c.method === 'POST' && c.url.endsWith('/sessions')));
+    assert.equal(events.length, 0);
+  } finally {
+    restore();
+  }
+  // 3. API down -> logged, not thrown
+  h = fakeHarness([]);
+  h.impl = async () => new Response('nope', { status: 500 });
+  ({ p, events, restore } = setup(BASE_ENV, h));
+  try {
+    const out = await p.warmUp(log);
+    assert.equal(out.ok, false);
+    assert.match(out.error, /Harness list sessions failed: 500/);
+    assert.match(logs.at(-1), /^ERR \[warm-up\] harness session not ready/);
+    assert.equal(events.length, 0);
+  } finally {
+    restore();
+  }
+  // 4. no token -> skipped
+  const bus = new EventBus();
+  const cold = await new RealPipeline(bus, { DATABASE_URL: 'postgres://stub' }).warmUp(log);
+  assert.deepEqual(cold, { ok: false, skipped: true, reason: 'HARNESS_API_TOKEN not set' });
 });
 
 test('harness: session reuse by manifest fingerprint; stale base session -> new <name>-<hash> session', async () => {
@@ -434,42 +485,23 @@ test('harness: tool path holds answer tokens until a tool call is observed, then
   }
 });
 
-test('harness: fallback 2: a run that fails before the first token goes to the Managed Agent with app-side retrieval', async () => {
-  const h = fakeHarness([], { fail: true });
-  const agentChunks = [{ choices: [{ delta: { content: 'From agent.' } }] }];
-  const { p, events, restore } = setup({ ...BASE_ENV, DO_AGENT_ENDPOINT: 'https://x.agents.do-ai.run', DO_AGENT_KEY: 'ak' }, h, { agentChunks });
-  try {
-    const out = await p.ask('q');
-    assert.equal(out.answer, 'From agent.');
-    assert.equal(out.backend, 'agent');
-    assert.equal(out.fallback, 'agent');
-    assert.deepEqual(out.sources.map((s) => s.id), [7]);
-    const fb = events.find((e) => e.type === 'fallback');
-    assert.equal(fb.data.to, 'agent');
-    assert.equal(fb.jobId, out.jobId);
-    assert.ok(events.some((e) => e.stage === 'agent' && e.status === 'progress' && /falling back to Managed Agent/.test(e.detail)));
-    assert.deepEqual(starts(events), ['agent', 'inference', 'kb', 'vectordb', 'agent', 'inference']);
-    assert.equal(events.at(-1).data.backend, 'agent');
-  } finally {
-    restore();
-  }
-});
-
-test('harness: first-token timeout triggers fallback 2; a mid-stream failure does not', async () => {
+test('harness: the first-token timeout and a pre-token failure surface as errors (no agent fallback; replay fallback upstream)', async () => {
   const hang = fakeHarness([], { hang: true });
-  const agentChunks = [{ choices: [{ delta: { content: 'From agent.' } }] }];
-  const env = { ...BASE_ENV, HARNESS_FIRST_TOKEN_TIMEOUT_MS: '60', DO_AGENT_ENDPOINT: 'https://x.agents.do-ai.run', DO_AGENT_KEY: 'ak' };
-  let s = setup(env, hang, { agentChunks });
+  const env = { ...BASE_ENV, HARNESS_FIRST_TOKEN_TIMEOUT_MS: '60' };
+  let s = setup(env, hang);
   try {
-    const out = await s.p.ask('q');
-    assert.equal(out.backend, 'agent');
-    assert.ok(s.events.some((e) => e.type === 'fallback' && /produced nothing within 60 ms/.test(e.data.reason)));
+    await assert.rejects(s.p.ask('q'), /produced nothing within 60 ms/);
+    assert.ok(!s.events.some((e) => e.type === 'fallback'), 'no fallback event: the pipeline has no second backend');
+    assert.ok(!s.fetches.some((f) => f.url.endsWith('/chat/completions')), 'no Managed Agent / direct inference call');
+    assert.equal(s.events.at(-1).type, 'job');
+    assert.equal(s.events.at(-1).status, 'error');
+    assert.equal(s.p.activeRun, null, 'active run cleared');
   } finally {
     s.restore();
   }
-  // tokens then failure: the harness already streamed, so no agent fallback (replay fallback handles it upstream)
+  // tokens then failure: same outcome
   const mid = fakeHarness(['ANSWER: partial'], { fail: true });
-  s = setup(env, mid, { agentChunks });
+  s = setup(env, mid);
   try {
     await assert.rejects(s.p.ask('q'), /Harness run failed: boom/);
     assert.ok(!s.events.some((e) => e.type === 'fallback'));
@@ -479,7 +511,7 @@ test('harness: first-token timeout triggers fallback 2; a mid-stream failure doe
   }
 });
 
-test('harness: without a Managed Agent a pre-token failure surfaces as an error (replay fallback upstream)', async () => {
+test('harness: a run that fails before the first token surfaces as an error (replay fallback upstream)', async () => {
   const h = fakeHarness([], { fail: true });
   const { p, events, restore } = setup(BASE_ENV, h);
   try {

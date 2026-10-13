@@ -62,27 +62,16 @@ services:
         type: SECRET
       - key: DO_INFERENCE_URL
         value: https://inference.do-ai.run/v1
-      # Model Access Key (control panel only). Optional when DO_AGENT_ENDPOINT is set.
+      # Model Access Key (control panel only). Only needed for DO_EMBEDDING_MODEL;
+      # answers are generated inside the harness session (HARNESS_INFERENCE_API_KEY).
       - key: DO_INFERENCE_KEY
         value: ""
         type: SECRET
-      - key: DO_INFERENCE_MODEL
-        value: llama3.3-70b-instruct
       - key: DO_EMBEDDING_MODEL
         value: ""
       - key: VECTOR_DIM
         value: "128"
-      # Managed Agent: fallback 2 (answers when the harness fails before its
-      # first token). Kept SECRET so the endpoint hostname does not leak.
-      - key: DO_AGENT_ENDPOINT
-        value: ""
-        type: SECRET
-      - key: DO_AGENT_KEY
-        value: ""
-        type: SECRET
-      # ---- v4: Harness Runtime answers questions through the MCP tools ----
-      - key: ANSWER_BACKEND
-        value: harness
+      # ---- v4: the Harness Runtime answers every question through the MCP tools ----
       # inline  -> the session manifest declares the MCP server directly (MCP_PUBLIC_URL + MCP_AUTH_TOKEN)
       # gateway -> the session selects the tools from the Action Gateway catalog (HARNESS_GATEWAY_TOOLS)
       # none    -> no tools; the app retrieves and passes context in the prompt

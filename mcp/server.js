@@ -72,14 +72,14 @@ function defaultDeps(env, cfg) {
 
 /** Build the MCP server with both tools bound to `deps`. One instance per request (stateless). */
 export function buildMcpServer(cfg, deps, emit) {
-  const server = new McpServer({ name: SERVER_NAME, version: '4.0.0' }, { instructions: 'Tools over the anatomy demo knowledge base. Call search_facts first with the user question; call get_document only when a hit needs its full source object.' });
+  const server = new McpServer({ name: SERVER_NAME, version: '4.0.0' }, { instructions: 'Tools over the anatomy demo facts stored in pgvector and Spaces. Call search_facts first with the user question; call get_document only when a hit needs its full source object.' });
 
   server.registerTool(
     'search_facts',
     {
       title: 'Search facts (pgvector)',
       description:
-        'Semantic search over the knowledge base of submitted facts stored in Managed Postgres with pgvector. ' +
+        'Semantic search over the submitted facts stored in Managed Postgres with pgvector. ' +
         'Pass the user question as `query`; returns the most similar fact chunks as JSON [{id, object_key, chunk, score}], best first. ' +
         'An empty list means nothing relevant is known yet. Always call this before answering.',
       inputSchema: { query: z.string().min(1).max(2000).describe('The question or search text'), k: z.number().int().min(1).max(5).optional().describe('Max results, 1-5 (default 3)') },

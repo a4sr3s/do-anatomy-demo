@@ -34,10 +34,10 @@ export class MockPipeline {
     const key = `facts/${Date.now()}-${jobId.slice(0, 8)}.txt`;
     ev.stage('spaces', 'start', `PUT ${key} to Spaces bucket`, { key, bytes: Buffer.byteLength(text) });
     await this.wait(600);
-    ev.stage('spaces', 'done', 'Object stored; event trigger fired', { key });
+    ev.stage('spaces', 'done', 'Object stored in Spaces', { key });
 
-    // 2. Functions: chunk + embed
-    ev.stage('functions', 'start', 'Function invoked: chunk + embed', { key });
+    // 2. chunk + embed in the App Platform app (stage `functions` is the wire name)
+    ev.stage('functions', 'start', 'App Platform: chunk + embed in-process', { key });
     await this.wait(400);
     const chunks = chunkText(text);
     ev.stage('functions', 'progress', `Chunked into ${chunks.length} chunk${chunks.length === 1 ? '' : 's'}`, {
@@ -183,10 +183,10 @@ export class MockPipeline {
 
   compose(question, hits) {
     if (!hits.length) {
-      return "I couldn't find anything relevant in the knowledge base yet. Submit a fact first, then ask me about it.";
+      return "I couldn't find anything relevant in the stored facts yet. Submit a fact first, then ask me about it.";
     }
     const [top, ...rest] = hits;
-    let text = `Based on the knowledge base: ${top.chunk}`;
+    let text = `Based on the stored facts: ${top.chunk}`;
     if (rest.length) text += ` Related: ${rest.map((r) => r.chunk).join(' ')}`;
     return text;
   }

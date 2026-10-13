@@ -9,10 +9,12 @@ import { tokenEquals } from './auth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
-// v4: `agent` is the Harness Runtime, `gateway` the Action Gateway / MCP hop it uses to reach vectordb + spaces
+// wire stage names (the frontend maps them to display labels): `functions` is chunk + embed inside this
+// App Platform app, `kb` the app-side retrieval of the context-in-prompt fallback, `agent` the Harness
+// Runtime, `gateway` the Action Gateway / MCP hop it uses to reach vectordb + spaces
 const STAGE_ORDER = ['spaces', 'functions', 'vectordb', 'kb', 'agent', 'gateway', 'inference'];
 const isNetworkError = (err) =>
-  /ECONN|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|fetch failed|timeout|network|5\d\d|credentials missing|DATABASE_URL missing|_KEY missing/i.test(
+  /ECONN|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|fetch failed|timeout|network|5\d\d|credentials missing|DATABASE_URL missing|_KEY missing|_TOKEN missing/i.test(
     `${err?.code || ''} ${err?.message || ''}`
   );
 

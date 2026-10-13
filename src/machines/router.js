@@ -1,10 +1,12 @@
-/** KNOWLEDGE BASE / MANAGED AGENT: a round dial with a needle that points at retrieved chambers, a knob, and a prompt tray. */
+/** HARNESS RUNTIME: a round retrieval dial whose needle points at retrieved chambers, an embedding knob (context-in-prompt fallback), and a context tray. */
 import * as THREE from 'three';
 import { Solid, rrBox, box, cyl, ring, tagPart, lineSegments, lineLoop, circlePoints, radialTicks, follow, Burst } from '../kit.js';
 
 export function buildRouter(parts) {
   const g = new THREE.Group();
-  const center = new THREE.Vector3(-1, 1.1, 4.5);
+  // moved left (v5) so the Action Gateway in front of pgvector has room for its own board label
+  // (base footprint x -6.1..-1.5, z 2.6..6.4)
+  const center = new THREE.Vector3(-3.8, 1.1, 4.5);
   g.position.set(center.x, 0, center.z);
 
   const basePart = parts['router.base'];
@@ -13,7 +15,7 @@ export function buildRouter(parts) {
   basePart.solids.push(base);
   g.add(lineSegments([[-2.0, 0.51, 1.5], [-0.4, 0.51, 1.5], [-2.0, 0.51, 1.65], [-1.0, 0.51, 1.65]], 0x3e444c));
 
-  // dial housing (KB)
+  // dial housing (retrieval dial)
   const dialPart = parts['router.dial'];
   const dx = -0.95;
   const dz = -0.1;

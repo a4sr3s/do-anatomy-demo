@@ -10,6 +10,7 @@ import { Switch } from '@/components/ui/switch';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { useStore, type LogEntry } from '@/anatomy/store';
 import { fmtTimeNY } from '@/anatomy/format';
+import { stageLabel } from '@/components.js';
 
 const SOURCES = ['spaces', 'functions', 'vectordb', 'kb', 'agent', 'gateway', 'tool', 'inference', 'job', 'system'] as const;
 type Source = (typeof SOURCES)[number];
@@ -34,7 +35,7 @@ const STATUS_CLASS: Record<string, string> = {
   error: 'text-destructive',
 };
 
-/** Rolling SSE event log: newest first, America/New_York timestamps, per-stage latency. */
+/** Rolling SSE event log: newest first, America/New_York timestamps, per-stage latency. Wire stage names are shown through `stageLabel`. */
 export function LogsSection() {
   const logs = useStore((s) => s.logs);
   const total = useStore((s) => s.logTotal);
@@ -47,7 +48,7 @@ export function LogsSection() {
     return logs.filter((l) => {
       if (!showProgress && l.status === 'progress') return false;
       if (sources.length && !sources.includes(sourceOf(l.who))) return false;
-      if (q && !`${l.who} ${l.status} ${l.what}`.toLowerCase().includes(q)) return false;
+      if (q && !`${l.who} ${stageLabel(l.who)} ${l.status} ${l.what}`.toLowerCase().includes(q)) return false;
       return true;
     });
   }, [logs, query, sources, showProgress]);
@@ -69,8 +70,8 @@ export function LogsSection() {
         </InputGroup>
         <ToggleGroup type="multiple" variant="outline" size="sm" spacing={0} value={sources} onValueChange={setSources} className="flex-wrap" aria-label="Sources">
           {SOURCES.map((s) => (
-            <ToggleGroupItem key={s} value={s} className={cn('text-xs', WHO_CLASS[s])}>
-              {s}
+            <ToggleGroupItem key={s} value={s} className={cn('text-xs', WHO_CLASS[s])} title={s === stageLabel(s) ? undefined : `stage "${s}"`}>
+              {stageLabel(s)}
             </ToggleGroupItem>
           ))}
         </ToggleGroup>
@@ -118,7 +119,7 @@ function LogRow({ entry: l }: { entry: LogEntry }) {
         {l.replay ? ' ↻' : ''}
       </span>
       <span className="truncate">
-        <span className={cn('font-medium', WHO_CLASS[l.who] ?? 'text-muted-foreground', l.who === 'tool' && 'uppercase tracking-wider')}>{l.who}</span>{' '}
+        <span className={cn('font-medium', WHO_CLASS[l.who] ?? 'text-muted-foreground', l.who === 'tool' && 'uppercase tracking-wider')}>{stageLabel(l.who)}</span>{' '}
         <span className={STATUS_CLASS[l.status]}>{l.status}</span>{' '}
         <span className={cn(l.status === 'progress' ? 'text-muted-foreground' : 'text-foreground', l.who === 'tool' && 'font-mono text-stage-gateway')}>{l.what}</span>
       </span>

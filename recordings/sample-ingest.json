@@ -37,7 +37,7 @@
       "jobId": "badbf434-a81e-4600-8dd9-c559525c8b6d",
       "stage": "spaces",
       "status": "done",
-      "detail": "Object stored; event trigger fired",
+      "detail": "Object stored in Spaces",
       "data": {
         "key": "facts/1791837831668-badbf434.txt"
       },
@@ -51,7 +51,7 @@
       "jobId": "badbf434-a81e-4600-8dd9-c559525c8b6d",
       "stage": "functions",
       "status": "start",
-      "detail": "Function invoked: chunk + embed",
+      "detail": "App Platform: chunk + embed in-process",
       "data": {
         "key": "facts/1791837831668-badbf434.txt"
       },

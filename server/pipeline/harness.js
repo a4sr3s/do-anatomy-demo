@@ -317,7 +317,7 @@ export class HarnessClient {
     const ac = new AbortController();
     const fail = (message, extra = {}) => Object.assign(new Error(message), extra);
     const timer = setTimeout(() => ac.abort(fail(`Harness run timed out after ${this.cfg.timeoutMs} ms`, { timeout: true })), this.cfg.timeoutMs);
-    // fallback 2 trigger: nothing at all (no token, no tool activity) within the first-token window
+    // liveness guard: nothing at all (no token, no tool activity) within the first-token window fails the run (server/app.js may then replay a recording)
     let firstTimer = setTimeout(() => ac.abort(fail(`Harness produced nothing within ${this.cfg.firstTokenTimeoutMs} ms`, { timeout: true, beforeFirstToken: true })), this.cfg.firstTokenTimeoutMs);
     const alive = () => {
       if (firstTimer) { clearTimeout(firstTimer); firstTimer = null; }
