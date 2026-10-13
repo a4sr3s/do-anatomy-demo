@@ -4,6 +4,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { createMcpApp, tokenMatches, MAX_DOC_BYTES } from '../mcp/server.js';
 import { embedLocal } from '../server/pipeline/embedding.js';
+import { NO_MATCHING_FACTS, DONT_KNOW_TEXT } from '../server/pipeline/retrieval.js';
 
 const FACT = 'Acme Robotics runs 40 GPU droplets in SFO3.';
 
@@ -76,7 +77,9 @@ test('mcp: tools/list exposes search_facts and get_document with usable descript
     assert.deepEqual(tools.map((t) => t.name).sort(), ['get_document', 'search_facts']);
     const search = tools.find((t) => t.name === 'search_facts');
     assert.match(search.description, /pgvector/);
-    assert.match(search.description, /Always call this before answering/);
+    assert.match(search.description, /Always call this exactly once before answering/);
+    assert.match(search.description, /NO_MATCHING_FACTS: answer exactly "I do not know that yet\."/);
+    assert.match(search.description, /no further tool calls/);
     assert.deepEqual(Object.keys(search.inputSchema.properties).sort(), ['k', 'query']);
     assert.deepEqual(search.inputSchema.required, ['query']);
     assert.equal(search.inputSchema.properties.k.maximum, 5);
@@ -123,6 +126,37 @@ test('mcp: search_facts embeds like ingest, runs the cosine query, filters low s
     assert.equal(typeof d.body.ms, 'number');
     assert.equal(d.body.summary, '1 hit');
     assert.deepEqual(d.body.hits, [{ id: 7, score: 0.91, chunk: FACT, object_key: 'facts/1.txt' }]);
+  } finally {
+    await c.close();
+    close();
+  }
+});
+
+test('mcp: search_facts with nothing above the relevance floor returns the plain NO_MATCHING_FACTS line (not "[]")', async () => {
+  assert.equal(NO_MATCHING_FACTS, 'NO_MATCHING_FACTS: answer exactly "I do not know that yet."');
+  assert.equal(DONT_KNOW_TEXT, 'I do not know that yet.');
+  const { base, posted, close } = start({ rows: [{ id: 8, chunk: 'noise', object_key: 'facts/2.txt', score: 0.03 }] });
+  const c = await client(base);
+  try {
+    const r = await c.callTool({ name: 'search_facts', arguments: { query: 'What colour is the sky?' } });
+    assert.equal(r.isError, undefined, 'not an error: the model must act on it, not retry');
+    assert.deepEqual(r.content, [{ type: 'text', text: NO_MATCHING_FACTS }]);
+    assert.deepEqual(r.structuredContent, { hits: [] });
+    // an empty table behaves the same
+    const empty = start({ rows: [] });
+    const c2 = await client(empty.base);
+    try {
+      const r2 = await c2.callTool({ name: 'search_facts', arguments: { query: 'anything', k: 1 } });
+      assert.equal(r2.content[0].text, NO_MATCHING_FACTS);
+    } finally {
+      await c2.close();
+      empty.close();
+    }
+    // the tool events are unchanged: start + done, 0 hits
+    await settle();
+    assert.deepEqual(posted.map((p) => p.body.phase), ['start', 'done']);
+    assert.equal(posted[1].body.summary, '0 hits');
+    assert.deepEqual(posted[1].body.hits, []);
   } finally {
     await c.close();
     close();

@@ -24,6 +24,9 @@
  *        plus tool-call events whose exact names are forwarded as-is)
  */
 import { createHash } from 'node:crypto';
+import { DONT_KNOW_TEXT } from './retrieval.js';
+
+export { DONT_KNOW_TEXT };
 
 const API = 'https://api.digitalocean.com/v2/agents/sessions';
 const MARKER = 'ANSWER:';
@@ -142,12 +145,12 @@ export function buildManifest(cfg, name = cfg.sessionName) {
   return lines.join('\n');
 }
 
-/** Context-in-prompt (fallback 1 / tools mode none). */
+/** Context-in-prompt (fallback 1 / tools mode none / the single run after the app-side guard search). */
 export function buildPrompt(question, context) {
   return [
     'You are the answering step of a retrieval pipeline. Ignore all earlier turns in this conversation and do not use any tools.',
     `${STALE_TURNS} The context below is the only source of truth for this turn.`,
-    'Answer the question using ONLY the context below. If the context is empty or does not contain the answer, say that you do not know that yet.',
+    `Answer the question using ONLY the context below. If the context is empty or does not contain the answer, reply exactly "${MARKER} ${DONT_KNOW_TEXT}" (say that you do not know that yet).`,
     `Reply with a single line that starts with "${MARKER}" followed by a concise answer (one or two sentences).`,
     '',
     'Context:',
@@ -157,23 +160,29 @@ export function buildPrompt(question, context) {
   ].join('\n');
 }
 
-/** Tool path (v4): the agent retrieves through the MCP tools itself. */
+/**
+ * Tool path (v4): the agent retrieves through the MCP tools itself. Exactly one
+ * search_facts call per turn; a NO_MATCHING_FACTS result ends the turn at once
+ * (the MCP server returns it when nothing clears the relevance floor) so
+ * questions about unknown facts do not pay for a second search or more reasoning.
+ */
 export function buildToolPrompt(question, { gateway = false } = {}) {
   const search = gateway ? 'the search_facts tool' : `${MCP_SERVER_NAME}/search_facts`;
   const doc = gateway ? 'get_document' : `${MCP_SERVER_NAME}/get_document`;
   return [
     'You are the answering step of a retrieval pipeline. Ignore all earlier turns in this conversation.',
     `${STALE_TURNS} Never answer from memory or from an earlier turn, even if the same question was asked before.`,
-    `You MUST call ${search} in this turn, with the question below as the query (k=3), before answering. Call ${doc} only if a hit is truncated and you need its full text.`,
+    `You MUST call ${search} in this turn, exactly once, with the question below as the query (k=3), before answering. Never call it a second time, with any query. Call ${doc} only if a hit is truncated and you need its full text.`,
     'Do not use any other tool, do not run commands, do not read or write files, do not browse.',
-    "Answer ONLY from this turn's tool results. If this turn's results are empty or do not contain the answer, say that you do not know that yet.",
-    `After the tool calls, reply with a single final line that starts with "${MARKER}" followed by a concise answer (one or two sentences).`,
+    `If the search result starts with "NO_MATCHING_FACTS", immediately reply with the single line "${MARKER} ${DONT_KNOW_TEXT}" and nothing else: no further tool calls, no reasoning, no rephrased search.`,
+    `Otherwise answer ONLY from this turn's tool results. If they do not contain the answer, reply with that same line: "${MARKER} ${DONT_KNOW_TEXT}".`,
+    `After the tool call, reply with a single final line that starts with "${MARKER}" followed by a concise answer (one or two sentences).`,
     '',
     `Question: ${question}`,
   ].join('\n');
 }
 
-/** Heuristic for a "no answer" reply, used to decide whether to retry with context in the prompt. */
+/** Heuristic for a "no answer" reply, used to decide whether a run whose tool call failed is retried with context in the prompt. */
 export function isDontKnow(text) {
   return !String(text || '').trim() || /\b(don'?t|do not|does not|doesn'?t|did not|not) (know|have|find|contain)|no (relevant )?(information|facts?|results?|context)|couldn'?t find|cannot find|unable to find|nothing relevant|not (yet )?(available|known)/i.test(text);
 }

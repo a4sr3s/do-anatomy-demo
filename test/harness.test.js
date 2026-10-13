@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventBus } from '../server/bus.js';
 import { RealPipeline } from '../server/pipeline/real.js';
-import { MarkerFilter, HarnessClient, buildManifest, buildPrompt, buildToolPrompt, harnessConfig, manifestHash, isDontKnow, normalizeToolName, toolTarget } from '../server/pipeline/harness.js';
+import { MarkerFilter, HarnessClient, buildManifest, buildPrompt, buildToolPrompt, harnessConfig, manifestHash, isDontKnow, normalizeToolName, toolTarget, DONT_KNOW_TEXT } from '../server/pipeline/harness.js';
 
 const FACT = 'Acme Robotics runs 40 GPU droplets in SFO3.';
 const sseFrame = (e) => `id: x\nevent: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`;
@@ -195,6 +195,14 @@ test('harness: prompts', () => {
   }
   assert.match(tp, /Never answer from memory or from an earlier turn/);
   assert.match(buildPrompt('q', ''), /context below is the only source of truth for this turn/);
+  // exactly one search per turn; NO_MATCHING_FACTS ends the turn at once with the fixed answer
+  assert.equal(DONT_KNOW_TEXT, 'I do not know that yet.');
+  for (const prompt of [tp, buildToolPrompt('q', { gateway: true })]) {
+    assert.match(prompt, /search_facts[^\n]*exactly once/);
+    assert.match(prompt, /Never call it a second time/);
+    assert.match(prompt, /If the search result starts with "NO_MATCHING_FACTS", immediately reply with the single line "ANSWER: I do not know that yet\." and nothing else: no further tool calls, no reasoning, no rephrased search\./);
+  }
+  assert.match(buildPrompt('q', ''), /reply exactly "ANSWER: I do not know that yet\."/);
   assert.ok(isDontKnow("I don't know that yet."));
   assert.ok(isDontKnow('No relevant facts were found.'));
   assert.ok(isDontKnow(''));
@@ -423,53 +431,171 @@ test('harness: "don\'t know" with a failed tool call (no usable result) is retri
   }
 });
 
-test('harness: an answer produced with zero tool calls is discarded unseen and re-asked with context (stale-history guard)', async () => {
-  // The warm session remembers earlier turns: after a fact is deleted the agent can answer confidently
-  // from history without calling search_facts. That answer must never reach the audience.
-  const prompts = [];
+/** Fake harness whose first run answers from history without any tool call; a second run (if any) answers from the context prompt. */
+function skipsToolHarness(prompts, secondAnswer = 'ANSWER: 40 droplets.') {
   let n = 0;
   const h = fakeHarness([], { onInput: (t) => prompts.push(t) });
   const base = h.impl;
   h.impl = async (url, init) => {
     if (String(url).endsWith('/events')) {
       n++;
-      const text = n === 1 ? 'Recalling... ANSWER: Acme runs 40 GPU droplets in SFO3.' : "ANSWER: I don't know that yet.";
+      const text = n === 1 ? 'Recalling... ANSWER: Acme runs 40 GPU droplets in SFO3.' : secondAnswer;
       const evs = [{ type: 'run.started', run_id: 'run-1', data: {} }, { type: 'run.token_delta', run_id: 'run-1', data: { text, is_reasoning: false } }, { type: 'run.completed', run_id: 'run-1', data: {} }];
       return new Response(evs.map(sseFrame).join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } });
     }
     return base(url, init);
   };
-  const { p, events, restore } = setup(BASE_ENV, h);
+  return h;
+}
+
+test('harness: guard, no tool call and no matching facts -> the app runs the search itself and answers "I do not know that yet." with no second model run', async () => {
+  // The warm session remembers earlier turns: after a fact is deleted the agent can answer confidently
+  // from history without calling search_facts. That answer must never reach the audience, and the
+  // app must not pay for a second model run when nothing is stored.
+  const prompts = [];
+  const { p, events, restore } = setup(BASE_ENV, skipsToolHarness(prompts));
+  const queries = [];
+  p.db = async () => ({ query: async (sql, params) => { queries.push({ sql, params }); return { rows: [] }; } });
   try {
     const out = await p.ask('How many droplets does Acme run?');
-    assert.equal(out.answer, "I don't know that yet.", 'the final answer comes from the context run, not from history');
+    assert.equal(out.answer, 'I do not know that yet.');
+    assert.equal(out.fallback, 'guard');
+    assert.equal(out.reason, 'no tool call, no matching facts');
+    assert.equal(out.backend, 'harness');
+    assert.equal(out.timing.toolCalls, 0, 'the model made no tool call; the app-side search is not counted as one');
+    assert.deepEqual(out.sources, []);
+    assert.equal(prompts.length, 1, 'exactly one model run: no retry with context in the prompt');
+    assert.match(prompts[0], /MUST call .*search_facts/);
+    assert.equal(queries.length, 1, 'the app ran the pgvector search once');
+    assert.match(queries[0].sql, /ORDER BY embedding <=> \$1::vector LIMIT 3/);
+    assert.equal(tokensOf(events), 'I do not know that yet.', 'the ungrounded answer was never streamed; the fixed answer was');
+    assert.ok(!events.some((e) => e.type === 'stage' && e.data?.token !== undefined && /40 GPU/.test(e.data.token)));
+    const discard = events.find((e) => e.stage === 'agent' && e.status === 'progress' && e.data.discarded);
+    assert.ok(discard, 'a stage event explains the discard');
+    assert.match(discard.detail, /without calling any tool: ungrounded answer discarded unseen \(1 held token\); the app runs search_facts itself/);
+    assert.equal(discard.data.guard, 'search');
+    assert.equal(discard.data.reason, 'no tool call');
+    assert.equal(discard.data.streamed, 0);
+    // the same scene events as an MCP-reported search_facts call, marked source `app`
+    assert.deepEqual(starts(events), ['agent', 'inference', 'gateway', 'vectordb'], 'no kb/app-side retrieval stage: the search animates through the gateway');
+    const tool = events.filter((e) => e.type === 'tool');
+    assert.deepEqual(tool.map((e) => [e.data.phase, e.data.source, e.data.tool, e.data.target]), [['start', 'app', 'search_facts', 'pgvector'], ['done', 'app', 'search_facts', 'pgvector']]);
+    assert.deepEqual(tool[0].data.args, { query: 'How many droplets does Acme run?', k: 3 });
+    assert.equal(tool[1].data.hits, 0);
+    assert.equal(tool[1].data.summary, '0 hits');
+    assert.equal(typeof tool[1].data.ms, 'number');
+    assert.ok(tool.every((e) => e.jobId === out.jobId && e.flow === 'query'));
+    const gw = events.filter((e) => e.stage === 'gateway');
+    assert.deepEqual(gw.map((e) => e.status), ['start', 'done']);
+    assert.match(gw[0].detail, /^TOOL search_facts\(query="How many droplets does Acme run\?", k=3\) → pgvector · run by the app \(harness skipped the tool\)$/);
+    assert.match(gw[1].detail, /TOOL search_facts\(query="How many droplets does Acme run\?", k=3\) → pgvector · 0 hits · \d+ ms/);
+    assert.equal(gw[1].data.op, 'tool');
+    assert.equal(gw[1].data.source, 'app');
+    const vdb = events.filter((e) => e.stage === 'vectordb');
+    assert.deepEqual(vdb.map((e) => e.status), ['start', 'done']);
+    assert.equal(vdb[0].data.op, 'tool');
+    assert.deepEqual(vdb[1].data.hits, []);
+    assert.equal(vdb[1].data.count, 1);
+    const noMatch = events.find((e) => e.stage === 'agent' && e.status === 'progress' && e.data.fallback === 'guard');
+    assert.match(noMatch.detail, /No matching facts: answering "I do not know that yet\." without a second model run/);
+    const infDone = events.find((e) => e.stage === 'inference' && e.status === 'done');
+    assert.match(infDone.detail, /without a second model run/);
+    assert.equal(infDone.data.tokens, 1);
+    const agentDone = events.find((e) => e.stage === 'agent' && e.status === 'done');
+    assert.equal(agentDone.data.fallback, 'guard');
+    assert.equal(agentDone.data.toolCalls, 0);
+    const job = events.at(-1);
+    assert.equal(job.type, 'job');
+    assert.equal(job.status, 'done');
+    assert.equal(job.data.fallback, 'guard');
+    assert.equal(job.data.reason, 'no tool call, no matching facts');
+    assert.equal(events.find((e) => e.type === 'answer').data.text, 'I do not know that yet.');
+  } finally {
+    restore();
+  }
+});
+
+test('harness: guard, no tool call but matching facts -> app-side search, then exactly one model run with the context in the prompt', async () => {
+  const prompts = [];
+  const { p, events, restore } = setup(BASE_ENV, skipsToolHarness(prompts));
+  const queries = [];
+  const db = await p.db();
+  p.db = async () => ({ query: async (sql, params) => { queries.push({ sql, params }); return db.query(sql, params); } });
+  try {
+    const out = await p.ask('How many droplets does Acme run?');
+    assert.equal(out.answer, '40 droplets.', 'the final answer comes from the context run, not from history');
     assert.equal(out.fallback, 'context');
     assert.equal(out.reason, 'no tool call');
     assert.equal(out.backend, 'harness');
     assert.equal(out.timing.toolCalls, 0);
-    assert.deepEqual(out.sources.map((s) => s.id), [7], 'sources are the app-side retrieval of the context run');
-    assert.equal(prompts.length, 2);
+    assert.deepEqual(out.sources.map((s) => [s.id, s.origin]), [[7, 'search_facts']], 'sources are the hits of the app-side search');
+    assert.equal(prompts.length, 2, 'one single fallback run');
     assert.match(prompts[0], /MUST call .*search_facts/);
-    assert.match(prompts[1], /Context:\n\[1\] Acme Robotics/);
-    assert.equal(tokensOf(events), "I don't know that yet.", 'the ungrounded answer was never streamed');
-    assert.ok(!events.some((e) => e.type === 'stage' && e.data?.token !== undefined && /40 GPU/.test(e.data.token)));
-    const discard = events.find((e) => e.stage === 'agent' && e.status === 'progress' && e.data.discarded);
-    assert.ok(discard, 'a stage event explains the discard');
-    assert.match(discard.detail, /without calling any tool: ungrounded answer discarded unseen \(1 held token\); re-asking with context passed in prompt/);
-    assert.equal(discard.data.fallback, 'context');
-    assert.equal(discard.data.reason, 'no tool call');
-    assert.equal(discard.data.streamed, 0);
-    assert.deepEqual(starts(events), ['agent', 'inference', 'kb', 'vectordb', 'inference']);
+    assert.match(prompts[1], /Context:\n\[1\] Acme Robotics runs 40 GPU droplets/);
+    assert.equal(queries.length, 1, 'the app searched once; the context run reuses those hits (no second retrieval)');
+    assert.equal(tokensOf(events), '40 droplets.', 'the ungrounded answer was never streamed');
+    assert.deepEqual(starts(events), ['agent', 'inference', 'gateway', 'vectordb', 'inference']);
+    const tool = events.filter((e) => e.type === 'tool');
+    assert.deepEqual(tool.map((e) => [e.data.phase, e.data.source]), [['start', 'app'], ['done', 'app']]);
+    assert.equal(tool[1].data.hits, 1);
+    assert.deepEqual(events.find((e) => e.stage === 'vectordb' && e.status === 'done').data.hits, [{ id: 7, score: 0.9 }]);
+    const next = events.find((e) => e.stage === 'agent' && e.status === 'progress' && e.data.fallback === 'context');
+    assert.match(next.detail, /1 matching chunk: one model run with the context passed in prompt/);
+    assert.equal(next.data.reason, 'no tool call');
+    assert.ok(!events.some((e) => e.stage === 'kb'), 'no kb stage: the guard search already animated through the gateway');
     const agentDone = events.find((e) => e.stage === 'agent' && e.status === 'done');
     assert.equal(agentDone.data.fallback, 'context');
     assert.equal(agentDone.data.reason, 'no tool call');
     const job = events.at(-1);
     assert.equal(job.type, 'job');
-    assert.equal(job.status, 'done');
     assert.equal(job.data.fallback, 'context');
     assert.equal(job.data.reason, 'no tool call');
-    const ans = events.find((e) => e.type === 'answer');
-    assert.equal(ans.data.text, "I don't know that yet.");
+  } finally {
+    restore();
+  }
+});
+
+test('harness: guard search failure (database down) fails the job with the error reported as a tool error', async () => {
+  const prompts = [];
+  const { p, events, restore } = setup(BASE_ENV, skipsToolHarness(prompts));
+  p.db = async () => { throw new Error('pg down'); };
+  try {
+    await assert.rejects(p.ask('q'), /pg down/);
+    assert.equal(prompts.length, 1, 'no retry with context in the prompt');
+    const tool = events.filter((e) => e.type === 'tool');
+    assert.deepEqual(tool.map((e) => [e.data.phase, e.data.source]), [['start', 'app'], ['error', 'app']]);
+    assert.equal(tool[1].data.error, 'pg down');
+    assert.ok(events.some((e) => e.stage === 'gateway' && e.status === 'error' && /pg down/.test(e.detail)));
+    assert.equal(events.at(-1).type, 'job');
+    assert.equal(events.at(-1).status, 'error');
+  } finally {
+    restore();
+  }
+});
+
+test('harness: NO_MATCHING_FACTS tool result + "I do not know that yet." answer is final: no retry of any kind', async () => {
+  let pipeline;
+  const prompts = [];
+  const h = fakeHarness(['ANSWER: I do not know that yet.'], {
+    onInput: (text) => {
+      prompts.push(text);
+      pipeline.handleToolEvent({ phase: 'start', callId: 'c1', tool: 'search_facts', args: { query: 'What colour is the sky?', k: 3 }, target: 'pgvector' });
+      pipeline.handleToolEvent({ phase: 'done', callId: 'c1', tool: 'search_facts', args: { query: 'What colour is the sky?', k: 3 }, target: 'pgvector', ms: 40, summary: '0 hits', hits: [] });
+    },
+  });
+  const { p, events, restore } = setup(BASE_ENV, h);
+  pipeline = p;
+  try {
+    const out = await p.ask('What colour is the sky?');
+    assert.equal(out.answer, 'I do not know that yet.');
+    assert.equal(out.fallback, null);
+    assert.equal(out.reason, null);
+    assert.equal(out.timing.toolCalls, 1);
+    assert.deepEqual(out.sources, []);
+    assert.equal(prompts.length, 1);
+    assert.deepEqual(starts(events), ['agent', 'inference', 'gateway', 'vectordb']);
+    assert.equal(tokensOf(events), 'I do not know that yet.');
+    assert.ok(!events.some((e) => e.stage === 'kb'));
   } finally {
     restore();
   }

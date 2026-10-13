@@ -1,13 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { chunkText } from './embedding.js';
-import { HarnessClient, harnessConfig, buildPrompt, buildToolPrompt, isDontKnow, normalizeToolName, toolTarget } from './harness.js';
+import { HarnessClient, harnessConfig, buildPrompt, buildToolPrompt, isDontKnow, normalizeToolName, toolTarget, DONT_KNOW_TEXT } from './harness.js';
 import { pgPoolConfig, embeddingConfig, embedTexts, toVector, cosineSearch } from './retrieval.js';
 import { factId, factKey, notFound } from './facts.js';
 
 export { pgPoolConfig };
 
 const MCP_HEALTH_TIMEOUT_MS = 1500;
-const DONT_KNOW_TEXT = 'I do not know that yet.';
+const SEARCH_K = 3;
 
 /** Short, log-safe rendering of tool arguments: search_facts(query=…) */
 export function fmtArgs(args = {}) {
@@ -31,14 +31,21 @@ export function fmtArgs(args = {}) {
  *   The MCP server reports each tool call to POST /api/internal/tool-event,
  *   which lands in handleToolEvent() below and is attributed to the active
  *   question job so the scene can animate it.
+ *   search_facts answers NO_MATCHING_FACTS when nothing clears the relevance
+ *   floor and the prompt makes the agent reply "I do not know that yet." at once.
  * Context-in-prompt fallback (still inside the harness): tool path unavailable
- *   (MCP health check fails, HARNESS_TOOLS_MODE=none, the agent answered without
- *   calling any tool, or it answered "don't know" without any usable tool
- *   result): the app retrieves itself (stages kb -> vectordb) and passes the
- *   context in the prompt. The session keeps its history, so an answer without a
- *   tool call is treated as ungrounded (it may describe a fact deleted since) and
- *   is never shown: on the tool path answer tokens are held back until a tool
- *   call has been observed.
+ *   (MCP health check fails, HARNESS_TOOLS_MODE=none, or the agent answered
+ *   "don't know" after a failed tool call): the app retrieves itself (stages
+ *   kb -> vectordb) and passes the context in the prompt.
+ * Guard (no tool call): the session keeps its history, so an answer produced
+ *   without any tool call is ungrounded (it may describe a fact deleted since)
+ *   and is never shown: on the tool path answer tokens are held back until a tool
+ *   call has been observed. If the run ends without one, the app runs search_facts
+ *   itself, reporting it through the same tool / gateway / vectordb events the
+ *   MCP server would send (source 'app') so the scene animates the search. With
+ *   no hits the answer is "I do not know that yet." instantly (no second model
+ *   run, `fallback: "guard"`); with hits there is exactly one more model run with
+ *   the context in the prompt (`fallback: "context"`, `reason: "no tool call"`).
  * Anything else surfaces as an error; server/app.js then replays a recording
  *   (REPLAY_FALLBACK). There is no other model backend.
  */
@@ -399,11 +406,11 @@ export class RealPipeline {
       onToolEvent: (t) => { run.harnessToolEvents++; ev.tool(this.harnessToolEvent(run, t)); },
       onToken,
     });
-    const contextRun = async (detail, why, because) => {
-      // context-in-prompt fallback: the app retrieves itself and passes the context in the prompt
+    const contextRun = async (detail, why, because, found = null) => {
+      // context-in-prompt fallback: the app retrieves itself (unless the guard search already did) and passes the context in the prompt
       gate.enabled = false;
       gate.held.length = 0;
-      sources = await this.retrieve(question, ev);
+      sources = found || (await this.retrieve(question, ev));
       const context = sources.map((s, i) => `[${i + 1}] ${s.chunk}`).join('\n');
       ev.stage('inference', 'start', `Serverless inference via harness: ${h.model}`, { model: h.model, via: 'harness', toolsMode: 'none' });
       harnessOut = await this.harness.ask(buildPrompt(question, context), hooks(detail));
@@ -428,14 +435,26 @@ export class RealPipeline {
         sources = run.hits.slice();
         if (!toolSeen()) {
           // GUARD: no tool call at all -> the answer is ungrounded (likely recalled from an earlier turn,
-          // possibly about a fact that has since been deleted). Discard it and re-ask with fresh context.
+          // possibly about a fact that has since been deleted). Discard it; the app runs the search itself.
           const held = gate.held.length;
           gate.held.length = 0;
+          gate.enabled = false;
           const what = streamed > 0 ? 'the ungrounded answer already streamed was discarded; the final answer replaces it' : `ungrounded answer discarded unseen (${held} held token${held === 1 ? '' : 's'})`;
-          ev.stage('agent', 'progress', `Harness answered without calling any tool: ${what}; re-asking with context passed in prompt`, { fallback: 'context', reason: 'no tool call', discarded: true, streamed, held, via: 'harness' });
+          ev.stage('agent', 'progress', `Harness answered without calling any tool: ${what}; the app runs search_facts itself`, { guard: 'search', reason: 'no tool call', discarded: true, streamed, held, via: 'harness' });
           answer = '';
-          sources = [];
-          await contextRun('context (no tool call)', 'context', 'no tool call');
+          const found = await this.guardSearch(question, run);
+          if (!found.length) {
+            // nothing stored matches: the answer is known without a second model run
+            fallback = 'guard';
+            reason = 'no tool call, no matching facts';
+            sources = [];
+            ev.stage('agent', 'progress', `No matching facts: answering "${DONT_KNOW_TEXT}" without a second model run`, { fallback, reason, via: 'harness' });
+            forward(DONT_KNOW_TEXT, 0);
+            answer = DONT_KNOW_TEXT;
+          } else {
+            ev.stage('agent', 'progress', `${found.length} matching chunk${found.length === 1 ? '' : 's'}: one model run with the context passed in prompt`, { fallback: 'context', reason: 'no tool call', hits: found.length, via: 'harness' });
+            await contextRun('context (no tool call)', 'context', 'no tool call', found);
+          }
         } else {
           if (gate.held.length) flushHeld();
           gate.enabled = false;
@@ -450,7 +469,7 @@ export class RealPipeline {
         await contextRun('context in prompt', 'context', unavailable);
       }
       const t = timing();
-      ev.stage('inference', 'done', 'Completed', { model: harnessOut.model || h.model, tokens: harnessOut.tokens, via: 'harness', ...t });
+      ev.stage('inference', 'done', fallback === 'guard' ? 'Completed without a second model run (no matching facts)' : 'Completed', { model: harnessOut.model || h.model, tokens: fallback === 'guard' ? 1 : harnessOut.tokens, via: 'harness', ...t });
       ev.stage('agent', 'done', `Harness answered (first token ${t.firstTokenMs ?? '—'} ms, total ${t.totalMs} ms, ${t.toolCalls} tool call${t.toolCalls === 1 ? '' : 's'})`, { via: 'harness', ...t, runId: harnessOut.runId, backend, fallback, reason });
       if (!answer) answer = DONT_KNOW_TEXT;
       return { answer, sources, backend, timing: timing(), fallback, reason };
@@ -501,6 +520,19 @@ export class RealPipeline {
    */
   handleToolEvent(body = {}) {
     const run = this.activeRun;
+    this.reportTool(run, body, 'mcp');
+    return run ? { accepted: true, jobId: run.jobId } : { accepted: false };
+  }
+
+  /**
+   * Publish one tool-call phase (`start` / `done` / `error`) as a `tool` event plus
+   * `gateway` and target (`vectordb` / `spaces`) stage events on `run`'s job.
+   * `source` is `mcp` for calls the MCP server reported (they count as the
+   * model's tool calls) or `app` for the guard search the app ran itself after
+   * the model skipped the tool (same events, so the scene animates it the same
+   * way, but counted apart so timing.toolCalls stays honest).
+   */
+  reportTool(run, body = {}, source = 'mcp') {
     const tool = String(body.tool || 'unknown');
     const phase = ['start', 'done', 'error'].includes(body.phase) ? body.phase : 'done';
     const target = body.target === 'spaces' || body.target === 'pgvector' ? body.target : tool === 'get_document' ? 'spaces' : 'pgvector';
@@ -508,20 +540,22 @@ export class RealPipeline {
     const args = body.args && typeof body.args === 'object' ? body.args : {};
     const hits = Array.isArray(body.hits) ? body.hits : [];
     const ms = Number.isFinite(body.ms) ? body.ms : undefined;
-    const data = { tool, phase, args, summary: body.summary, ms, target, callId: body.callId, hits: hits.length, error: body.error, source: 'mcp' };
+    const data = { tool, phase, args, summary: body.summary, ms, target, callId: body.callId, hits: hits.length, error: body.error, source };
     if (!run) {
       this.bus.publish({ type: 'tool', flow: 'query', jobId: null, data });
-      return { accepted: false };
+      return data;
     }
     const { ev } = run;
+    const byApp = source === 'app';
     ev.tool(data);
-    const base = { tool, callId: body.callId, args, op: 'tool', target };
+    const base = { tool, callId: body.callId, args, op: 'tool', target, source };
     if (phase === 'start') {
-      run.toolCalls++;
-      ev.stage('gateway', 'start', `TOOL ${tool}(${fmtArgs(args)}) → ${target}`, base);
-      ev.stage(stage, 'start', `${tool} via Action Gateway`, base);
+      if (byApp) run.guardSearches = (run.guardSearches || 0) + 1;
+      else run.toolCalls++;
+      ev.stage('gateway', 'start', `TOOL ${tool}(${fmtArgs(args)}) → ${target}${byApp ? ' · run by the app (harness skipped the tool)' : ''}`, base);
+      ev.stage(stage, 'start', byApp ? `${tool} run by the app via the gateway path (harness skipped the tool)` : `${tool} via Action Gateway`, base);
     } else if (phase === 'done') {
-      run.toolDone++;
+      if (!byApp) run.toolDone++;
       for (const hit of hits) {
         const id = hit?.id ?? hit?.object_key;
         if (id == null || run.seen.has(id)) continue;
@@ -532,11 +566,36 @@ export class RealPipeline {
       ev.stage(stage, 'done', `${tool}: ${body.summary || `${hits.length} hits`}${ms != null ? ` · ${ms} ms` : ''}`, { ...base, hits: short, ms, ...(stage === 'vectordb' ? { count: this.count } : {}) });
       ev.stage('gateway', 'done', `TOOL ${tool}(${fmtArgs(args)}) → ${target} · ${body.summary || `${hits.length} hits`}${ms != null ? ` · ${ms} ms` : ''}`, { ...base, hits: short, ms });
     } else {
-      run.toolErrors++;
+      if (!byApp) run.toolErrors++;
       ev.stage(stage, 'error', `${tool} failed: ${body.error || 'unknown error'}`);
       ev.stage('gateway', 'error', `TOOL ${tool}(${fmtArgs(args)}) → ${target} failed: ${body.error || 'unknown error'}`);
     }
-    return { accepted: true, jobId: run.jobId };
+    return data;
+  }
+
+  /**
+   * GUARD search: the model skipped search_facts, so the app runs the same
+   * pgvector search itself and reports it through the same tool / gateway /
+   * vectordb events the MCP server would have sent (source `app`). Resolves the
+   * hits as sources (also collected on `run.hits`); a database error propagates
+   * (the job fails; server/app.js may then replay a recording).
+   */
+  async guardSearch(question, run) {
+    const callId = randomUUID();
+    const args = { query: question, k: SEARCH_K };
+    const call = { callId, tool: 'search_facts', args, target: 'pgvector' };
+    const t0 = Date.now();
+    this.reportTool(run, { ...call, phase: 'start' }, 'app');
+    try {
+      const [qvec] = await this.embed([question]);
+      const pool = await this.db();
+      const hits = await cosineSearch(pool, this.cfg.table, qvec, SEARCH_K);
+      this.reportTool(run, { ...call, phase: 'done', ms: Date.now() - t0, hits, summary: `${hits.length} hit${hits.length === 1 ? '' : 's'}` }, 'app');
+      return hits.map((h) => ({ id: h.id, chunk: h.chunk, score: h.score, object_key: h.object_key, origin: 'search_facts' }));
+    } catch (err) {
+      this.reportTool(run, { ...call, phase: 'error', ms: Date.now() - t0, error: err.message }, 'app');
+      throw err;
+    }
   }
 
   /** Embed the question and run a cosine top-3 search in pgvector, emitting kb/vectordb stage events (app-side retrieval). */

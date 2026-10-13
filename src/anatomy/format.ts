@@ -53,6 +53,7 @@ export function describeTool(e: any): { who: string; status: string; what: strin
     if (d.ms != null) parts.push(`${d.ms} ms`);
   } else if (d.phase === 'error') parts.push(`failed: ${d.error || 'unknown error'}`);
   if (d.source === 'harness') parts.push('(harness event)');
+  else if (d.source === 'app') parts.push('(run by the app: harness skipped the tool)');
   return { who: 'tool', status: d.phase || '', what: parts.join(' · ') };
 }
 

@@ -7,6 +7,10 @@
 import { embedLocal, LOCAL_DIM } from './embedding.js';
 
 export const SCORE_FLOOR = 0.08;
+/** The one answer for "nothing stored matches": used by the MCP tool text, both prompts and the app-side guard. */
+export const DONT_KNOW_TEXT = 'I do not know that yet.';
+/** search_facts result when no chunk clears SCORE_FLOOR: a plain marker the model can act on without reasoning. */
+export const NO_MATCHING_FACTS = `NO_MATCHING_FACTS: answer exactly "${DONT_KNOW_TEXT}"`;
 
 /**
  * Build the `pg.Pool` config for DATABASE_URL.

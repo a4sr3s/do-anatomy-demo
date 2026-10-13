@@ -5,7 +5,9 @@
  * the demo's data plane as two Model Context Protocol tools the Harness
  * Runtime agent can call (directly, or through the Action Gateway):
  *
- *   search_facts({query, k})  -> pgvector cosine search (same embedder as ingest)
+ *   search_facts({query, k})  -> pgvector cosine search (same embedder as ingest);
+ *                                with no hit above the relevance floor the result is the
+ *                                plain line NO_MATCHING_FACTS: answer exactly "I do not know that yet."
  *   get_document({key})       -> object text from Spaces (facts/ prefix only)
  *
  * Transport: Streamable HTTP, stateless (a fresh transport per request), at
@@ -22,7 +24,7 @@ import express from 'express';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { cosineSearch, createPool, embedTexts, embeddingConfig } from '../server/pipeline/retrieval.js';
+import { cosineSearch, createPool, embedTexts, embeddingConfig, DONT_KNOW_TEXT, NO_MATCHING_FACTS } from '../server/pipeline/retrieval.js';
 import { tokenEquals } from '../server/auth.js';
 
 export const SERVER_NAME = 'anatomy-data';
@@ -72,7 +74,7 @@ function defaultDeps(env, cfg) {
 
 /** Build the MCP server with both tools bound to `deps`. One instance per request (stateless). */
 export function buildMcpServer(cfg, deps, emit) {
-  const server = new McpServer({ name: SERVER_NAME, version: '4.0.0' }, { instructions: 'Tools over the anatomy demo facts stored in pgvector and Spaces. Call search_facts first with the user question; call get_document only when a hit needs its full source object.' });
+  const server = new McpServer({ name: SERVER_NAME, version: '4.0.0' }, { instructions: `Tools over the anatomy demo facts stored in pgvector and Spaces. Call search_facts exactly once with the user question; call get_document only when a hit needs its full source object. A search_facts result starting with NO_MATCHING_FACTS means nothing relevant is stored: answer exactly "${DONT_KNOW_TEXT}" and make no further tool calls.` });
 
   server.registerTool(
     'search_facts',
@@ -81,7 +83,8 @@ export function buildMcpServer(cfg, deps, emit) {
       description:
         'Semantic search over the submitted facts stored in Managed Postgres with pgvector. ' +
         'Pass the user question as `query`; returns the most similar fact chunks as JSON [{id, object_key, chunk, score}], best first. ' +
-        'An empty list means nothing relevant is known yet. Always call this before answering.',
+        `When nothing relevant is stored the result is the single line \`${NO_MATCHING_FACTS}\`: then reply with exactly that answer and stop (no further tool calls). ` +
+        'Always call this exactly once before answering.',
       inputSchema: { query: z.string().min(1).max(2000).describe('The question or search text'), k: z.number().int().min(1).max(5).optional().describe('Max results, 1-5 (default 3)') },
     },
     async ({ query, k }) => {
@@ -94,7 +97,8 @@ export function buildMcpServer(cfg, deps, emit) {
         const hits = await cosineSearch(deps, cfg.table, qvec, args.k);
         const ms = Date.now() - t0;
         emit({ phase: 'done', callId, tool: 'search_facts', args, target: 'pgvector', ms, hits: hits.map((h) => ({ id: h.id, score: h.score, chunk: h.chunk, object_key: h.object_key })), summary: `${hits.length} hit${hits.length === 1 ? '' : 's'}` });
-        return { content: [{ type: 'text', text: JSON.stringify(hits) }], structuredContent: { hits } };
+        // no hit above SCORE_FLOOR: a short plain marker instead of "[]" so the model answers at once
+        return { content: [{ type: 'text', text: hits.length ? JSON.stringify(hits) : NO_MATCHING_FACTS }], structuredContent: { hits } };
       } catch (err) {
         emit({ phase: 'error', callId, tool: 'search_facts', args, target: 'pgvector', ms: Date.now() - t0, error: err.message });
         return { isError: true, content: [{ type: 'text', text: `search_facts failed: ${err.message}` }] };
