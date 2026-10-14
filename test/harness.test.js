@@ -205,7 +205,7 @@ test('harness: config defaults (v4 session name, gateway tools, DIGITALOCEAN_ACC
   assert.equal(cfg.configId, '01a132ee-ff11-7130-9d05-838874ecec77');
   assert.equal(cfg.rotateAfter, 15);
   assert.equal(cfg.rotateIdleMs, 20 * 60 * 1000);
-  assert.equal(cfg.reasoningEffort, 'low');
+  assert.equal(cfg.reasoningEffort, 'off');
   assert.equal(harnessConfig({ HARNESS_CONFIG_ID: 'none' }).configId, '');
   assert.equal(harnessConfig({ HARNESS_CONFIG_ID: '' }).configId, '');
   assert.equal(harnessConfig({ HARNESS_CONFIG_ID: ' abc ' }).configId, 'abc');
@@ -214,8 +214,8 @@ test('harness: config defaults (v4 session name, gateway tools, DIGITALOCEAN_ACC
   assert.equal(harnessConfig({ HARNESS_ROTATE_AFTER: 'x' }).rotateAfter, 15, 'invalid -> default');
   assert.equal(harnessConfig({ HARNESS_REASONING_EFFORT: 'High' }).reasoningEffort, 'high');
   assert.equal(harnessConfig({ HARNESS_REASONING_EFFORT: 'off' }).reasoningEffort, 'off');
-  assert.equal(harnessConfig({ HARNESS_REASONING_EFFORT: 'bogus' }).reasoningEffort, 'low');
-  assert.equal(harnessConfig({ HARNESS_REASONING_EFFORT: '' }).reasoningEffort, 'low');
+  assert.equal(harnessConfig({ HARNESS_REASONING_EFFORT: 'bogus' }).reasoningEffort, 'off');
+  assert.equal(harnessConfig({ HARNESS_REASONING_EFFORT: '' }).reasoningEffort, 'off');
 });
 
 test('harness: inline manifest declares the anatomy-data MCP server, its secret slot and allow rules', () => {
@@ -1092,11 +1092,11 @@ test('harness: prompts start with "Reasoning: <effort>" when an effort is given 
   assert.match(buildPrompt('q', '', { effort: 'low' }), /reply exactly "ANSWER: I do not know that yet\."/);
 });
 
-test('harness: the pipeline sends the configured reasoning effort as the first prompt line (default low; off sends none) and sums reasoning tokens into timing', async () => {
+test('harness: the pipeline sends the configured reasoning effort as the first prompt line (low sends the line; default off sends none) and sums reasoning tokens into timing', async () => {
   const prompts = [];
   const usage = { input_tokens: 100, output_tokens: 5, cached_input_tokens: 0, reasoning_tokens: 42 };
   let h = fakeHarness(['ANSWER: 40 droplets.'], { onInput: (t) => prompts.push(t), usage });
-  let { p, events, restore } = setup({ ...BASE_ENV, HARNESS_TOOLS_MODE: 'none' }, h);
+  let { p, events, restore } = setup({ ...BASE_ENV, HARNESS_TOOLS_MODE: 'none', HARNESS_REASONING_EFFORT: 'low' }, h);
   try {
     const out = await p.ask('How many droplets?');
     assert.equal(out.answer, '40 droplets.');
@@ -1229,7 +1229,7 @@ test('harness: boot resolution picks the newest live session named <base> or <ba
     assert.equal(d.harnessRotating, false);
     assert.equal(d.harnessLastRotation, null);
     assert.equal(d.harnessLastRotationError, null);
-    assert.equal(d.harnessReasoningEffort, 'low');
+    assert.equal(d.harnessReasoningEffort, 'off');
   } finally {
     restore();
   }
@@ -1291,7 +1291,7 @@ test('harness: rotation after N questions creates, warms, switches between quest
     assert.equal(p.harness.sessionName, created.name);
     const warm = inputs.find(([id]) => id === created.session_id);
     assert.ok(warm, 'the new session was warmed with one run');
-    assert.equal(warm[1], 'Reasoning: low\nReply with exactly: ANSWER: ready');
+    assert.equal(warm[1], 'Reply with exactly: ANSWER: ready');
     assert.ok(h.calls.some((c) => c.url.endsWith(`/sessions/${created.session_id}`) && c.method === 'GET'), 'polled GET /sessions/{id} until READY');
     assert.deepEqual(h.calls.filter((c) => c.method === 'DELETE').map((c) => c.url.split('/').pop()), ['old']);
     assert.equal(h.state.sessions.find((s) => s.session_id === 'old').status, 'SESSION_STATUS_DESTROYED');

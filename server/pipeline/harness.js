@@ -95,7 +95,7 @@ export function harnessConfig(env) {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
-  const effort = String(env.HARNESS_REASONING_EFFORT || 'low').trim().toLowerCase();
+  const effort = String(env.HARNESS_REASONING_EFFORT || 'off').trim().toLowerCase();
   // HARNESS_CONFIG_ID unset -> the default config; `none` or blank -> no config (YAML manifest path)
   const rawConfig = env.HARNESS_CONFIG_ID === undefined ? DEFAULT_CONFIG_ID : String(env.HARNESS_CONFIG_ID).trim();
   return {
@@ -113,7 +113,7 @@ export function harnessConfig(env) {
     mcpToken: env.MCP_AUTH_TOKEN || '',
     gatewayTools: gatewayTools.length ? gatewayTools : DEFAULT_GATEWAY_TOOLS,
     // gpt-oss Harmony reasoning effort, sent as the first prompt line (there is no API parameter); `off` sends nothing
-    reasoningEffort: REASONING_EFFORTS.includes(effort) ? effort : 'low',
+    reasoningEffort: REASONING_EFFORTS.includes(effort) ? effort : 'off',
     // session hygiene: sessions are created from this Environment Config (JSON create) and rotated
     configId: /^none$/i.test(rawConfig) ? '' : rawConfig,
     rotateAfter: intEnv(env.HARNESS_ROTATE_AFTER, DEFAULT_ROTATE_AFTER),
