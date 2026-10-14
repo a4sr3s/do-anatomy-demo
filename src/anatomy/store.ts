@@ -111,7 +111,7 @@ export interface State {
   /** last measured answer per path, so both latencies can be shown side by side */
   latency: Record<AskMode, AnswerMeta | null>;
   /** agent-mode readiness as reported by POST /api/harness/warm (null = not asked yet) */
-  agentReady: { state: 'warming' | 'ready' | 'error' | 'skipped'; detail: string; at: number } | null;
+  agentReady: { state: 'warming' | 'ready' | 'error' | 'skipped'; detail: string; session?: string | null; at: number } | null;
   inspector: { part: InspectorPart | null; pinned: boolean; stats: Stats };
   machineStats: Record<string, Stats>;
   recordings: Recording[];

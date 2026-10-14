@@ -160,7 +160,7 @@ async function warmAgent() {
     const r = await api('/harness/warm', { method: 'POST' });
     if (r.skipped) store.set({ agentReady: { state: 'skipped', detail: r.reason || 'no harness', at: Date.now() } });
     else if (r.ok === false) store.set({ agentReady: { state: 'error', detail: r.error || 'harness not ready', at: Date.now() } });
-    else store.set({ agentReady: { state: 'ready', detail: `${r.session || 'session'} ${String(r.status || '').replace(/^SESSION_STATUS_/, '').toLowerCase() || 'ready'}${r.resumed ? ' · resumed' : ''}${r.rotation ? ' · rotating' : ''}${r.throttled ? '' : r.ms != null ? ` · ${r.ms} ms` : ''}`, at: Date.now() } });
+    else store.set({ agentReady: { state: 'ready', detail: `${String(r.status || '').replace(/^SESSION_STATUS_/, '').toLowerCase() || 'ready'}${r.resumed ? ' · resumed' : ''}${r.rotation ? ' · rotating' : ''}${r.throttled ? '' : r.ms != null ? ` · ${r.ms} ms` : ''}`, session: r.session || null, at: Date.now() } });
   } catch (err) {
     store.set({ agentReady: { state: 'error', detail: (err as Error).message, at: Date.now() } });
   }
@@ -288,7 +288,7 @@ function AskDock() {
                     ))}
                   </ToggleGroup>
                   {askMode === 'agent' && agentReady && (
-                    <Badge variant="outline" data-testid="agent-ready" className={cn('max-w-[18rem] truncate', agentReady.state === 'ready' ? 'text-success' : agentReady.state === 'error' ? 'text-destructive' : 'text-muted-foreground')}>
+                    <Badge variant="outline" data-testid="agent-ready" title={agentReady.session ? `session ${agentReady.session}` : undefined} className={cn('max-w-[18rem] truncate', agentReady.state === 'ready' ? 'text-success' : agentReady.state === 'error' ? 'text-destructive' : 'text-muted-foreground')}>
                       {agentReady.state === 'warming' ? <Spinner data-icon="inline-start" /> : null}
                       harness {agentReady.detail}
                     </Badge>
