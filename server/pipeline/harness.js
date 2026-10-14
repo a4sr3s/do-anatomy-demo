@@ -7,7 +7,11 @@
  * (it auto-pauses when idle; sending input resumes it), sends each prompt
  * with POST /v2/agents/sessions/{id}/input and streams the answer from the
  * session's SSE event stream (GET /v2/agents/sessions/{id}/events,
- * `run.token_delta` events) back into the demo's own SSE bus.
+ * `run.token_delta` events) back into the demo's own SSE bus. The event stream
+ * is attached ONCE per session and kept open across questions (SessionStream):
+ * events are routed to the run that owns them by run_id, and the stream is only
+ * re-attached (with Last-Event-ID) when it actually drops. POST /input never
+ * waits for an attach.
  *
  * Architecture v4: the session is created with tools. In `inline` mode the
  * manifest declares our own "anatomy-data" MCP server (mcp/) directly; in
@@ -32,7 +36,7 @@
  *        run.token_delta {text,is_reasoning}, run.usage_recorded, run.completed, run.failed,
  *        plus tool-call events whose exact names are forwarded as-is)
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { DONT_KNOW_TEXT, DONT_KNOW_TEXT_ES, dontKnowText, looksSpanish } from './retrieval.js';
 
 export { DONT_KNOW_TEXT, DONT_KNOW_TEXT_ES, dontKnowText, looksSpanish };
@@ -106,7 +110,13 @@ export function harnessConfig(env) {
     size: env.HARNESS_SIZE || 'mars-1vcpu-1gb',
     idleTimeout: env.HARNESS_IDLE_TIMEOUT || '30m',
     timeoutMs: Number(env.HARNESS_TIMEOUT_MS) || 90000,
-    firstTokenTimeoutMs: Number(env.HARNESS_FIRST_TOKEN_TIMEOUT_MS) || 45000,
+    // liveness window: with the event stream already attached, nothing within 15 s is a real failure
+    // (server/app.js then replays a recording); the old 45 s only made the audience wait for the replay
+    firstTokenTimeoutMs: Number(env.HARNESS_FIRST_TOKEN_TIMEOUT_MS) || 15000,
+    // persistent event stream: attach (response headers) timeout and the silence after which a stream is re-attached
+    attachTimeoutMs: intEnv(env.HARNESS_ATTACH_TIMEOUT_MS, 20000),
+    streamIdleMs: intEnv(env.HARNESS_STREAM_IDLE_MS, 60000),
+    streamBackoffMs: 500, // first re-attach delay after a drop (doubles up to 10 s); not an env knob
     apiUrl: (env.HARNESS_API_URL || API).replace(/\/$/, ''),
     toolsMode: TOOLS_MODES.includes(toolsMode) ? toolsMode : 'gateway',
     mcpUrl: (env.MCP_PUBLIC_URL || '').replace(/\/$/, ''),
@@ -379,6 +389,248 @@ export function isSessionOf(base, name) {
 const isDead = (s) => /DESTROY|FAILED/.test(s?.status || '');
 const createdAt = (s) => Date.parse(s?.created_at || '') || 0;
 
+/** The rotation warm-up run may include the OpenCode boot of a fresh session (~5 s to run.started): a wider liveness window. */
+const WARM_FIRST_TOKEN_MS = 60000;
+/** Re-attach back-off: a normal (ref'd) timer, bounded and only pending while a re-attach is due. */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * One long-lived `GET /sessions/{id}/events` attach per session.
+ *
+ * The events endpoint keeps one live delivery slot per client and a new attach supersedes
+ * the previous one. Opening a fresh attach for every question (and aborting it afterwards)
+ * made each question pay 3-4 s for that supersede and sometimes hung or produced a zombie
+ * stream: the 45 s "stalls" where the POST was never even sent (bench/INVESTIGATION.md).
+ * So the stream is opened once when a session becomes current (warm-up, rotation), stays
+ * open across questions and is only re-attached when it actually ends: then with
+ * `Last-Event-ID` so nothing in between is missed. Delivery is at-least-once, so events are
+ * de-duplicated by `event_id`. Events are routed to the run that owns them (`run_id`); events
+ * of a run nobody follows yet are buffered, because the POST /input response carrying the run
+ * id can land after the run's first events. A silent stream (the server sends a keepalive
+ * comment every ~15 s) is re-attached by the idle watchdog; a run that times out without a
+ * single event forces a re-attach too (zombie attach). A 404 is final: the session is gone.
+ */
+export class SessionStream {
+  constructor(sessionId, { url, headers, fetch: fetchImpl, log, attachTimeoutMs = 20000, idleMs = 60000, backoffMs = 500, maxBackoffMs = 10000, bufferSize = 1000 }) {
+    this.sessionId = sessionId;
+    this.url = url;
+    this.headers = typeof headers === 'function' ? headers : () => headers;
+    this.fetch = fetchImpl;
+    this.logger = typeof log === 'function' ? log : () => log || console;
+    this.attachTimeoutMs = attachTimeoutMs;
+    this.idleMs = idleMs;
+    this.backoffMs = backoffMs;
+    this.maxBackoffMs = maxBackoffMs;
+    this.bufferSize = bufferSize;
+    this.deviceId = randomUUID();
+    this.state = 'idle'; // idle | connecting | attached | live | reconnecting | closed
+    this.closed = false;
+    this.fatal = null;
+    this.loop = null;
+    this.ac = null;
+    this.idleTimer = null;
+    this.attaches = 0;
+    this.drops = 0;
+    this.events = 0;
+    this.lastEventId = '';
+    this.lastEventAt = null;
+    this.attachedAt = null;
+    this.openedAt = Date.now();
+    this.lastError = null;
+    this.subs = new Map(); // run_id -> Set<{ onEvent, onError }>
+    this.recent = []; // events of runs nobody has subscribed to (yet)
+    this.seen = new Set(); // event ids, bounded
+  }
+
+  get log() {
+    return this.logger();
+  }
+
+  /** Start the attach loop (idempotent). */
+  start() {
+    if (!this.loop && !this.closed) {
+      this.loop = this._loop().catch((err) => this.log.error?.(`[harness] event stream of ${this.sessionId} loop crashed: ${err.message}`));
+    }
+    return this;
+  }
+
+  /** Stop for good: every follower is told the stream is closed. */
+  close(reason = 'closed') {
+    if (this.closed) return;
+    this.closed = true;
+    this.state = 'closed';
+    this.ac?.abort(new Error(`event stream ${reason}`));
+    this._notifyError(Object.assign(new Error(`Harness event stream ${reason}`), { streamClosed: true }));
+  }
+
+  /** Drop the current attach and re-attach (with Last-Event-ID). */
+  reconnect(reason = 'forced') {
+    if (this.closed) return;
+    this.log.log?.(`[harness] event stream of ${this.sessionId}: re-attaching (${reason})`);
+    this.ac?.abort(new Error(`re-attach: ${reason}`));
+  }
+
+  /**
+   * Follow one run. Buffered events of that run are delivered first (asynchronously, so the
+   * caller can finish wiring), then live ones. Returns the unsubscribe function.
+   */
+  subscribe(runId, onEvent, onError = () => {}) {
+    const sub = { onEvent, onError };
+    let set = this.subs.get(runId);
+    if (!set) this.subs.set(runId, (set = new Set()));
+    set.add(sub);
+    const pending = this.recent.filter((e) => e.run_id === runId);
+    if (pending.length) this.recent = this.recent.filter((e) => e.run_id !== runId);
+    queueMicrotask(() => {
+      for (const e of pending) {
+        if (!set.has(sub)) return;
+        onEvent(e);
+      }
+      if (this.closed && set.has(sub)) onError(this.fatal || Object.assign(new Error('Harness event stream closed'), { streamClosed: true }));
+    });
+    return () => {
+      set.delete(sub);
+      if (!set.size && this.subs.get(runId) === set) this.subs.delete(runId);
+    };
+  }
+
+  /** Health snapshot (no secrets). */
+  status() {
+    return {
+      sessionId: this.sessionId,
+      state: this.state,
+      attaches: this.attaches,
+      drops: this.drops,
+      events: this.events,
+      lastEventId: this.lastEventId || null,
+      attachedAt: this.attachedAt,
+      lastEventAt: this.lastEventAt,
+      openMs: Date.now() - this.openedAt,
+      lastError: this.lastError,
+      following: this.subs.size,
+    };
+  }
+
+  _notifyError(err) {
+    for (const [, set] of [...this.subs]) for (const sub of [...set]) {
+      try { sub.onError(err); } catch { /* the follower's problem */ }
+    }
+  }
+
+  async _loop() {
+    let backoff = this.backoffMs;
+    while (!this.closed) {
+      const ac = new AbortController();
+      this.ac = ac;
+      const attachTimer = setTimeout(() => ac.abort(new Error(`attach timed out after ${this.attachTimeoutMs} ms`)), this.attachTimeoutMs);
+      attachTimer.unref?.();
+      this.state = this.attaches ? 'reconnecting' : 'connecting';
+      try {
+        const headers = { ...this.headers(), accept: 'text/event-stream', 'cache-control': 'no-cache', 'x-device-uuid': this.deviceId };
+        if (this.lastEventId) headers['last-event-id'] = this.lastEventId;
+        const res = await this.fetch(`${this.url}/events`, { headers, signal: ac.signal });
+        clearTimeout(attachTimer);
+        if (!res.ok) {
+          const err = Object.assign(new Error(`Harness events failed: ${res.status}`), { status: res.status, recoverable: res.status === 404, beforeFirstToken: true });
+          if (res.status === 404) {
+            // the session is gone: nothing to re-attach to
+            this.fatal = err;
+            this.lastError = { at: Date.now(), message: err.message };
+            this.closed = true;
+            this.state = 'closed';
+            this._notifyError(err);
+            return;
+          }
+          throw err;
+        }
+        if (!res.body) throw new Error('Harness events: empty body');
+        this.attaches++;
+        this.attachedAt = Date.now();
+        this.state = 'attached';
+        backoff = this.backoffMs;
+        await this._read(res.body, ac);
+        throw new Error('event stream ended');
+      } catch (err) {
+        clearTimeout(attachTimer);
+        if (this.closed) return;
+        this.drops++;
+        this.lastError = { at: Date.now(), message: err.message };
+        this.state = 'reconnecting';
+        this.log.log?.(`[harness] event stream of ${this.sessionId} dropped (${err.message}); re-attaching in ${backoff} ms`);
+        await sleep(backoff);
+        backoff = Math.min(backoff * 2, this.maxBackoffMs);
+      }
+    }
+  }
+
+  async _read(body, ac) {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    const aborted = new Promise((_, reject) => ac.signal.addEventListener('abort', () => reject(ac.signal.reason || new Error('aborted')), { once: true }));
+    aborted.catch(() => {});
+    const idle = () => {
+      clearTimeout(this.idleTimer);
+      if (this.idleMs > 0) {
+        this.idleTimer = setTimeout(() => ac.abort(new Error(`no data for ${this.idleMs} ms`)), this.idleMs);
+        this.idleTimer.unref?.();
+      }
+    };
+    let buf = '';
+    try {
+      idle();
+      for (;;) {
+        const { value, done } = await Promise.race([reader.read(), aborted]);
+        if (done) return;
+        idle();
+        buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+        let idx;
+        while ((idx = buf.indexOf('\n\n')) !== -1) {
+          const frame = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          this._frame(frame);
+        }
+      }
+    } finally {
+      clearTimeout(this.idleTimer);
+      reader.cancel().catch(() => {});
+    }
+  }
+
+  _frame(frame) {
+    let id = '';
+    const data = [];
+    for (const line of frame.split('\n')) {
+      if (line.startsWith(':')) continue; // keepalive comment
+      if (line.startsWith('id:')) id = line.slice(3).trim();
+      else if (line.startsWith('data:')) data.push(line.slice(5).trim());
+    }
+    if (!data.length) return;
+    let e;
+    try { e = JSON.parse(data.join('\n')); } catch { return; }
+    if (!e || typeof e !== 'object') return;
+    const eventId = String(e.event_id || id || '');
+    if (eventId) {
+      if (this.seen.has(eventId)) return; // at-least-once delivery: duplicates are dropped
+      this.seen.add(eventId);
+      if (this.seen.size > this.bufferSize * 2) this.seen.delete(this.seen.values().next().value);
+      this.lastEventId = eventId;
+    }
+    if (e.type === 'stream.state') {
+      if (e.data?.state === 'live') this.state = 'live';
+      return;
+    }
+    this.events++;
+    this.lastEventAt = Date.now();
+    const set = this.subs.get(String(e.run_id || ''));
+    if (set && set.size) {
+      for (const sub of [...set]) sub.onEvent(e);
+    } else {
+      this.recent.push(e);
+      if (this.recent.length > this.bufferSize) this.recent.shift();
+    }
+  }
+}
+
 export class HarnessClient {
   constructor(cfg, fetchImpl = (...a) => fetch(...a), log = console) {
     this.cfg = cfg;
@@ -398,6 +650,42 @@ export class HarnessClient {
     this.lastRotationError = null; // { at, message, from, to, reason }
     this.rotateBackoffUntil = 0;
     this.cleanup = Promise.resolve(); // background deletion of older duplicate sessions found at boot
+    this.streams = new Map(); // session id -> SessionStream (the current session, plus a rotation target while it warms)
+  }
+
+  /** The persistent event stream of a session, attached on first use and kept open (see SessionStream). */
+  _stream(id) {
+    let s = this.streams.get(id);
+    if (s && !s.closed) return s;
+    s = new SessionStream(id, {
+      url: `${this.cfg.apiUrl}/${id}`,
+      headers: () => this.headers(),
+      fetch: (...a) => this.fetch(...a),
+      log: () => this.log,
+      attachTimeoutMs: this.cfg.attachTimeoutMs,
+      idleMs: this.cfg.streamIdleMs,
+      backoffMs: this.cfg.streamBackoffMs,
+    });
+    this.streams.set(id, s);
+    return s.start();
+  }
+
+  _closeStream(id, reason) {
+    const s = id && this.streams.get(id);
+    if (!s) return;
+    this.streams.delete(id);
+    s.close(reason);
+  }
+
+  /** Close every event stream (shutdown / tests). */
+  close(reason = 'client closed') {
+    for (const id of [...this.streams.keys()]) this._closeStream(id, reason);
+  }
+
+  /** Health snapshot of the current session's event stream (null before the first attach). */
+  streamStatus(id = this.sessionId) {
+    const s = id && this.streams.get(id);
+    return s ? s.status() : null;
   }
 
   headers(extra = {}) {
@@ -506,6 +794,7 @@ export class HarnessClient {
   /** Best effort DELETE; never throws, resolves true when the API accepted it. */
   async deleteSession(id, name = id) {
     if (!id) return false;
+    this._closeStream(id, 'session deleted');
     try {
       const res = await this.fetch(`${this.cfg.apiUrl}/${id}`, { method: 'DELETE', headers: this.headers() });
       if (!res.ok && res.status !== 404) throw new Error(`${res.status} ${await res.text()}`);
@@ -545,6 +834,7 @@ export class HarnessClient {
     let created = false;
     if (!s) { s = await this.createSession(found.name); created = true; }
     this._setSession(s.session_id, found.name);
+    this._stream(this.sessionId); // attach now, so the first question only pays for its POST
     return { id: this.sessionId, name: found.name, created, stale: found.stale };
   }
 
@@ -570,6 +860,7 @@ export class HarnessClient {
       out = await this._run(session.id, prompt, hooks, t0);
     } catch (err) {
       if (!(retry && err.recoverable)) throw err;
+      this._closeStream(this.sessionId, `session lost (${err.message})`);
       this.sessionId = null;
       const fresh = await this.ensureSession(err.status === 404);
       hooks.onSession?.({ ...fresh, retried: true, toolsMode: this.cfg.toolsMode, hash: this.hash });
@@ -629,7 +920,7 @@ export class HarnessClient {
       created = await this.createSession(name);
       await this.waitReady(created.session_id);
       const warmPrompt = withReasoning([`Reply with exactly: ${MARKER} ready`], this.cfg.reasoningEffort).join('\n');
-      const warm = await this._run(created.session_id, warmPrompt, {}, Date.now());
+      const warm = await this._run(created.session_id, warmPrompt, {}, Date.now(), { firstTokenTimeoutMs: Math.max(this.cfg.firstTokenTimeoutMs, WARM_FIRST_TOKEN_MS) });
       this.log.log?.(`[harness] session ${name} warm (${warm.totalMs} ms, "${warm.text}")`);
     } catch (err) {
       this.lastRotationError = { at: Date.now(), message: err.message, from: from.name, to: name, reason };
@@ -650,17 +941,26 @@ export class HarnessClient {
     this.queue = sw.catch(() => {});
     const old = await sw;
     this.log.log?.(`[harness] session switched ${old.name || '(none)'} -> ${name} in ${Date.now() - t0} ms`);
-    if (old.id && old.id !== created.session_id) this.lastRotation.deletedOld = await this.deleteSession(old.id, old.name);
+    if (old.id && old.id !== created.session_id) {
+      this.lastRotation.deletedOld = await this.deleteSession(old.id, old.name);
+      this._closeStream(old.id, 'session rotated out');
+    }
     this.lastRotationError = null;
     return { ok: true, from: old.name, to: name };
   }
 
-  async _run(id, prompt, hooks, t0) {
+  /**
+   * One run on a session: POST /input at once (the persistent event stream is already attached,
+   * or attaching in the background), then follow the run's events on that stream until
+   * run.completed / run.failed. `firstTokenTimeoutMs` can be widened for warm-up runs.
+   */
+  async _run(id, prompt, hooks, t0, { firstTokenTimeoutMs = this.cfg.firstTokenTimeoutMs } = {}) {
+    const stream = this._stream(id);
     const ac = new AbortController();
     const fail = (message, extra = {}) => Object.assign(new Error(message), extra);
     const timer = setTimeout(() => ac.abort(fail(`Harness run timed out after ${this.cfg.timeoutMs} ms`, { timeout: true })), this.cfg.timeoutMs);
     // liveness guard: nothing at all (no token, no tool activity) within the first-token window fails the run (server/app.js may then replay a recording)
-    let firstTimer = setTimeout(() => ac.abort(fail(`Harness produced nothing within ${this.cfg.firstTokenTimeoutMs} ms`, { timeout: true, beforeFirstToken: true })), this.cfg.firstTokenTimeoutMs);
+    let firstTimer = setTimeout(() => ac.abort(fail(`Harness produced nothing within ${firstTokenTimeoutMs} ms`, { timeout: true, beforeFirstToken: true })), firstTokenTimeoutMs);
     const alive = () => {
       if (firstTimer) { clearTimeout(firstTimer); firstTimer = null; }
     };
@@ -669,17 +969,14 @@ export class HarnessClient {
     // "first token" = first answer token streamed to the audience (text after ANSWER:); hidden
     // reasoning and tool activity only count as liveness for the first-token timeout.
     let sawOutput = false;
+    let runId = '';
+    let runEvents = 0;
     const filter = new MarkerFilter((tok, i) => {
       if (stats.firstTokenMs == null) stats.firstTokenMs = Date.now() - t0;
       sawOutput = true;
       hooks.onToken?.(tok, i);
     });
     try {
-      const sse = await this.fetch(`${this.cfg.apiUrl}/${id}/events`, {
-        headers: this.headers({ accept: 'text/event-stream', 'cache-control': 'no-cache' }),
-        signal: ac.signal,
-      });
-      if (!sse.ok) throw fail(`Harness events failed: ${sse.status}`, { recoverable: sse.status === 404, status: sse.status, beforeFirstToken: true });
       const res = await this.fetch(`${this.cfg.apiUrl}/${id}/input`, {
         method: 'POST',
         headers: this.headers({ 'content-type': 'application/json' }),
@@ -690,25 +987,17 @@ export class HarnessClient {
         const body = await res.text();
         throw fail(`Harness input failed: ${res.status} ${body}`, { recoverable: [404, 409, 410].includes(res.status), status: res.status, beforeFirstToken: true });
       }
-      const { run_id: runId } = await res.json();
+      const json = await res.json().catch(() => ({}));
+      runId = typeof json?.run_id === 'string' ? json.run_id.trim() : '';
+      // the API notes the id "may be empty if OHR returned no run id": such a run could never be followed
+      if (!runId) throw fail('Harness input returned no run id', { beforeFirstToken: true, noRunId: true });
       hooks.onRun?.({ runId, sessionId: id });
 
-      const reader = sse.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = '';
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) throw fail('Harness event stream ended before the run completed', { beforeFirstToken: !sawOutput });
-        buf += decoder.decode(value, { stream: true });
-        let idx;
-        while ((idx = buf.indexOf('\n\n')) !== -1) {
-          const frame = buf.slice(0, idx);
-          buf = buf.slice(idx + 2);
-          const data = frame.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trim()).join('\n');
-          if (!data) continue;
-          let e;
-          try { e = JSON.parse(data); } catch { continue; }
-          if (e.run_id !== runId) continue;
+      return await new Promise((resolve, reject) => {
+        let unsub = () => {};
+        const settle = (fn, value) => { unsub(); fn(value); };
+        const handle = (e) => {
+          runEvents++;
           const d = e.data || {};
           if (e.type === 'run.started') hooks.onStarted?.(Date.now() - t0);
           else if (e.type === 'run.token_delta') {
@@ -722,10 +1011,9 @@ export class HarnessClient {
           else if (e.type === 'run.completed') {
             stats.tokensIn = d.total_tokens_in || 0;
             stats.tokensOut = d.total_tokens_out || 0;
-            reader.cancel().catch(() => {});
             const out = filter.finish();
             if (stats.firstTokenMs == null && out.text) stats.firstTokenMs = Date.now() - t0;
-            return { ...out, ...stats, totalMs: Date.now() - t0, runId, sessionId: id };
+            settle(resolve, { ...out, ...stats, totalMs: Date.now() - t0, runId, sessionId: id });
           } else if (isToolEventType(e.type)) {
             // tool-call events from the harness itself (names vary by adapter); the MCP server's own events are primary
             alive();
@@ -743,11 +1031,19 @@ export class HarnessClient {
             this.seenEventTypes.add(e.type);
             this.log.debug?.(`[harness] unhandled event type ${e.type}`);
           }
-        }
-      }
+        };
+        unsub = stream.subscribe(
+          runId,
+          (e) => { try { handle(e); } catch (err) { settle(reject, err); } },
+          (err) => settle(reject, Object.assign(err, { beforeFirstToken: err.beforeFirstToken ?? !sawOutput }))
+        );
+        ac.signal.addEventListener('abort', () => settle(reject, ac.signal.reason || fail('Harness run aborted')), { once: true });
+      });
     } catch (err) {
-      if (ac.signal.aborted && ac.signal.reason) throw ac.signal.reason;
+      if (ac.signal.aborted && ac.signal.reason) err = ac.signal.reason;
       if (err.beforeFirstToken === undefined) err.beforeFirstToken = !sawOutput;
+      // a run that timed out without a single event on an attached stream: the attach may be a zombie, re-attach for the next run
+      if (err.timeout && runId && runEvents === 0) stream.reconnect(`no events for run ${runId}`);
       throw err;
     } finally {
       clearTimeout(timer);

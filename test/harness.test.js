@@ -6,7 +6,6 @@ import { MarkerFilter, HarnessClient, buildManifest, buildPrompt, buildToolPromp
 import { createApp } from '../server/app.js';
 
 const FACT = 'Acme Robotics runs 40 GPU droplets in SFO3.';
-const sseFrame = (e) => `id: x\nevent: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`;
 // HARNESS_CONFIG_ID=none: the manifest (YAML) path these tests were written for; the config path has its own tests below
 const BASE_ENV = { HARNESS_API_TOKEN: 'tok', HARNESS_INFERENCE_API_KEY: 'k', MCP_PUBLIC_URL: 'https://demo.example/mcp', MCP_AUTH_TOKEN: 'mcp-secret', HARNESS_CONFIG_ID: 'none' };
 const CONFIG_ID = '01a132ee-ff11-7130-9d05-838874ecec77';
@@ -16,13 +15,44 @@ const quiet = { log() {}, error() {}, debug() {} };
 
 /**
  * Fake Harness Runtime API: list -> sessions (with labels), create -> new
- * session, events -> scripted stream, input -> run id. `onInput` lets a test
- * react to the prompt (e.g. simulate the MCP server reporting tool events).
+ * session, events -> one long-lived stream per attach (like the real feed: the
+ * old-run context first, then whatever later inputs produce), input -> run id,
+ * after which the run's scripted events are pushed into the session's open
+ * stream. `onInput` lets a test react to the prompt (e.g. simulate the MCP
+ * server reporting tool events). `script(n, text)` scripts the n-th run (1-based):
+ * either `{ deltas | text, extraEvents, fail, usage }` or an async
+ * `(emit) => …` that pushes `{ type, data }` events itself. Every frame carries a
+ * unique `id:` / `event_id`; an attach with `Last-Event-ID` resumes after it.
+ * `h.drop(sessionId)` ends the current stream like a server-side drop.
  */
-function fakeHarness(deltas, { fail = false, sessions, extraEvents = [], onInput, hang = false, name = 'alexis-anatomy-harness-v4b', perPage = 100, createdStatus = 'SESSION_STATUS_READY', usage = null } = {}) {
+function fakeHarness(deltas, { fail = false, sessions, extraEvents = [], onInput, hang = false, name = 'alexis-anatomy-harness-v4b', perPage = 100, createdStatus = 'SESSION_STATUS_READY', usage = null, script = null, runIdFor = null } = {}) {
   const calls = [];
-  const runId = 'run-1';
-  const state = { sessions: sessions || [{ session_id: 'sess-1', name, status: 'SESSION_STATUS_PAUSED', labels: { manifest: '__match__' } }], nextId: 0, createdStatus };
+  const state = { sessions: sessions || [{ session_id: 'sess-1', name, status: 'SESSION_STATUS_PAUSED', labels: { manifest: '__match__' } }], nextId: 0, createdStatus, runs: 0, seq: 0, streams: new Map(), log: new Map(), attaches: [] };
+  const sidOf = (u) => /\/sessions\/([^/?]+)\//.exec(u)?.[1];
+  const frameOf = (e) => `id: ${e.event_id}\nevent: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`;
+  const encoder = new TextEncoder();
+  /** Record an event in the session's log and push it into the open stream (if any). */
+  const emit = (sid, runId, e) => {
+    const ev = { ...e, run_id: e.run_id ?? runId, event_id: `ev-${++state.seq}` };
+    if (!state.log.has(sid)) state.log.set(sid, []);
+    state.log.get(sid).push(ev);
+    const st = state.streams.get(sid);
+    if (st && !st.closed) st.ctrl.enqueue(encoder.encode(frameOf(ev)));
+    return ev;
+  };
+  const defaultRun = () => ({ deltas, extraEvents, fail, usage });
+  const playRun = async (sid, runId, text) => {
+    const r = script ? script(state.runs, text) : defaultRun();
+    const push = (e) => emit(sid, runId, e);
+    push({ type: 'run.started', data: {} });
+    if (typeof r === 'function') return r(push);
+    const ds = r.deltas || (r.text != null ? [r.text] : []);
+    for (const e of r.extraEvents || []) push(e);
+    for (const t of ds) push({ type: 'run.token_delta', data: { text: t, is_reasoning: false } });
+    push({ type: 'run.token_delta', data: { text: 'hidden', is_reasoning: true } });
+    push({ type: 'run.usage_recorded', data: { model_id: 'openai-gpt-oss-20b', ...(r.usage ? { usage: r.usage } : {}) } });
+    push(r.fail ? { type: 'run.failed', data: { message: 'boom' } } : { type: 'run.completed', data: { total_tokens_in: 10, total_tokens_out: 3 } });
+  };
   const impl = async (url, init = {}) => {
     calls.push({ url: String(url), method: init.method || 'GET', body: init.body, headers: init.headers });
     const u = String(url);
@@ -62,31 +92,52 @@ function fakeHarness(deltas, { fail = false, sessions, extraEvents = [], onInput
       return s ? Response.json({ session: s }) : new Response('not found', { status: 404 });
     }
     if (u.endsWith('/input')) {
+      const sid = sidOf(u);
       const text = JSON.parse(init.body).text;
       if (onInput?.(text, u) === false) return new Response('gone', { status: 404 });
+      const runId = runIdFor ? runIdFor(++state.runs) : `run-${++state.runs}`;
+      // the run starts right after the POST is accepted; its events land on the session's open stream
+      if (!hang) setTimeout(() => playRun(sid, runId, text).catch((err) => console.error('fake run failed', err)), 0);
       return Response.json({ run_id: runId });
     }
     if (u.endsWith('/events')) {
-      if (hang) {
-        // an open stream that only ends when the caller aborts (like a real fetch body)
-        const body = new ReadableStream({ start(ctrl) { init.signal?.addEventListener('abort', () => ctrl.error(init.signal.reason)); } });
-        return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
-      }
-      const evs = [
-        { type: 'run.log', run_id: 'old', data: { message: 'history' } },
-        { type: 'run.token_delta', run_id: 'old', data: { text: 'ANSWER: stale', is_reasoning: false } },
-        { type: 'run.started', run_id: runId, data: {} },
-        ...extraEvents.map((e) => ({ ...e, run_id: runId })),
-        ...deltas.map((t) => ({ type: 'run.token_delta', run_id: runId, data: { text: t, is_reasoning: false } })),
-        { type: 'run.token_delta', run_id: runId, data: { text: 'hidden', is_reasoning: true } },
-        { type: 'run.usage_recorded', run_id: runId, data: { model_id: 'openai-gpt-oss-20b', ...(usage ? { usage } : {}) } },
-        fail ? { type: 'run.failed', run_id: runId, data: { message: 'boom' } } : { type: 'run.completed', run_id: runId, data: { total_tokens_in: 10, total_tokens_out: 3 } },
-      ];
-      return new Response(evs.map(sseFrame).join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } });
+      const sid = sidOf(u);
+      const since = init.headers?.['last-event-id'] || '';
+      state.attaches.push({ sid, since, device: init.headers?.['x-device-uuid'] || '' });
+      const st = { closed: false, ctrl: null };
+      const body = new ReadableStream({
+        start(ctrl) {
+          st.ctrl = ctrl;
+          const close = () => { if (!st.closed) { st.closed = true; try { ctrl.error(init.signal?.reason || new Error('aborted')); } catch { /* already closed */ } } };
+          init.signal?.addEventListener('abort', close, { once: true });
+          st.drop = () => { if (!st.closed) { st.closed = true; ctrl.close(); } };
+          const log = state.log.get(sid) || [];
+          let frames;
+          if (since) {
+            // reconnect: strictly what follows the last rendered event
+            const at = log.findIndex((e) => e.event_id === since);
+            frames = log.slice(at + 1);
+          } else {
+            // first attach: the recent context (an old run's events) then everything already logged
+            frames = [
+              { type: 'run.log', run_id: 'old', event_id: `old-${sid}-1`, data: { message: 'history' } },
+              { type: 'run.token_delta', run_id: 'old', event_id: `old-${sid}-2`, data: { text: 'ANSWER: stale', is_reasoning: false } },
+              ...log,
+            ];
+          }
+          ctrl.enqueue(encoder.encode(`event: stream.state\ndata: ${JSON.stringify({ event_id: '', run_id: '', type: 'stream.state', data: { state: 'catching_up' } })}\n\n`));
+          for (const e of frames) ctrl.enqueue(encoder.encode(frameOf(e)));
+          ctrl.enqueue(encoder.encode(`event: stream.state\ndata: ${JSON.stringify({ event_id: '', run_id: '', type: 'stream.state', data: { state: 'live' } })}\n\n`));
+        },
+      });
+      state.streams.set(sid, st);
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
     }
     return new Response('nope', { status: 500 });
   };
-  return { impl, calls, state };
+  /** End the session's current stream like a server-side drop (the client re-attaches with Last-Event-ID). */
+  const drop = (sid) => state.streams.get(sid)?.drop?.();
+  return { impl, calls, state, emit, drop };
 }
 
 /** Pipeline with a stubbed pgvector, a fake harness and a routed global fetch (MCP health only). */
@@ -193,7 +244,9 @@ test('harness: config defaults (v4 session name, gateway tools, DIGITALOCEAN_ACC
   assert.equal(cfg.toolsMode, 'gateway');
   assert.equal(cfg.size, 'mars-1vcpu-1gb');
   assert.equal(cfg.idleTimeout, '30m');
-  assert.equal(cfg.firstTokenTimeoutMs, 45000);
+  assert.equal(cfg.firstTokenTimeoutMs, 15000);
+  assert.equal(cfg.attachTimeoutMs, 20000);
+  assert.equal(cfg.streamIdleMs, 60000);
   // HARNESS_GATEWAY_TOOLS unset / blank -> Action Gateway slugs <serverRef>_<tool> for the anatomy-data server
   assert.deepEqual(cfg.gatewayTools, ['anatomy-data_search_facts', 'anatomy-data_get_document']);
   assert.deepEqual(harnessConfig({ HARNESS_GATEWAY_TOOLS: ' , ' }).gatewayTools, ['anatomy-data_search_facts', 'anatomy-data_get_document']);
@@ -474,9 +527,10 @@ test('harness: HARNESS_TOOLS_MODE=none never checks MCP and passes context in th
 
 test('harness: "don\'t know" with a failed tool call (no usable result) is retried once with context in the prompt', async () => {
   const prompts = [];
-  let n = 0;
   let pipeline;
   const h = fakeHarness([], {
+    // first run: don't-know answer; second run (context in prompt): grounded answer
+    script: (n) => ({ text: n === 1 ? "ANSWER: I don't know that yet." : 'ANSWER: 40 droplets.' }),
     onInput: (t) => {
       prompts.push(t);
       // first run: the tool is called but fails, don't-know answer; second run (context in prompt): grounded answer
@@ -486,16 +540,6 @@ test('harness: "don\'t know" with a failed tool call (no usable result) is retri
       }
     },
   });
-  const base = h.impl;
-  h.impl = async (url, init) => {
-    if (String(url).endsWith('/events')) {
-      n++;
-      const text = n === 1 ? "ANSWER: I don't know that yet." : 'ANSWER: 40 droplets.';
-      const evs = [{ type: 'run.started', run_id: 'run-1', data: {} }, { type: 'run.token_delta', run_id: 'run-1', data: { text, is_reasoning: false } }, { type: 'run.completed', run_id: 'run-1', data: {} }];
-      return new Response(evs.map(sseFrame).join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } });
-    }
-    return base(url, init);
-  };
   const { p, events, restore } = setup(BASE_ENV, h);
   pipeline = p;
   try {
@@ -516,19 +560,10 @@ test('harness: "don\'t know" with a failed tool call (no usable result) is retri
 
 /** Fake harness whose first run answers from history without any tool call; a second run (if any) answers from the context prompt. */
 function skipsToolHarness(prompts, secondAnswer = 'ANSWER: 40 droplets.') {
-  let n = 0;
-  const h = fakeHarness([], { onInput: (t) => prompts.push(t) });
-  const base = h.impl;
-  h.impl = async (url, init) => {
-    if (String(url).endsWith('/events')) {
-      n++;
-      const text = n === 1 ? 'Recalling... ANSWER: Acme runs 40 GPU droplets in SFO3.' : secondAnswer;
-      const evs = [{ type: 'run.started', run_id: 'run-1', data: {} }, { type: 'run.token_delta', run_id: 'run-1', data: { text, is_reasoning: false } }, { type: 'run.completed', run_id: 'run-1', data: {} }];
-      return new Response(evs.map(sseFrame).join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } });
-    }
-    return base(url, init);
-  };
-  return h;
+  return fakeHarness([], {
+    onInput: (t) => prompts.push(t),
+    script: (n) => ({ text: n === 1 ? 'Recalling... ANSWER: Acme runs 40 GPU droplets in SFO3.' : secondAnswer }),
+  });
 }
 
 test('harness: guard, no tool call and no matching facts -> the app runs the search itself and answers "I do not know that yet." with no second model run', async () => {
@@ -687,27 +722,19 @@ test('harness: NO_MATCHING_FACTS tool result + "I do not know that yet." answer 
 test('harness: tool path holds answer tokens until a tool call is observed, then streams them in order', async () => {
   let pipeline;
   let tokensBeforeTool = -1;
-  const h = fakeHarness([]);
-  const base = h.impl;
-  h.impl = async (url, init) => {
-    if (String(url).endsWith('/events')) {
-      // tokens arrive BEFORE the MCP server's report of the tool call (webhook latency), then more after it
-      const frames = (evs) => new TextEncoder().encode(evs.map((e) => sseFrame({ ...e, run_id: 'run-1' })).join(''));
-      const body = new ReadableStream({
-        async start(ctrl) {
-          ctrl.enqueue(frames([{ type: 'run.started', data: {} }, { type: 'run.token_delta', data: { text: 'ANSWER: Acme', is_reasoning: false } }, { type: 'run.token_delta', data: { text: ' runs', is_reasoning: false } }]));
-          await new Promise((r) => setTimeout(r, 20));
-          tokensBeforeTool = tokensOf(pipelineEvents).length;
-          pipeline.handleToolEvent({ phase: 'start', callId: 'c1', tool: 'search_facts', args: { query: 'q' }, target: 'pgvector' });
-          pipeline.handleToolEvent({ phase: 'done', callId: 'c1', tool: 'search_facts', args: { query: 'q' }, target: 'pgvector', summary: '1 hit', hits: [{ id: 7, score: 0.9, chunk: FACT, object_key: 'facts/1.txt' }] });
-          ctrl.enqueue(frames([{ type: 'run.token_delta', data: { text: ' 40 GPU droplets.', is_reasoning: false } }, { type: 'run.completed', data: { total_tokens_in: 1, total_tokens_out: 3 } }]));
-          ctrl.close();
-        },
-      });
-      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
-    }
-    return base(url, init);
-  };
+  const h = fakeHarness([], {
+    // tokens arrive BEFORE the MCP server's report of the tool call (webhook latency), then more after it
+    script: () => async (emit) => {
+      emit({ type: 'run.token_delta', data: { text: 'ANSWER: Acme', is_reasoning: false } });
+      emit({ type: 'run.token_delta', data: { text: ' runs', is_reasoning: false } });
+      await new Promise((r) => setTimeout(r, 20));
+      tokensBeforeTool = tokensOf(pipelineEvents).length;
+      pipeline.handleToolEvent({ phase: 'start', callId: 'c1', tool: 'search_facts', args: { query: 'q' }, target: 'pgvector' });
+      pipeline.handleToolEvent({ phase: 'done', callId: 'c1', tool: 'search_facts', args: { query: 'q' }, target: 'pgvector', summary: '1 hit', hits: [{ id: 7, score: 0.9, chunk: FACT, object_key: 'facts/1.txt' }] });
+      emit({ type: 'run.token_delta', data: { text: ' 40 GPU droplets.', is_reasoning: false } });
+      emit({ type: 'run.completed', data: { total_tokens_in: 1, total_tokens_out: 3 } });
+    },
+  });
   const { p, events, restore } = setup(BASE_ENV, h);
   const pipelineEvents = events;
   pipeline = p;
@@ -822,24 +849,13 @@ test('harness: tool-call events in the harness SSE stream are forwarded as tool 
 
 /** Fake harness whose runs are scripted per call: `runs[i]` is { text?, deltas?, extraEvents? } for the i-th run. */
 function scriptedHarness(runs, { onInput } = {}) {
-  let n = 0;
-  const h = fakeHarness([], { onInput });
-  const base = h.impl;
-  h.impl = async (url, init) => {
-    if (String(url).endsWith('/events')) {
-      const r = runs[Math.min(n++, runs.length - 1)];
-      const deltas = r.deltas || [r.text];
-      const evs = [
-        { type: 'run.started', run_id: 'run-1', data: {} },
-        ...(r.extraEvents || []).map((e) => ({ ...e, run_id: 'run-1' })),
-        ...deltas.map((text) => ({ type: 'run.token_delta', run_id: 'run-1', data: { text, is_reasoning: false } })),
-        { type: 'run.completed', run_id: 'run-1', data: { total_tokens_in: 10, total_tokens_out: 3 } },
-      ];
-      return new Response(evs.map(sseFrame).join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } });
-    }
-    return base(url, init);
-  };
-  return h;
+  return fakeHarness([], {
+    onInput,
+    script: (n) => {
+      const r = runs[Math.min(n - 1, runs.length - 1)];
+      return { deltas: r.deltas || [r.text], extraEvents: r.extraEvents || [] };
+    },
+  });
 }
 
 const REASONING = 'We need to search for the droplets. The tool returned something odd; let me think about it. I should answer that I do not know.';
@@ -1500,5 +1516,278 @@ test('harness: POST /api/harness/rotate needs the tool-event token, starts a rot
     assert.equal(res.status, 404);
   } finally {
     ms.close();
+  }
+});
+
+// ---- persistent event stream (bench/INVESTIGATION.md option 1) ---------------------------------
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+test('stream: one GET /events attach per session, reused across questions; each run is routed by its own run id', async () => {
+  const prompts = [];
+  const h = fakeHarness([], { onInput: (t) => prompts.push(t), script: (n) => ({ text: `ANSWER: answer ${n}.` }) });
+  const { p, restore } = setup({ ...BASE_ENV, HARNESS_TOOLS_MODE: 'none' }, h);
+  p.harness.log = quiet;
+  try {
+    await p.warmUp(quiet);
+    const attachesAfterWarmUp = h.calls.filter((c) => c.url.endsWith('/events')).length;
+    assert.equal(attachesAfterWarmUp, 1, 'the warm-up attaches the stream once');
+    const runIds = [];
+    for (let i = 1; i <= 5; i++) {
+      const out = await p.ask(`q${i}`);
+      assert.equal(out.answer, `answer ${i}.`);
+      runIds.push(h.state.runs);
+    }
+    assert.deepEqual(runIds, [1, 2, 3, 4, 5]);
+    assert.equal(h.calls.filter((c) => c.url.endsWith('/events')).length, 1, 'no re-attach per question');
+    assert.equal(h.calls.filter((c) => c.url.endsWith('/input')).length, 5);
+    const st = p.describe().harnessStream;
+    assert.equal(st.sessionId, 'sess-1');
+    assert.equal(st.attaches, 1);
+    assert.equal(st.drops, 0);
+    assert.equal(st.state, 'live');
+    assert.ok(st.events >= 5 * 4, 'events of every run were counted');
+    assert.equal(st.following, 0, 'no run followed between questions');
+    assert.match(st.lastEventId, /^ev-\d+$/);
+    assert.ok(h.state.attaches[0].device, 'a device id identifies this client install');
+    assert.equal(p.harness.streams.size, 1);
+  } finally {
+    p.harness.close();
+    restore();
+  }
+});
+
+test('stream: POST /input is sent at once, not gated on the attach; events that arrive before the run id is known are buffered', async () => {
+  const h = fakeHarness(['ANSWER: ok.']);
+  let attached = false;
+  let inputSentBeforeAttach = null;
+  const base = h.impl;
+  h.impl = async (url, init) => {
+    const u = String(url);
+    if (u.endsWith('/events')) {
+      await sleep(40); // a slow attach
+      attached = true;
+    }
+    if (u.endsWith('/input')) inputSentBeforeAttach = !attached;
+    return base(url, init);
+  };
+  const { p, restore } = setup({ ...BASE_ENV, HARNESS_TOOLS_MODE: 'none' }, h);
+  p.harness.log = quiet;
+  try {
+    const out = await p.ask('q');
+    assert.equal(out.answer, 'ok.');
+    assert.equal(inputSentBeforeAttach, true, 'the POST went out while the attach was still pending');
+    // the run's events were logged by the fake before the attach landed, replayed on attach, and delivered once
+    assert.equal(out.timing.firstTokenMs >= 0, true);
+  } finally {
+    p.harness.close();
+    restore();
+  }
+  // the opposite race: the run id lands after the run's first events were already on the stream
+  const h2 = fakeHarness([], { script: () => async (emit) => { emit({ type: 'run.token_delta', data: { text: 'ANSWER: early.', is_reasoning: false } }); emit({ type: 'run.completed', data: {} }); } });
+  const base2 = h2.impl;
+  h2.impl = async (url, init) => {
+    const res = await base2(url, init);
+    if (String(url).endsWith('/input')) await sleep(30); // the events of the run beat the POST response
+    return res;
+  };
+  const s2 = setup({ ...BASE_ENV, HARNESS_TOOLS_MODE: 'none' }, h2);
+  s2.p.harness.log = quiet;
+  try {
+    await s2.p.warmUp(quiet);
+    const out = await s2.p.ask('q');
+    assert.equal(out.answer, 'early.');
+    assert.equal(tokensOf(s2.events), 'early.', 'buffered events are delivered exactly once');
+  } finally {
+    s2.p.harness.close();
+    s2.restore();
+  }
+});
+
+test('stream: a dropped stream is re-attached with Last-Event-ID and the run completes; a replayed overlap is de-duplicated', async () => {
+  let sid;
+  const h = fakeHarness([], {
+    script: () => async (emit) => {
+      emit({ type: 'run.token_delta', data: { text: 'ANSWER: Acme', is_reasoning: false } });
+      await sleep(5);
+      h.drop(sid); // server-side drop mid-run
+      await sleep(5);
+      emit({ type: 'run.token_delta', data: { text: ' runs 40 droplets.', is_reasoning: false } });
+      emit({ type: 'run.completed', data: { total_tokens_in: 1, total_tokens_out: 2 } });
+    },
+  });
+  const { p, events, restore } = setup({ ...BASE_ENV, HARNESS_TOOLS_MODE: 'none' }, h);
+  p.harness.log = quiet;
+  p.harness.cfg.streamBackoffMs = 5;
+  try {
+    await p.warmUp(quiet);
+    sid = p.harness.sessionId;
+    const out = await p.ask('q');
+    assert.equal(out.answer, 'Acme runs 40 droplets.');
+    assert.equal(tokensOf(events), 'Acme runs 40 droplets.', 'no token lost, none doubled');
+    const attaches = h.state.attaches.filter((a) => a.sid === sid);
+    assert.equal(attaches.length, 2, 'exactly one re-attach');
+    assert.equal(attaches[0].since, '', 'first attach: no cursor');
+    assert.match(attaches[1].since, /^ev-\d+$/, 're-attach resumes after the last event rendered');
+    assert.equal(attaches[1].device, attaches[0].device, 'same device id');
+    const st = p.describe().harnessStream;
+    assert.equal(st.attaches, 2);
+    assert.equal(st.drops, 1);
+    assert.match(st.lastError.message, /event stream ended/);
+    // a second question on the re-attached stream works as before
+    assert.equal((await p.ask('q2')).answer, 'Acme runs 40 droplets.');
+  } finally {
+    p.harness.close();
+    restore();
+  }
+  // de-duplication: a stream that re-serves frames already seen (at-least-once delivery) delivers them once
+  const seen = [];
+  const frames = (evs) => evs.map((e) => `id: ${e.event_id}\nevent: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join('');
+  const a = { event_id: 'e1', run_id: 'r1', type: 'run.token_delta', data: { text: 'ANSWER: a' } };
+  const b = { event_id: 'e2', run_id: 'r1', type: 'run.token_delta', data: { text: 'b' } };
+  const c = { event_id: 'e3', run_id: 'r1', type: 'run.completed', data: {} };
+  let n = 0;
+  const fetchImpl = async () => new Response(n++ === 0 ? frames([a, b]) : frames([a, b, c]), { status: 200 });
+  const { SessionStream } = await import('../server/pipeline/harness.js');
+  const st = new SessionStream('s', { url: 'https://h/sessions/s', headers: {}, fetch: fetchImpl, log: quiet, backoffMs: 1 });
+  st.start();
+  await new Promise((resolve) => st.subscribe('r1', (e) => { seen.push(e.event_id); if (e.type === 'run.completed') resolve(); }));
+  assert.deepEqual(seen, ['e1', 'e2', 'e3']);
+  assert.equal(st.lastEventId, 'e3');
+  st.close();
+  assert.equal(st.status().state, 'closed');
+});
+
+test('stream: an empty run id from POST /input is an error (the run could not be followed), reported as a job error with no retry', async () => {
+  const h = fakeHarness(['ANSWER: ok.'], { runIdFor: () => '' });
+  const { p, events, restore } = setup({ ...BASE_ENV, HARNESS_TOOLS_MODE: 'none' }, h);
+  p.harness.log = quiet;
+  try {
+    await assert.rejects(p.ask('q'), (err) => {
+      assert.match(err.message, /Harness input returned no run id/);
+      assert.equal(err.beforeFirstToken, true, 'before the first token: the replay fallback applies upstream');
+      return true;
+    });
+    assert.equal(h.calls.filter((c) => c.url.endsWith('/input')).length, 1, 'the prompt is not re-sent');
+    assert.equal(events.at(-1).type, 'job');
+    assert.equal(events.at(-1).status, 'error');
+    assert.equal(p.activeRun, null);
+  } finally {
+    p.harness.close();
+    restore();
+  }
+});
+
+test('stream: a run that times out without a single event forces a re-attach (zombie attach); the stream is closed when the session is deleted', async () => {
+  const h = fakeHarness([], { hang: true });
+  const { p, restore } = setup({ ...BASE_ENV, HARNESS_TOOLS_MODE: 'none', HARNESS_FIRST_TOKEN_TIMEOUT_MS: '40' }, h);
+  p.harness.log = quiet;
+  p.harness.cfg.streamBackoffMs = 1;
+  try {
+    await p.warmUp(quiet);
+    await assert.rejects(p.ask('q'), /produced nothing within 40 ms/);
+    await sleep(20);
+    const st = p.describe().harnessStream;
+    assert.equal(st.attaches, 2, 're-attached after the empty run');
+    assert.match(st.lastError.message, /re-attach: no events for run run-1/);
+    const sid = p.harness.sessionId;
+    await p.harness.deleteSession(sid);
+    assert.equal(p.harness.streams.has(sid), false);
+    assert.equal(p.describe().harnessStream, null);
+  } finally {
+    p.harness.close();
+    restore();
+  }
+});
+
+test('stream: a 404 on the attach means the session is gone: the run fails as recoverable and is retried on a fresh session', async () => {
+  const h = fakeHarness(['ANSWER: ok.'], { sessions: [{ session_id: 'old', name: 'alexis-anatomy-harness-v4b', status: 'SESSION_STATUS_READY', config_id: CONFIG_ID }] });
+  const base = h.impl;
+  h.impl = async (url, init) => (String(url).endsWith('/events') && String(url).includes('/old/') ? new Response('gone', { status: 404 }) : base(url, init));
+  const { p, restore } = setup({ ...CONFIG_ENV, HARNESS_TOOLS_MODE: 'none' }, h);
+  p.harness.log = quiet;
+  try {
+    await p.warmUp(quiet);
+    const out = await p.ask('q');
+    assert.equal(out.answer, 'ok.');
+    assert.notEqual(p.harness.sessionId, 'old');
+    assert.equal(p.harness.streams.has('old'), false, 'the dead session has no stream');
+    assert.equal(p.describe().harnessStream.sessionId, p.harness.sessionId);
+  } finally {
+    p.harness.close();
+    restore();
+  }
+});
+
+test('stream: rotation warms the new session on its own stream (with a wider liveness window), then closes the old one after the switch', async () => {
+  const base = 'alexis-anatomy-harness-v4b';
+  const h = fakeHarness([], {
+    sessions: [{ session_id: 'old', name: base, status: 'SESSION_STATUS_READY', config_id: CONFIG_ID }],
+    // the warm-up run of a fresh session boots OpenCode first: its first token comes late
+    script: (n, text) => (/ANSWER: ready/.test(text) ? async (emit) => { await sleep(60); emit({ type: 'run.token_delta', data: { text: 'ANSWER: ready', is_reasoning: false } }); emit({ type: 'run.completed', data: {} }); } : { text: 'ANSWER: ok.' }),
+  });
+  const { p, restore } = setup({ ...CONFIG_ENV, HARNESS_TOOLS_MODE: 'none', HARNESS_ROTATE_AFTER: '1', HARNESS_ROTATE_IDLE_MS: '0', HARNESS_FIRST_TOKEN_TIMEOUT_MS: '30' }, h);
+  p.harness.log = quiet;
+  try {
+    await p.warmUp(quiet);
+    await p.ask('q1');
+    assert.ok(p.harness.rotating);
+    for (let i = 0; i < 100 && p.harness.streams.size < 2; i++) await sleep(1); // the target session is created, then attached
+    assert.equal(p.harness.streams.size, 2, 'old session stream + the rotation target stream');
+    const result = await p.harness.rotating;
+    assert.equal(result.ok, true, 'the warm-up run outlived the 30 ms question window: the rotation window is wider');
+    assert.equal(p.harness.streams.size, 1, 'the old stream is closed after the switch');
+    assert.equal(p.harness.streams.has('old'), false);
+    assert.equal(p.describe().harnessStream.sessionId, p.harness.sessionId);
+    assert.equal(h.state.attaches.filter((a) => a.sid === p.harness.sessionId).length, 1);
+    assert.equal((await p.ask('q2')).answer, 'ok.');
+  } finally {
+    p.harness.close();
+    restore();
+  }
+});
+
+test('mcp health is off the critical path: primed at warm-up, cached for MCP_HEALTH_TTL_MS, refreshed in the background when stale', async () => {
+  const h = fakeHarness(['ANSWER: ok.']);
+  const { p, fetches, restore } = setup({ ...BASE_ENV, MCP_HEALTH_TTL_MS: '60000' }, h);
+  p.harness.log = quiet;
+  const healthCalls = () => fetches.filter((f) => f.url.endsWith('/mcp/health')).length;
+  try {
+    await p.warmUp(quiet);
+    await sleep(1);
+    assert.equal(healthCalls(), 1, 'primed at warm-up');
+    assert.equal(p.describe().mcpHealth.ok, true);
+    await p.ask('q1');
+    await p.ask('q2');
+    assert.equal(healthCalls(), 1, 'questions reuse the cached result');
+    // stale: the question goes ahead on the cached value and one refresh runs in the background
+    p.mcpHealth.at = Date.now() - 120000;
+    await p.ask('q3');
+    await sleep(1);
+    assert.equal(healthCalls(), 2, 'one background refresh');
+    assert.ok(Date.now() - p.describe().mcpHealth.at < 1000, 'the cache was refreshed');
+    // TTL 0: every question refreshes in the background, never waits
+    p.cfg.mcpHealthTtlMs = 0;
+    await p.ask('q4');
+    await sleep(1);
+    assert.equal(healthCalls(), 3);
+  } finally {
+    p.harness.close();
+    restore();
+  }
+  // no warm-up: the very first question waits for the one check (the tool path must be decided), later ones do not
+  const h2 = fakeHarness(['ANSWER: ok.']);
+  const s2 = setup(BASE_ENV, h2, { mcpHealthy: false });
+  s2.p.harness.log = quiet;
+  try {
+    const out = await s2.p.ask('q');
+    assert.equal(out.fallback, 'context');
+    assert.match(out.reason, /MCP health HTTP 503/);
+    assert.equal(s2.fetches.filter((f) => f.url.endsWith('/mcp/health')).length, 1);
+    await s2.p.ask('q2');
+    assert.equal(s2.fetches.filter((f) => f.url.endsWith('/mcp/health')).length, 1, 'cached (still unhealthy) within the TTL');
+  } finally {
+    s2.p.harness.close();
+    s2.restore();
   }
 });

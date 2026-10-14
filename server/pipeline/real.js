@@ -8,6 +8,8 @@ import { factId, factKey, notFound } from './facts.js';
 export { pgPoolConfig };
 
 const MCP_HEALTH_TIMEOUT_MS = 1500;
+/** A health result younger than this is reused; a stale one is reused while a refresh runs in the background. */
+const DEFAULT_MCP_HEALTH_TTL_MS = 30000;
 const SEARCH_K = 3;
 
 /** Short, log-safe rendering of tool arguments: search_facts(query=…) */
@@ -83,6 +85,7 @@ export class RealPipeline {
       scoreFloor: scoreFloor(embedding),
       harness: harnessConfig(env),
       mcpToken: env.MCP_AUTH_TOKEN || '',
+      mcpHealthTtlMs: Number(env.MCP_HEALTH_TTL_MS) >= 0 ? Number(env.MCP_HEALTH_TTL_MS) : DEFAULT_MCP_HEALTH_TTL_MS,
       dim: embedding.dim,
     };
     this.harness = new HarnessClient(this.cfg.harness);
@@ -93,6 +96,8 @@ export class RealPipeline {
     this.migration = null; // result of the last embedding migration run at boot (see db()); shown in /api/health
     this.activeRun = null; // the question job currently running in the harness (tool events attach to it)
     this.askQueue = Promise.resolve();
+    this.mcpHealth = null; // last MCP health check { ok, reason?, at }; primed at warm-up, refreshed in the background (see mcpHealthy)
+    this.mcpHealthRefresh = null;
   }
 
   describe() {
@@ -117,6 +122,10 @@ export class RealPipeline {
       harnessRotating: Boolean(this.harness.rotating),
       harnessLastRotation: this.harness.lastRotation,
       harnessLastRotationError: this.harness.lastRotationError,
+      // the persistent event stream of the current session (see HarnessClient.SessionStream)
+      harnessStream: this.harness.streamStatus(),
+      harnessFirstTokenTimeoutMs: h.firstTokenTimeoutMs,
+      mcpHealth: this.mcpHealth,
       toolsMode: h.toolsMode,
       mcp: Boolean(h.mcpUrl),
       inferenceVia: this.inferenceVia(),
@@ -152,6 +161,8 @@ export class RealPipeline {
       return { ok: false, skipped: true, reason: 'HARNESS_API_TOKEN not set' };
     }
     const t0 = Date.now();
+    // prime the MCP health cache now, so no question ever waits for it (never throws)
+    if (this.cfg.harness.toolsMode !== 'none') this.mcpHealthy().catch(() => {});
     try {
       const s = await this.harness.ensureSession();
       const h = this.cfg.harness;
@@ -414,21 +425,36 @@ export class RealPipeline {
     }
   }
 
-  /** `GET <MCP_PUBLIC_URL>/health` with a short timeout: is the tool path reachable? */
-  async mcpHealthy() {
+  /** `GET <MCP_PUBLIC_URL>/health` with a short timeout: is the tool path reachable? Uncached. */
+  async mcpHealthCheck() {
     const url = this.cfg.harness.mcpUrl;
-    if (!url) return { ok: false, reason: 'MCP_PUBLIC_URL not set' };
+    const done = (r) => { this.mcpHealth = { ...r, at: Date.now() }; return this.mcpHealth; };
+    if (!url) return done({ ok: false, reason: 'MCP_PUBLIC_URL not set' });
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), MCP_HEALTH_TIMEOUT_MS);
     try {
       const res = await fetch(`${url}/health`, { signal: ac.signal });
-      if (!res.ok) return { ok: false, reason: `MCP health HTTP ${res.status}` };
-      return { ok: true };
+      if (!res.ok) return done({ ok: false, reason: `MCP health HTTP ${res.status}` });
+      return done({ ok: true });
     } catch (err) {
-      return { ok: false, reason: `MCP health ${ac.signal.aborted ? 'timed out' : err.message}` };
+      return done({ ok: false, reason: `MCP health ${ac.signal.aborted ? 'timed out' : err.message}` });
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  /**
+   * MCP health off the critical path: a result younger than MCP_HEALTH_TTL_MS is reused; an older
+   * one is reused too while one refresh runs in the background. Only the very first check (no
+   * result at all, i.e. the warm-up did not run) is waited for.
+   */
+  async mcpHealthy() {
+    const h = this.mcpHealth;
+    if (!h) return this.mcpHealthRefresh || (this.mcpHealthRefresh = this.mcpHealthCheck().finally(() => { this.mcpHealthRefresh = null; }));
+    if (Date.now() - h.at >= this.cfg.mcpHealthTtlMs && !this.mcpHealthRefresh) {
+      this.mcpHealthRefresh = this.mcpHealthCheck().finally(() => { this.mcpHealthRefresh = null; });
+    }
+    return h;
   }
 
   /**
