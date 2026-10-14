@@ -69,7 +69,13 @@ function servicesFor(h: Health): Service[] {
     { name: 'Managed Postgres', detail: `pgvector · ${p.chunks ?? 0} rows`, up: Boolean(p.database) },
     { name: 'Harness Runtime', detail: p.harness ? `${p.harnessModel ?? 'opencode'} · session ${p.harnessSession ?? ''}` : 'HARNESS_API_TOKEN not set', up: Boolean(p.harness) },
     { name: 'Action Gateway / MCP', detail: `tools mode ${p.toolsMode ?? 'gateway'}${p.mcp ? '' : ' · MCP_PUBLIC_URL not set'}`, up: p.toolsMode === 'none' ? null : Boolean(p.mcp) },
-    { name: 'Serverless Inference', detail: p.inferenceVia === 'harness' ? `${p.harnessModel ?? 'gpt-oss-20b'} · via harness session` : 'needs the harness token', up: p.inferenceVia === 'harness' },
+    {
+      name: 'Serverless Inference',
+      detail: p.inferenceVia
+        ? `${p.harnessModel ?? 'gpt-oss-20b'} · ${p.answerMode === 'search-first' ? `search-first, one round via ${p.searchFirstBackend === 'direct' ? 'direct streaming' : 'harness session'}${p.searchFirstReasoningEffort && p.searchFirstReasoningEffort !== 'off' ? ` (reasoning ${p.searchFirstReasoningEffort})` : ''}` : 'tool path via harness session'}`
+        : 'needs the harness token',
+      up: Boolean(p.inferenceVia),
+    },
     { name: 'Embeddings', detail: String(p.embedding ?? 'local-hash'), up: null },
   ];
 }

@@ -111,16 +111,22 @@ export async function createApp(options = {}) {
   app.delete('/api/facts', factsRoute(() => pipeline.deleteAllFacts()));
   app.delete('/api/facts/:id', factsRoute((req) => pipeline.deleteFact(req.params.id)));
 
-  app.post('/api/ask', (req, res) => {
-    const question = String(req.body?.question || '').trim();
-    if (!question) return res.status(400).json({ ok: false, error: 'question is required' });
-    return runWithFallback('query', () => pipeline.ask(question), res);
-  });
-
   // ---- internal: tool calls reported by the MCP server ----------------------
   // The mcp/ service POSTs here (TOOL_EVENT_URL) for every tool call; the event
   // is attributed to the question job currently running in the harness.
   const toolEventToken = env.MCP_AUTH_TOKEN || '';
+
+  // The answer path is configured by ANSWER_MODE / SEARCH_FIRST_BACKEND / SEARCH_FIRST_REASONING_EFFORT.
+  // For benchmarking, a caller holding the shared secret (x-tool-event-token) may override them per
+  // question with body fields {mode, backend, effort}; everyone else gets the configured path.
+  app.post('/api/ask', (req, res) => {
+    const question = String(req.body?.question || '').trim();
+    if (!question) return res.status(400).json({ ok: false, error: 'question is required' });
+    const { mode, backend, effort } = req.body || {};
+    const wantsOverride = mode !== undefined || backend !== undefined || effort !== undefined;
+    const opts = wantsOverride && tokenEquals(req.get('x-tool-event-token'), toolEventToken) ? { mode, backend, effort } : {};
+    return runWithFallback('query', () => pipeline.ask(question, opts), res);
+  });
   app.post('/api/internal/tool-event', (req, res) => {
     if (!tokenEquals(req.get('x-tool-event-token'), toolEventToken)) return res.status(401).json({ ok: false, error: 'unauthorized' });
     if (typeof pipeline.handleToolEvent !== 'function') return res.status(202).json({ ok: true, accepted: false, reason: `no tool events in ${pipeline.mode} mode` });

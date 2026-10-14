@@ -14,7 +14,7 @@
     "build": "vite build",
     "start": "node server/index.js",
     "start:mcp": "node mcp/index.js",
-    "test": "node --test test/mock-pipeline.test.js test/recorder.test.js test/real-pipeline.test.js test/harness.test.js test/mcp.test.js test/tool-events.test.js test/retrieval.test.js test/migrate.test.js",
+    "test": "node --test test/mock-pipeline.test.js test/recorder.test.js test/real-pipeline.test.js test/harness.test.js test/search-first.test.js test/mcp.test.js test/tool-events.test.js test/retrieval.test.js test/migrate.test.js",
     "migrate:embeddings": "node scripts/migrate-embeddings.js",
     "record:samples": "node scripts/record-samples.js"
   },

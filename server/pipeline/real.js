@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { chunkText } from './embedding.js';
-import { HarnessClient, harnessConfig, buildPrompt, buildToolPrompt, isDontKnow, normalizeToolName, toolTarget, dontKnowText } from './harness.js';
+import { HarnessClient, harnessConfig, buildPrompt, buildToolPrompt, isDontKnow, normalizeToolName, toolTarget, dontKnowText, REASONING_EFFORTS } from './harness.js';
+import { DirectInference } from './direct.js';
 import { pgPoolConfig, embeddingConfig, embedTexts, toVector, cosineSearch, scoreFloor } from './retrieval.js';
 import { migrate } from './migrate.js';
 import { factId, factKey, notFound } from './facts.js';
@@ -11,6 +12,44 @@ const MCP_HEALTH_TIMEOUT_MS = 1500;
 /** A health result younger than this is reused; a stale one is reused while a refresh runs in the background. */
 const DEFAULT_MCP_HEALTH_TTL_MS = 30000;
 const SEARCH_K = 3;
+export const ANSWER_MODES = ['tool', 'search-first'];
+export const SEARCH_FIRST_BACKENDS = ['harness', 'direct'];
+const DEFAULT_ANSWER_MODE = 'tool';
+const DEFAULT_SEARCH_FIRST_BACKEND = 'harness';
+const DEFAULT_SEARCH_FIRST_EFFORT = 'off';
+const DEFAULT_EMBED_CACHE_SIZE = 256;
+
+/**
+ * How a question is answered (see the class docs):
+ *   ANSWER_MODE=tool          the agent in the harness calls search_facts itself (two model rounds + the gateway hop)
+ *   ANSWER_MODE=search-first  the app embeds + searches pgvector at once, then ONE model round writes the answer
+ *     SEARCH_FIRST_BACKEND=harness|direct   where that round runs (Harness Runtime session, or Serverless Inference directly)
+ *     SEARCH_FIRST_REASONING_EFFORT=off|low|medium|high  gpt-oss reasoning effort of that round (`Reasoning: <e>` prompt
+ *       line in the harness, `reasoning_effort` API parameter directly); `off` sends nothing
+ *   EMBED_CACHE_SIZE  query embeddings kept in memory (same question -> no second /embeddings call); 0 disables
+ */
+export function answerConfig(env) {
+  const mode = String(env.ANSWER_MODE || DEFAULT_ANSWER_MODE).trim().toLowerCase().replace(/_/g, '-');
+  const backend = String(env.SEARCH_FIRST_BACKEND || DEFAULT_SEARCH_FIRST_BACKEND).trim().toLowerCase();
+  const effort = String(env.SEARCH_FIRST_REASONING_EFFORT || DEFAULT_SEARCH_FIRST_EFFORT).trim().toLowerCase();
+  const cache = Number(env.EMBED_CACHE_SIZE);
+  return {
+    mode: ANSWER_MODES.includes(mode) ? mode : DEFAULT_ANSWER_MODE,
+    backend: SEARCH_FIRST_BACKENDS.includes(backend) ? backend : DEFAULT_SEARCH_FIRST_BACKEND,
+    effort: REASONING_EFFORTS.includes(effort) ? effort : DEFAULT_SEARCH_FIRST_EFFORT,
+    embedCacheSize: Number.isFinite(cache) && cache >= 0 ? Math.floor(cache) : DEFAULT_EMBED_CACHE_SIZE,
+  };
+}
+
+/** Normalise per-request overrides (POST /api/ask body, authorised callers only): unknown values fall back to the config. */
+export function answerOptions(cfg, opts = {}) {
+  const pick = (v, list, dflt) => { const x = String(v ?? '').trim().toLowerCase().replace(/_/g, '-'); return list.includes(x) ? x : dflt; };
+  return {
+    mode: pick(opts.mode, ANSWER_MODES, cfg.mode),
+    backend: pick(opts.backend, SEARCH_FIRST_BACKENDS, cfg.backend),
+    effort: pick(opts.effort, REASONING_EFFORTS, cfg.effort),
+  };
+}
 
 /** Short, log-safe rendering of tool arguments: search_facts(query=…) */
 export function fmtArgs(args = {}) {
@@ -27,7 +66,7 @@ export function fmtArgs(args = {}) {
  * Ingest: client -> Spaces (PutObject) -> chunk + embed in this App Platform
  *   web service (stage `functions`, kept as the wire name) -> pgvector INSERT.
  *
- * Question flow (the only answer path):
+ * Question flow, ANSWER_MODE=tool (the agent retrieves):
  *   client -> Harness Runtime session (OpenCode + gpt-oss-20b on Serverless Inference)
  *          -> Action Gateway / inline MCP -> anatomy-data MCP server (mcp/)
  *          -> pgvector (search_facts) / Spaces (get_document)
@@ -36,6 +75,17 @@ export function fmtArgs(args = {}) {
  *   question job so the scene can animate it.
  *   search_facts answers NO_MATCHING_FACTS when nothing clears the relevance
  *   floor and the prompt makes the agent reply "I do not know that yet." at once.
+ * Question flow, ANSWER_MODE=search-first (see answerConfig): the app embeds the
+ *   question (query-embedding cache) and searches pgvector at once (stages kb ->
+ *   vectordb -> kb), then exactly ONE model round writes the answer with the
+ *   facts in the prompt (buildPrompt): in the Harness Runtime session
+ *   (SEARCH_FIRST_BACKEND=harness, stage agent + inference, rotation applies) or
+ *   straight on Serverless Inference (SEARCH_FIRST_BACKEND=direct, stage
+ *   inference only: no harness is involved, so the scene shows none). The model
+ *   still writes every answer, also "I do not know that yet." when nothing
+ *   matched; the ANSWER-only filter, the no-marker rule and the language rules
+ *   are the same. A direct round that fails before its first token is retried
+ *   once in the harness (`fallback: "harness"`).
  * Context-in-prompt fallback (still inside the harness): tool path unavailable
  *   (MCP health check fails, HARNESS_TOOLS_MODE=none, or the agent answered
  *   "don't know" after a failed tool call): the app retrieves itself (stages
@@ -84,11 +134,17 @@ export class RealPipeline {
       embedding,
       scoreFloor: scoreFloor(embedding),
       harness: harnessConfig(env),
+      answer: answerConfig(env),
       mcpToken: env.MCP_AUTH_TOKEN || '',
       mcpHealthTtlMs: Number(env.MCP_HEALTH_TTL_MS) >= 0 ? Number(env.MCP_HEALTH_TTL_MS) : DEFAULT_MCP_HEALTH_TTL_MS,
       dim: embedding.dim,
     };
     this.harness = new HarnessClient(this.cfg.harness);
+    // direct Serverless Inference (search-first, SEARCH_FIRST_BACKEND=direct): same model + key as the harness session
+    this.direct = new DirectInference({ url: this.cfg.inference.url, key: this.cfg.harness.inferenceKey || env.DO_INFERENCE_KEY || '', model: this.cfg.harness.model, firstTokenTimeoutMs: this.cfg.harness.firstTokenTimeoutMs, timeoutMs: this.cfg.harness.timeoutMs });
+    // query-embedding cache: normalised question -> vector (insertion-ordered Map used as an LRU)
+    this.embedCache = new Map();
+    this.embedCacheStats = { hits: 0, misses: 0 };
     this._s3 = null;
     this._pool = null;
     this._ready = null;
@@ -129,15 +185,26 @@ export class RealPipeline {
       toolsMode: h.toolsMode,
       mcp: Boolean(h.mcpUrl),
       inferenceVia: this.inferenceVia(),
+      // answer path (see answerConfig)
+      answerMode: this.cfg.answer.mode,
+      searchFirstBackend: this.cfg.answer.backend,
+      searchFirstReasoningEffort: this.cfg.answer.effort,
+      direct: this.direct.status(),
+      embedCache: { size: this.embedCache.size, max: this.cfg.answer.embedCacheSize, ...this.embedCacheStats },
       embedding: this.cfg.inference.embeddingModel || 'local-hash',
       vectorDim: this.cfg.dim,
       scoreFloor: this.cfg.scoreFloor,
     };
   }
 
-  /** How the model is reached: `harness` (Serverless Inference inside the Harness Runtime session) or nothing configured. */
+  /**
+   * How the model is reached: `harness` (Serverless Inference inside the Harness Runtime session), `direct`
+   * (search-first on Serverless Inference with the inference key alone, no harness token) or nothing configured.
+   */
   inferenceVia() {
-    return this.cfg.harness.token ? 'harness' : null;
+    if (this.cfg.harness.token) return 'harness';
+    if (this.cfg.answer.mode === 'search-first' && this.cfg.answer.backend === 'direct' && this.direct.key) return 'direct';
+    return null;
   }
 
   /**
@@ -252,6 +319,29 @@ export class RealPipeline {
 
   async embed(texts) {
     return embedTexts(this.cfg.embedding, texts);
+  }
+
+  /**
+   * Embed one question through the query-embedding cache (EMBED_CACHE_SIZE entries, LRU): the same
+   * question asked again skips the /embeddings round trip. Resolves { vector, cached }.
+   */
+  async embedQuery(question) {
+    const max = this.cfg.answer.embedCacheSize;
+    const key = String(question).trim().toLowerCase().replace(/\s+/g, ' ');
+    if (max > 0 && this.embedCache.has(key)) {
+      const vector = this.embedCache.get(key);
+      this.embedCache.delete(key);
+      this.embedCache.set(key, vector); // most recently used last
+      this.embedCacheStats.hits++;
+      return { vector, cached: true };
+    }
+    this.embedCacheStats.misses++;
+    const [vector] = await this.embed([question]);
+    if (max > 0) {
+      this.embedCache.set(key, vector);
+      while (this.embedCache.size > max) this.embedCache.delete(this.embedCache.keys().next().value);
+    }
+    return { vector, cached: false };
   }
 
   toVector(arr) {
@@ -399,30 +489,133 @@ export class RealPipeline {
 
   // ---- query --------------------------------------------------------------
   /**
-   * Answer a question through the Harness Runtime: the agent retrieves through
-   * the MCP tools itself (see class docs), falling back to context in the
-   * prompt when the tool path is unavailable. Resolves
-   * { jobId, answer, sources, timing: {firstTokenMs, totalMs, toolCalls, reasoningTokens}, backend: 'harness', fallback?, reason? }.
+   * Answer a question. ANSWER_MODE=tool: through the Harness Runtime, the agent
+   * retrieving through the MCP tools itself (see class docs), falling back to
+   * context in the prompt when the tool path is unavailable. ANSWER_MODE=search-first:
+   * the app searches first, then one model round (askSearchFirst). `opts` are the
+   * authorised per-request overrides { mode, backend, effort } (see answerOptions).
+   * Resolves { jobId, answer, sources, timing: {firstTokenMs, totalMs, toolCalls, reasoningTokens, ...},
+   * backend: 'harness' | 'direct', answerMode: 'tool' | 'search-first', fallback?, reason? }
+   * (`mode` is the pipeline mode in the HTTP response, so the answer path is `answerMode`).
    */
-  async ask(question) {
+  async ask(question, opts = {}) {
     const jobId = randomUUID();
     const ev = this.bus.forJob(jobId, 'query');
     const t0 = Date.now();
-    ev.job('start', { input: question });
+    const o = answerOptions(this.cfg.answer, opts);
+    ev.job('start', { input: question, answerMode: o.mode, ...(o.mode === 'search-first' ? { backend: o.backend, effort: o.effort } : {}) });
     try {
-      if (!this.inferenceVia()) throw new Error('HARNESS_API_TOKEN missing (or DIGITALOCEAN_ACCESS_TOKEN): questions are answered by the Harness Runtime session');
-      // one harness run at a time so tool events are attributed to the right job
-      const run = this.askQueue.then(() => this.askViaHarness(question, ev, jobId, t0));
-      this.askQueue = run.catch(() => {});
+      let run;
+      if (o.mode === 'search-first') {
+        if (o.backend === 'harness' && !this.cfg.harness.token) throw new Error('HARNESS_API_TOKEN missing (or DIGITALOCEAN_ACCESS_TOKEN): the search-first model round runs in the Harness Runtime session (SEARCH_FIRST_BACKEND=harness)');
+        if (o.backend === 'direct' && !this.direct.key) throw new Error('HARNESS_INFERENCE_API_KEY missing (or DO_INFERENCE_KEY): the search-first model round runs on Serverless Inference directly (SEARCH_FIRST_BACKEND=direct)');
+        // the search runs at once (not queued behind a tool-path question); the harness round queues itself per session
+        run = this.askSearchFirst(question, ev, jobId, t0, o);
+      } else {
+        if (!this.cfg.harness.token) throw new Error('HARNESS_API_TOKEN missing (or DIGITALOCEAN_ACCESS_TOKEN): questions are answered by the Harness Runtime session');
+        // one harness run at a time so tool events are attributed to the right job
+        run = this.askQueue.then(() => this.askViaHarness(question, ev, jobId, t0));
+        this.askQueue = run.catch(() => {});
+      }
       const result = await run;
       const { answer, sources } = result;
       ev.answer(answer, sources);
-      ev.job('done', { answer, sources, timing: result.timing, backend: result.backend, fallback: result.fallback, reason: result.reason });
+      ev.job('done', { answer, sources, timing: result.timing, backend: result.backend, answerMode: result.answerMode, fallback: result.fallback, reason: result.reason });
       return { jobId, ...result };
     } catch (err) {
       ev.job('error', { message: err.message });
       throw Object.assign(err, { jobId, flow: 'query' });
     }
+  }
+
+  /**
+   * Search-first answer flow: embed + pgvector search immediately (stages kb -> vectordb -> kb,
+   * query-embedding cache), then exactly ONE model round that writes the answer with the facts in
+   * the prompt. `backend` = `harness` (the Harness Runtime session; stage agent, rotation applies)
+   * or `direct` (Serverless Inference streaming, no harness and so no agent stage). With no hits
+   * the model still writes the "don't know" line from an empty context. Returns
+   * { answer, sources, backend, answerMode: 'search-first', timing, fallback, reason }.
+   */
+  async askSearchFirst(question, ev, jobId, t0, { backend, effort }) {
+    const h = this.cfg.harness;
+    const dontKnow = dontKnowText(question);
+    let firstTokenMs = null;
+    let streamed = 0;
+    let reasoningTokens = 0;
+    let modelStartedMs = null; // response headers (direct) / run.started (harness)
+    let modelFirstMs = null; // first visible answer token
+    const forward = (token, index) => {
+      if (firstTokenMs == null) firstTokenMs = Date.now() - t0;
+      streamed++;
+      ev.stage('inference', 'progress', '', { token, index });
+    };
+    const label = backend === 'direct' ? `Serverless Inference (${h.model}, direct)` : `Harness Runtime (OpenCode, ${h.model})`;
+    const via = backend;
+    if (backend === 'harness') {
+      ev.stage('agent', 'start', `${label} answering search-first: the app searches pgvector first, the facts go in the prompt, one model round writes the answer`, { via, mode: 'search-first', backend, session: h.sessionName, toolsMode: 'none', model: h.model, effort });
+    }
+    // 1. the search, at once (overlapping the warm session / connection checks, which cost nothing when warm)
+    const warm = backend === 'harness' ? this.harness.ensureSession().catch(() => null) : null;
+    const tSearch = Date.now();
+    const info = {};
+    const found = await this.retrieve(question, ev, info);
+    const searchMs = Date.now() - tSearch;
+    const embedCached = Boolean(info.cached);
+    const sources = found;
+    const context = sources.map((s, i) => `[${i + 1}] ${s.chunk}`).join('\n');
+    const prompt = buildPrompt(question, context, { effort: backend === 'harness' ? effort : '' });
+    // 2. one model round
+    let out = null;
+    let fallback = null;
+    let reason = null;
+    let usedBackend = backend;
+    const timing = () => ({ firstTokenMs, totalMs: Date.now() - t0, toolCalls: 0, reasoningTokens, searchMs, embedCached, modelStartedMs, modelFirstMs, hits: sources.length });
+    const harnessRound = async (why) => {
+      if (warm) await warm;
+      ev.stage('inference', 'start', `Serverless inference via harness: ${h.model}${why ? ` · ${why}` : ''}`, { model: h.model, via: 'harness', toolsMode: 'none', mode: 'search-first', effort });
+      const r = await this.harness.ask(prompt, {
+        onSession: (s) => ev.stage('agent', 'progress', s.created ? `Harness session ${s.name} created (manifest ${s.hash})` : `Harness session ${s.name} ready`, { step: 'session', created: s.created, name: s.name, via: 'harness', toolsMode: 'none', hash: s.hash }),
+        onStarted: (ms) => { modelStartedMs = ms; ev.stage('agent', 'progress', `Harness run started (+${ms} ms) · search-first`, { step: 'run', ms, via: 'harness' }); },
+        onToken: (tok, i) => { if (modelFirstMs == null) modelFirstMs = Date.now() - t0; forward(tok, i); },
+      });
+      reasoningTokens += r.reasoningTokens || 0;
+      return r;
+    };
+    if (backend === 'direct') {
+      ev.stage('inference', 'start', `Serverless Inference direct: ${h.model} (streaming, ${effort === 'off' ? 'default reasoning' : `reasoning ${effort}`})`, { model: h.model, via: 'direct', mode: 'search-first', effort });
+      try {
+        out = await this.direct.ask(prompt, {
+          effort,
+          t0,
+          onStarted: (ms, info) => { modelStartedMs = ms; ev.stage('inference', 'progress', `Serverless Inference responded (+${ms} ms${info?.reused ? ', connection reused' : ''})`, { step: 'headers', ms, reused: Boolean(info?.reused), via: 'direct' }); },
+          onToken: (tok, i) => { if (modelFirstMs == null) modelFirstMs = Date.now() - t0; forward(tok, i); },
+        });
+        reasoningTokens += out.reasoningTokens || 0;
+      } catch (err) {
+        if (!(err.beforeFirstToken && h.token)) throw err;
+        // nothing was shown yet: the same single round in the harness session instead
+        ev.stage('inference', 'progress', `Direct inference failed before its first token (${err.message}); retrying the same round in the harness`, { fallback: 'harness', reason: err.message, via: 'direct' });
+        fallback = 'harness';
+        reason = err.message;
+        usedBackend = 'harness';
+        ev.stage('agent', 'start', `Harness Runtime (OpenCode, ${h.model}) answering search-first (direct inference failed)`, { via: 'harness', mode: 'search-first', backend: 'harness', session: h.sessionName, toolsMode: 'none', model: h.model, fallback, reason });
+        out = await harnessRound('direct inference failed');
+      }
+    } else {
+      out = await harnessRound('');
+    }
+    let answer = out.text;
+    if (!answer || out.noMarker) {
+      // same rule as every other path: no ANSWER: line means no answer; reasoning is never shown
+      ev.stage(usedBackend === 'harness' ? 'agent' : 'inference', 'progress', `Model produced no ANSWER: line: answering "${dontKnow}"`, { noMarker: true, via: usedBackend, mode: 'search-first' });
+      if (streamed === 0) forward(dontKnow, 0);
+      answer = dontKnow;
+      reason = reason || 'no ANSWER: line';
+    }
+    const t = timing();
+    ev.stage('inference', 'done', 'Completed (search-first, one model round)', { model: out.model || h.model, tokens: out.tokens, via: usedBackend, mode: 'search-first', ...t });
+    if (usedBackend === 'harness') ev.stage('agent', 'done', `Harness answered search-first (first token ${t.firstTokenMs ?? '—'} ms, total ${t.totalMs} ms, search ${searchMs} ms${embedCached ? ', embedding cached' : ''}${t.reasoningTokens ? `, ${t.reasoningTokens} reasoning tokens` : ''})`, { via: 'harness', mode: 'search-first', ...t, runId: out.runId, backend: usedBackend, fallback, reason });
+    return { answer, sources, backend: usedBackend, answerMode: 'search-first', timing: timing(), fallback, reason };
   }
 
   /** `GET <MCP_PUBLIC_URL>/health` with a short timeout: is the tool path reachable? Uncached. */
@@ -589,7 +782,7 @@ export class RealPipeline {
       ev.stage('inference', 'done', fallback === 'guard' ? 'Completed without a second model run (no matching facts)' : 'Completed', { model: harnessOut.model || h.model, tokens: fallback === 'guard' ? 1 : harnessOut.tokens, via: 'harness', ...t });
       ev.stage('agent', 'done', `Harness answered (first token ${t.firstTokenMs ?? '—'} ms, total ${t.totalMs} ms, ${t.toolCalls} tool call${t.toolCalls === 1 ? '' : 's'}${t.reasoningTokens ? `, ${t.reasoningTokens} reasoning tokens` : ''})`, { via: 'harness', ...t, runId: harnessOut.runId, backend, fallback, reason });
       if (!answer) answer = dontKnow;
-      return { answer, sources, backend, timing: timing(), fallback, reason };
+      return { answer, sources, backend, answerMode: 'tool', timing: timing(), fallback, reason };
     } finally {
       if (this.activeRun === run) this.activeRun = null;
     }
@@ -704,7 +897,7 @@ export class RealPipeline {
     const t0 = Date.now();
     this.reportTool(run, { ...call, phase: 'start' }, 'app');
     try {
-      const [qvec] = await this.embed([question]);
+      const { vector: qvec } = await this.embedQuery(question);
       const pool = await this.db();
       const hits = await cosineSearch(pool, this.cfg.table, qvec, SEARCH_K, this.cfg.scoreFloor);
       this.reportTool(run, { ...call, phase: 'done', ms: Date.now() - t0, hits, summary: `${hits.length} hit${hits.length === 1 ? '' : 's'}` }, 'app');
@@ -715,16 +908,23 @@ export class RealPipeline {
     }
   }
 
-  /** Embed the question and run a cosine top-3 search in pgvector, emitting kb/vectordb stage events (app-side retrieval). */
-  async retrieve(question, ev) {
+  /**
+   * Embed the question (query-embedding cache) and run a cosine top-3 search in pgvector, emitting
+   * kb/vectordb stage events (app-side retrieval: search-first path and the context-in-prompt fallback).
+   * `info.cached` reports whether the query embedding came from the cache.
+   */
+  async retrieve(question, ev, info = {}) {
+    const t0 = Date.now();
     ev.stage('kb', 'start', 'App-side retrieval: embedding the question', { question });
-    const [qvec] = await this.embed([question]);
-    ev.stage('kb', 'progress', 'Query embedded', { step: 'embed' });
+    const { vector: qvec, cached } = await this.embedQuery(question);
+    info.cached = cached;
+    ev.stage('kb', 'progress', cached ? `Query embedding reused from the cache (${Date.now() - t0} ms)` : `Query embedded (${this.cfg.dim} dims, ${Date.now() - t0} ms)`, { step: 'embed', cached, ms: Date.now() - t0 });
+    const tq = Date.now();
     ev.stage('vectordb', 'start', 'pgvector cosine search, top 3', { op: 'search' });
     const pool = await this.db();
     const sources = await cosineSearch(pool, this.cfg.table, qvec, 3, this.cfg.scoreFloor);
-    ev.stage('vectordb', 'done', `${sources.length} relevant chunk${sources.length === 1 ? '' : 's'} retrieved`, { count: this.count, hits: sources.map((s) => ({ id: s.id, score: s.score })), op: 'search' });
-    ev.stage('kb', 'done', `Context assembled from ${sources.length} chunk${sources.length === 1 ? '' : 's'}`, { hits: sources.length });
+    ev.stage('vectordb', 'done', `${sources.length} relevant chunk${sources.length === 1 ? '' : 's'} retrieved · ${Date.now() - tq} ms`, { count: this.count, hits: sources.map((s) => ({ id: s.id, score: s.score })), op: 'search', ms: Date.now() - tq });
+    ev.stage('kb', 'done', `Context assembled from ${sources.length} chunk${sources.length === 1 ? '' : 's'} (${Date.now() - t0} ms)`, { hits: sources.length, ms: Date.now() - t0, cached });
     return sources;
   }
 }
