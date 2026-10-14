@@ -24,7 +24,7 @@ import express from 'express';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { cosineSearch, createPool, embedTexts, embeddingConfig, DONT_KNOW_TEXT, NO_MATCHING_FACTS } from '../server/pipeline/retrieval.js';
+import { cosineSearch, createPool, embedTexts, embeddingConfig, scoreFloor, DONT_KNOW_TEXT, NO_MATCHING_FACTS } from '../server/pipeline/retrieval.js';
 import { tokenEquals } from '../server/auth.js';
 
 export const SERVER_NAME = 'anatomy-data';
@@ -39,6 +39,8 @@ export function mcpConfig(env) {
     token: env.MCP_AUTH_TOKEN || '',
     table: env.PGVECTOR_TABLE || 'anatomy_chunks',
     embedding: embeddingConfig(env),
+    // relevance floor matching the embedder: SCORE_FLOOR for a hosted model, LOCAL_SCORE_FLOOR for the local hash
+    scoreFloor: scoreFloor(embeddingConfig(env)),
     spaces: {
       key: env.DO_SPACES_KEY,
       secret: env.DO_SPACES_SECRET,
@@ -94,10 +96,10 @@ export function buildMcpServer(cfg, deps, emit) {
       emit({ phase: 'start', callId, tool: 'search_facts', args, target: 'pgvector' });
       try {
         const [qvec] = await deps.embed([query]);
-        const hits = await cosineSearch(deps, cfg.table, qvec, args.k);
+        const hits = await cosineSearch(deps, cfg.table, qvec, args.k, cfg.scoreFloor);
         const ms = Date.now() - t0;
         emit({ phase: 'done', callId, tool: 'search_facts', args, target: 'pgvector', ms, hits: hits.map((h) => ({ id: h.id, score: h.score, chunk: h.chunk, object_key: h.object_key })), summary: `${hits.length} hit${hits.length === 1 ? '' : 's'}` });
-        // no hit above SCORE_FLOOR: a short plain marker instead of "[]" so the model answers at once
+        // no hit above the relevance floor: a short plain marker instead of "[]" so the model answers at once
         return { content: [{ type: 'text', text: hits.length ? JSON.stringify(hits) : NO_MATCHING_FACTS }], structuredContent: { hits } };
       } catch (err) {
         emit({ phase: 'error', callId, tool: 'search_facts', args, target: 'pgvector', ms: Date.now() - t0, error: err.message });

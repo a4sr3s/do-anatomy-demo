@@ -223,3 +223,81 @@ test('real pipeline: deleteAllFacts removes every row (known keys + legacy rows)
   assert.deepEqual({ facts: none.facts, removed: none.removed }, { facts: 0, removed: 0 });
   assert.equal(empty.sent.length, 0);
 });
+
+test('real pipeline: search floor and inference key follow the embedder config', () => {
+  const bus = new EventBus();
+  const local = new RealPipeline(bus, {});
+  assert.equal(local.cfg.scoreFloor, 0.08);
+  assert.equal(local.describe().scoreFloor, 0.08);
+  assert.equal(local.describe().vectorDim, 128);
+  const hosted = new RealPipeline(bus, { DO_EMBEDDING_MODEL: 'bge-m3', HARNESS_INFERENCE_API_KEY: 'h' });
+  assert.equal(hosted.cfg.scoreFloor, 0.52);
+  assert.equal(hosted.describe().vectorDim, 1024);
+  assert.equal(hosted.describe().inference, true, 'the harness inference key serves /embeddings too');
+  assert.equal(hosted.cfg.embedding.key, 'h');
+});
+
+test('real pipeline: db() runs the embedding migration after CREATE TABLE; errors are recorded, never thrown; the MCP server never migrates', async () => {
+  const bus = new EventBus();
+  const makePool = (type, rows) => {
+    const pool = { queries: [], type, rows: rows.map((r) => ({ ...r })) };
+    pool.query = async (sql, params = []) => {
+      pool.queries.push(sql);
+      if (/pg_attribute/.test(sql)) return { rows: [{ type: pool.type }] };
+      if (/^ALTER TABLE/.test(sql)) { pool.type = 'vector(1024)'; for (const r of pool.rows) r.embedding = null; return { rows: [] }; }
+      if (/WHERE embedding IS NULL/.test(sql)) return { rows: pool.rows.filter((r) => r.embedding == null) };
+      if (/^UPDATE/.test(sql)) { pool.rows.find((r) => r.id === params[1]).embedding = params[0]; return {}; }
+      if (/count\(DISTINCT object_key\)/.test(sql)) return { rows: [{ rows: pool.rows.length, facts: new Set(pool.rows.map((r) => r.object_key)).size }] };
+      if (/count\(\*\)::int AS n/.test(sql)) return { rows: [{ n: pool.rows.length }] };
+      return { rows: [] };
+    };
+    pool.end = async () => {};
+    return pool;
+  };
+  const logs = [];
+  const log = { log: (m) => logs.push(m), error: (m) => logs.push(`ERR ${m}`) };
+  // stub pg so no network is touched
+  const p = new RealPipeline(bus, { DATABASE_URL: 'postgres://stub', DO_EMBEDDING_MODEL: 'bge-m3', DO_INFERENCE_KEY: 'k' });
+  const pool = makePool('vector(128)', [{ id: 1, chunk: 'a', object_key: 'facts/1.txt', embedding: '[old]' }, { id: 2, chunk: 'b', object_key: 'facts/2.txt', embedding: '[old]' }]);
+  p.embed = async (texts) => texts.map(() => new Array(1024).fill(0.5));
+  const origMigrate = p.migrateEmbeddings.bind(p);
+  p.migrateEmbeddings = (pl) => origMigrate(pl, log);
+  const realDb = p.db;
+  p.db = async function () {
+    if (this._pool) return this._pool;
+    this._pool = pool;
+    this._ready = (async () => {
+      await pool.query('CREATE EXTENSION IF NOT EXISTS vector');
+      await pool.query(`CREATE TABLE IF NOT EXISTS ${this.cfg.table} (...)`);
+      await this.migrateEmbeddings(pool);
+      const r = await pool.query(`SELECT count(*)::int AS n FROM ${this.cfg.table}`);
+      this.count = r.rows[0].n;
+    })();
+    await this._ready;
+    return pool;
+  };
+  assert.equal(p.migration, null, 'nothing before the first db() call');
+  const out = await p.prepareDb(log);
+  assert.equal(out.ok, true);
+  assert.equal(p.migration.ok, true);
+  assert.deepEqual({ facts: p.migration.facts, rows: p.migration.rows, dim: p.migration.dim, previousDim: p.migration.previousDim, recreated: p.migration.recreated, reembedded: p.migration.reembedded, embedding: p.migration.embedding }, { facts: 2, rows: 2, dim: 1024, previousDim: 128, recreated: true, reembedded: 2, embedding: 'bge-m3' });
+  assert.ok(logs.some((m) => /^\[migrate\] facts=2 rows=2 dim=1024/.test(m)), logs.join('\n'));
+  assert.ok(pool.queries.findIndex((q) => /CREATE TABLE/.test(q)) < pool.queries.findIndex((q) => /pg_attribute/.test(q)), 'migration runs after CREATE TABLE');
+  assert.equal(p.count, 2);
+  assert.equal(typeof realDb, 'function');
+
+  // a failing migration is recorded and logged but db() still resolves
+  const bad = new RealPipeline(bus, { DATABASE_URL: 'postgres://stub' });
+  const badPool = { query: async (sql) => { if (/pg_attribute/.test(sql)) throw new Error('permission denied for pg_attribute'); return { rows: [{ n: 0 }] }; }, end: async () => {} };
+  await bad.migrateEmbeddings(badPool, log);
+  assert.equal(bad.migration.ok, false);
+  assert.match(bad.migration.error, /permission denied/);
+  assert.match(logs.at(-1), /^ERR \[migrate\] failed: permission denied/);
+
+  // no DATABASE_URL -> skipped, never throws
+  assert.deepEqual(await new RealPipeline(bus, {}).prepareDb(log), { ok: false, skipped: true, reason: 'DATABASE_URL not set' });
+
+  // the MCP server has no migration code path
+  const mcpSrc = await import('node:fs').then((fs) => fs.readFileSync(new URL('../mcp/server.js', import.meta.url), 'utf8'));
+  assert.ok(!/migrate/.test(mcpSrc), 'mcp/server.js never imports or runs the migration');
+});

@@ -24,14 +24,20 @@
  *        plus tool-call events whose exact names are forwarded as-is)
  */
 import { createHash } from 'node:crypto';
-import { DONT_KNOW_TEXT } from './retrieval.js';
+import { DONT_KNOW_TEXT, DONT_KNOW_TEXT_ES, dontKnowText, looksSpanish } from './retrieval.js';
 
-export { DONT_KNOW_TEXT };
+export { DONT_KNOW_TEXT, DONT_KNOW_TEXT_ES, dontKnowText, looksSpanish };
 
 const API = 'https://api.digitalocean.com/v2/agents/sessions';
 const MARKER = 'ANSWER:';
 /** Shared by both prompts: the session is long-lived, so earlier turns can describe facts that no longer exist. */
 const STALE_TURNS = 'Facts can be added or deleted at any time, so everything from earlier turns is stale and must never be used.';
+/**
+ * Shared by both prompts: the audience may ask in Spanish (or any language). The
+ * answer follows the question's language; the fixed "don't know" line is
+ * localised the same way, but the ANSWER: marker never changes.
+ */
+const LANGUAGE_RULE = `Write the answer in the same language as the question (an English question gets an English answer, a Spanish question a Spanish answer, and so on); the "don't know" line is translated the same way (English "${DONT_KNOW_TEXT}", Spanish "${DONT_KNOW_TEXT_ES}") but always starts with "${MARKER}".`;
 export const MCP_SERVER_NAME = 'anatomy-data';
 export const MCP_TOOLS = ['search_facts', 'get_document'];
 export const MCP_SECRET_SLOT = 'ANATOMY_MCP_TOKEN';
@@ -147,11 +153,13 @@ export function buildManifest(cfg, name = cfg.sessionName) {
 
 /** Context-in-prompt (fallback 1 / tools mode none / the single run after the app-side guard search). */
 export function buildPrompt(question, context) {
+  const dk = dontKnowText(question);
   return [
     'You are the answering step of a retrieval pipeline. Ignore all earlier turns in this conversation and do not use any tools.',
     `${STALE_TURNS} The context below is the only source of truth for this turn.`,
-    `Answer the question using ONLY the context below. If the context is empty or does not contain the answer, reply exactly "${MARKER} ${DONT_KNOW_TEXT}" (say that you do not know that yet).`,
+    `Answer the question using ONLY the context below. If the context is empty or does not contain the answer, reply exactly "${MARKER} ${dk}" (say that you do not know that yet).`,
     `Reply with a single line that starts with "${MARKER}" followed by a concise answer (one or two sentences).`,
+    LANGUAGE_RULE,
     '',
     'Context:',
     context || '(none)',
@@ -169,14 +177,16 @@ export function buildPrompt(question, context) {
 export function buildToolPrompt(question, { gateway = false } = {}) {
   const search = gateway ? 'the search_facts tool' : `${MCP_SERVER_NAME}/search_facts`;
   const doc = gateway ? 'get_document' : `${MCP_SERVER_NAME}/get_document`;
+  const dk = dontKnowText(question);
   return [
     'You are the answering step of a retrieval pipeline. Ignore all earlier turns in this conversation.',
     `${STALE_TURNS} Never answer from memory or from an earlier turn, even if the same question was asked before.`,
-    `You MUST call ${search} in this turn, exactly once, with the question below as the query (k=3), before answering. Never call it a second time, with any query. Call ${doc} only if a hit is truncated and you need its full text.`,
+    `You MUST call ${search} in this turn, exactly once, with the question below as the query (k=3), before answering. Pass the question as \`query\` exactly as the user wrote it, in its own language: never translate, rephrase or shorten it (the embedder is multilingual). Never call it a second time, with any query. Call ${doc} only if a hit is truncated and you need its full text.`,
     'Do not use any other tool, do not run commands, do not read or write files, do not browse.',
-    `If the search result starts with "NO_MATCHING_FACTS", immediately reply with the single line "${MARKER} ${DONT_KNOW_TEXT}" and nothing else: no further tool calls, no reasoning, no rephrased search.`,
-    `Otherwise answer ONLY from this turn's tool results. If they do not contain the answer, reply with that same line: "${MARKER} ${DONT_KNOW_TEXT}".`,
+    `If the search result starts with "NO_MATCHING_FACTS", immediately reply with the single line "${MARKER} ${dk}" and nothing else: no further tool calls, no reasoning, no rephrased search.`,
+    `Otherwise answer ONLY from this turn's tool results. If they do not contain the answer, reply with that same line: "${MARKER} ${dk}".`,
     `After the tool call, reply with a single final line that starts with "${MARKER}" followed by a concise answer (one or two sentences).`,
+    LANGUAGE_RULE,
     '',
     `Question: ${question}`,
   ].join('\n');
@@ -184,7 +194,12 @@ export function buildToolPrompt(question, { gateway = false } = {}) {
 
 /** Heuristic for a "no answer" reply, used to decide whether a run whose tool call failed is retried with context in the prompt. */
 export function isDontKnow(text) {
-  return !String(text || '').trim() || /\b(don'?t|do not|does not|doesn'?t|did not|not) (know|have|find|contain)|no (relevant )?(information|facts?|results?|context)|couldn'?t find|cannot find|unable to find|nothing relevant|not (yet )?(available|known)/i.test(text);
+  const t = String(text || '');
+  if (!t.trim()) return true;
+  if (/\b(don'?t|do not|does not|doesn'?t|did not|not) (know|have|find|contain)|no (relevant )?(information|facts?|results?|context)|couldn'?t find|cannot find|unable to find|nothing relevant|not (yet )?(available|known)/i.test(t)) return true;
+  // Spanish: "Todavía no lo sé.", "No lo sé", "no tengo (esa) información", "no hay datos / resultados", "no encuentro"
+  // (JS `\b` ignores accented letters, so the boundaries are spelled out)
+  return /(?:^|[^a-záéíóúñ])(?:no (?:lo )?s[eé]|(?:todav[ií]a|a[uú]n) no|no (?:tengo|hay|encuentro|contiene)|sin (?:informaci[oó]n|datos|resultados))(?![a-záéíóúñ])/i.test(t);
 }
 
 /**

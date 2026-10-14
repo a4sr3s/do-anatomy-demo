@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { chunkText } from './embedding.js';
-import { HarnessClient, harnessConfig, buildPrompt, buildToolPrompt, isDontKnow, normalizeToolName, toolTarget, DONT_KNOW_TEXT } from './harness.js';
-import { pgPoolConfig, embeddingConfig, embedTexts, toVector, cosineSearch } from './retrieval.js';
+import { HarnessClient, harnessConfig, buildPrompt, buildToolPrompt, isDontKnow, normalizeToolName, toolTarget, dontKnowText } from './harness.js';
+import { pgPoolConfig, embeddingConfig, embedTexts, toVector, cosineSearch, scoreFloor } from './retrieval.js';
+import { migrate } from './migrate.js';
 import { factId, factKey, notFound } from './facts.js';
 
 export { pgPoolConfig };
@@ -75,10 +76,11 @@ export class RealPipeline {
       // answer generation always happens inside the harness session.
       inference: {
         url: embedding.url,
-        key: env.DO_INFERENCE_KEY,
+        key: embedding.key,
         embeddingModel: embedding.embeddingModel,
       },
       embedding,
+      scoreFloor: scoreFloor(embedding),
       harness: harnessConfig(env),
       mcpToken: env.MCP_AUTH_TOKEN || '',
       dim: embedding.dim,
@@ -88,6 +90,7 @@ export class RealPipeline {
     this._pool = null;
     this._ready = null;
     this.count = 0;
+    this.migration = null; // result of the last embedding migration run at boot (see db()); shown in /api/health
     this.activeRun = null; // the question job currently running in the harness (tool events attach to it)
     this.askQueue = Promise.resolve();
   }
@@ -108,6 +111,8 @@ export class RealPipeline {
       mcp: Boolean(h.mcpUrl),
       inferenceVia: this.inferenceVia(),
       embedding: this.cfg.inference.embeddingModel || 'local-hash',
+      vectorDim: this.cfg.dim,
+      scoreFloor: this.cfg.scoreFloor,
     };
   }
 
@@ -160,6 +165,10 @@ export class RealPipeline {
       await pool.query(
         `CREATE TABLE IF NOT EXISTS ${this.cfg.table} (id serial PRIMARY KEY, chunk text NOT NULL, object_key text, embedding vector(${this.cfg.dim}), created_at timestamptz DEFAULT now())`
       );
+      // Embedding migration (only the web service runs it; the MCP server never touches the schema):
+      // an existing table whose vector(dim) differs from the configured embedder is recreated and
+      // every NULL embedding is re-embedded. Never fatal: a failure is logged and shown in /api/health.
+      await this.migrateEmbeddings(pool);
       const r = await pool.query(`SELECT count(*)::int AS n FROM ${this.cfg.table}`);
       this.count = r.rows[0].n;
     })();
@@ -174,6 +183,39 @@ export class RealPipeline {
       throw err;
     }
     return pool;
+  }
+
+  /** Run the idempotent embedding migration on `pool`; records the result (or the error) on `this.migration`. */
+  async migrateEmbeddings(pool, log = console) {
+    const cfg = this.cfg.embedding;
+    const startedAt = new Date().toISOString();
+    try {
+      const out = await migrate(pool, cfg, (texts) => this.embed(texts), { table: this.cfg.table, log });
+      this.migration = { ok: true, startedAt, embedding: cfg.embeddingModel || 'local-hash', ...out };
+    } catch (err) {
+      log.error(`[migrate] failed: ${err.message}`);
+      this.migration = { ok: false, startedAt, embedding: cfg.embeddingModel || 'local-hash', dim: cfg.dim, error: err.message };
+    }
+    return this.migration;
+  }
+
+  /**
+   * Boot-time database preparation: open the pool now (creating the table and
+   * running the embedding migration) instead of on the first request. Never
+   * throws; resolves { ok, skipped?, migration?, error? }.
+   */
+  async prepareDb(log = console) {
+    if (!this.cfg.databaseUrl) {
+      log.log('[migrate] skipped: DATABASE_URL not set');
+      return { ok: false, skipped: true, reason: 'DATABASE_URL not set' };
+    }
+    try {
+      await this.db();
+      return { ok: Boolean(this.migration?.ok), migration: this.migration };
+    } catch (err) {
+      log.error(`[migrate] database not ready: ${err.message}`);
+      return { ok: false, error: err.message, migration: this.migration };
+    }
   }
 
   async embed(texts) {
@@ -374,6 +416,7 @@ export class RealPipeline {
    */
   async askViaHarness(question, ev, jobId, t0) {
     const h = this.cfg.harness;
+    const dontKnow = dontKnowText(question); // the fixed answer in the question's language (Spanish or English)
     const run = { jobId, ev, toolCalls: 0, toolDone: 0, toolErrors: 0, harnessToolEvents: 0, invalidToolEvents: 0, hits: [], seen: new Set() };
     this.activeRun = run;
     let firstTokenMs = null;
@@ -431,9 +474,9 @@ export class RealPipeline {
       reason = because || null;
       if (clean(harnessOut)) { answer = harnessOut.text; return; }
       // same rule as the tool path: no ANSWER: line means no answer; reasoning is never shown
-      ev.stage('agent', 'progress', `Context run produced no ANSWER: line: answering "${DONT_KNOW_TEXT}"`, { fallback, reason, noMarker: true, via: 'harness' });
-      if (streamed === 0) forward(DONT_KNOW_TEXT, 0);
-      answer = DONT_KNOW_TEXT;
+      ev.stage('agent', 'progress', `Context run produced no ANSWER: line: answering "${dontKnow}"`, { fallback, reason, noMarker: true, via: 'harness' });
+      if (streamed === 0) forward(dontKnow, 0);
+      answer = dontKnow;
     };
 
     try {
@@ -469,9 +512,9 @@ export class RealPipeline {
             fallback = 'guard';
             reason = `${why}, no matching facts`;
             sources = [];
-            ev.stage('agent', 'progress', `No matching facts: answering "${DONT_KNOW_TEXT}" without a second model run`, { fallback, reason, via: 'harness' });
-            forward(DONT_KNOW_TEXT, 0);
-            answer = DONT_KNOW_TEXT;
+            ev.stage('agent', 'progress', `No matching facts: answering "${dontKnow}" without a second model run`, { fallback, reason, via: 'harness' });
+            forward(dontKnow, 0);
+            answer = dontKnow;
           } else {
             ev.stage('agent', 'progress', `${found.length} matching chunk${found.length === 1 ? '' : 's'}: one model run with the context passed in prompt`, { fallback: 'context', reason: why, hits: found.length, via: 'harness' });
             await contextRun(`context (${why})`, 'context', why, found);
@@ -492,7 +535,7 @@ export class RealPipeline {
       const t = timing();
       ev.stage('inference', 'done', fallback === 'guard' ? 'Completed without a second model run (no matching facts)' : 'Completed', { model: harnessOut.model || h.model, tokens: fallback === 'guard' ? 1 : harnessOut.tokens, via: 'harness', ...t });
       ev.stage('agent', 'done', `Harness answered (first token ${t.firstTokenMs ?? '—'} ms, total ${t.totalMs} ms, ${t.toolCalls} tool call${t.toolCalls === 1 ? '' : 's'})`, { via: 'harness', ...t, runId: harnessOut.runId, backend, fallback, reason });
-      if (!answer) answer = DONT_KNOW_TEXT;
+      if (!answer) answer = dontKnow;
       return { answer, sources, backend, timing: timing(), fallback, reason };
     } finally {
       if (this.activeRun === run) this.activeRun = null;
@@ -610,7 +653,7 @@ export class RealPipeline {
     try {
       const [qvec] = await this.embed([question]);
       const pool = await this.db();
-      const hits = await cosineSearch(pool, this.cfg.table, qvec, SEARCH_K);
+      const hits = await cosineSearch(pool, this.cfg.table, qvec, SEARCH_K, this.cfg.scoreFloor);
       this.reportTool(run, { ...call, phase: 'done', ms: Date.now() - t0, hits, summary: `${hits.length} hit${hits.length === 1 ? '' : 's'}` }, 'app');
       return hits.map((h) => ({ id: h.id, chunk: h.chunk, score: h.score, object_key: h.object_key, origin: 'search_facts' }));
     } catch (err) {
@@ -626,7 +669,7 @@ export class RealPipeline {
     ev.stage('kb', 'progress', 'Query embedded', { step: 'embed' });
     ev.stage('vectordb', 'start', 'pgvector cosine search, top 3', { op: 'search' });
     const pool = await this.db();
-    const sources = await cosineSearch(pool, this.cfg.table, qvec, 3);
+    const sources = await cosineSearch(pool, this.cfg.table, qvec, 3, this.cfg.scoreFloor);
     ev.stage('vectordb', 'done', `${sources.length} relevant chunk${sources.length === 1 ? '' : 's'} retrieved`, { count: this.count, hits: sources.map((s) => ({ id: s.id, score: s.score })), op: 'search' });
     ev.stage('kb', 'done', `Context assembled from ${sources.length} chunk${sources.length === 1 ? '' : 's'}`, { hits: sources.length });
     return sources;

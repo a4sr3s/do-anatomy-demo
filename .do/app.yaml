@@ -62,15 +62,20 @@ services:
         type: SECRET
       - key: DO_INFERENCE_URL
         value: https://inference.do-ai.run/v1
-      # Model Access Key (control panel only). Only needed for DO_EMBEDDING_MODEL;
-      # answers are generated inside the harness session (HARNESS_INFERENCE_API_KEY).
+      # Model Access Key (control panel only). Used for DO_EMBEDDING_MODEL; when empty the
+      # harness session's HARNESS_INFERENCE_API_KEY is used for /embeddings instead.
+      # Answers are generated inside the harness session (HARNESS_INFERENCE_API_KEY).
       - key: DO_INFERENCE_KEY
         value: ""
         type: SECRET
+      # Multilingual embedding model (1024 dims). The web service migrates the pgvector
+      # table at boot when the stored dimension differs (column recreated, rows re-embedded).
+      # Must match the mcp service exactly. Leave DO_EMBEDDING_MODEL empty + VECTOR_DIM=128
+      # for the key-free local hash embedder.
       - key: DO_EMBEDDING_MODEL
-        value: ""
+        value: bge-m3
       - key: VECTOR_DIM
-        value: "128"
+        value: "1024"
       # ---- v4: the Harness Runtime answers every question through the MCP tools ----
       # inline  -> the session manifest declares the MCP server directly (MCP_PUBLIC_URL + MCP_AUTH_TOKEN)
       # gateway -> the session selects the tools from the Action Gateway catalog (HARNESS_GATEWAY_TOOLS)
@@ -143,10 +148,17 @@ services:
       - key: DO_SPACES_BUCKET
         value: alexis-anatomy-demo
       # Must match the web service so search_facts embeds exactly like ingest did.
+      # The mcp service never migrates the table; only the web service does.
       - key: VECTOR_DIM
-        value: "128"
+        value: "1024"
       - key: DO_EMBEDDING_MODEL
+        value: bge-m3
+      - key: DO_INFERENCE_URL
+        value: https://inference.do-ai.run/v1
+      # Same Model Access Key as the web service (needed to embed the query with bge-m3)
+      - key: DO_INFERENCE_KEY
         value: ""
+        type: SECRET
       # Internal App Platform URL of the web component: every tool call is reported here.
       - key: TOOL_EVENT_URL
         value: http://web:8080/api/internal/tool-event

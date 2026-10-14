@@ -44,6 +44,8 @@ export async function createApp(options = {}) {
       mode: pipeline.mode,
       uptime: Math.round((Date.now() - startedAt) / 1000),
       pipeline: pipeline.describe(),
+      // last embedding migration run by this web service at boot (real mode; null in mock mode / before it ran)
+      migration: pipeline.migration ?? null,
       recorder: recorder.status,
       replayFallback,
       stages: STAGE_ORDER,

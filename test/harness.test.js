@@ -961,3 +961,56 @@ test('harness: tool events arriving with no active question are published unattr
   assert.equal(events[0].type, 'tool');
   assert.equal(events[0].jobId, null);
 });
+
+test('harness: prompts carry the language rules; the "don\'t know" line follows the question\'s language, the ANSWER: marker does not', () => {
+  const en = buildToolPrompt('Where does Acme run?');
+  const es = buildToolPrompt('¿Dónde corre Acme?');
+  for (const prompt of [en, es, buildToolPrompt('q', { gateway: true }), buildPrompt('Where does Acme run?', '[1] ctx'), buildPrompt('¿Dónde corre Acme?', '')]) {
+    assert.match(prompt, /same language as the question/);
+    assert.match(prompt, /Spanish "Todavía no lo sé\."/);
+    assert.match(prompt, /always starts with "ANSWER:"/);
+  }
+  for (const prompt of [en, es, buildToolPrompt('q', { gateway: true })]) {
+    assert.match(prompt, /Pass the question as `query` exactly as the user wrote it, in its own language: never translate, rephrase or shorten it \(the embedder is multilingual\)/);
+  }
+  assert.match(en, /If the search result starts with "NO_MATCHING_FACTS", immediately reply with the single line "ANSWER: I do not know that yet\." and nothing else/);
+  assert.match(es, /If the search result starts with "NO_MATCHING_FACTS", immediately reply with the single line "ANSWER: Todavía no lo sé\." and nothing else/);
+  assert.match(es, /reply with that same line: "ANSWER: Todavía no lo sé\."/);
+  assert.match(es, /Question: ¿Dónde corre Acme\?$/, 'the question is passed verbatim');
+  assert.match(buildPrompt('¿Dónde corre Acme?', ''), /reply exactly "ANSWER: Todavía no lo sé\."/);
+  assert.match(buildPrompt('Where does Acme run?', ''), /reply exactly "ANSWER: I do not know that yet\."/);
+  // the retry heuristic understands the Spanish line too
+  assert.ok(isDontKnow('Todavía no lo sé.'));
+  assert.ok(isDontKnow('No lo sé.'));
+  assert.ok(isDontKnow('No tengo esa información.'));
+  assert.ok(!isDontKnow('Acme tiene 40 droplets GPU en SFO3.'));
+});
+
+test('harness: the app-side guard answers "Todavía no lo sé." for a Spanish question when nothing matches', async () => {
+  const ramble = ['I will answer from memory: Acme runs 40 GPU droplets.'];
+  const prompts = [];
+  const { p, events, restore } = setup(BASE_ENV, fakeHarness(ramble, { onInput: (t) => prompts.push(t) }));
+  const queries = [];
+  p.db = async () => ({ query: async (sql, params) => { queries.push({ sql, params }); return { rows: [] }; } });
+  try {
+    const res = await p.ask('¿Cuántos droplets tiene Acme?');
+    assert.equal(res.answer, 'Todavía no lo sé.');
+    assert.equal(res.fallback, 'guard');
+    assert.equal(res.reason, 'no tool call, no matching facts');
+    assert.equal(prompts.length, 1, 'no second model run');
+    assert.equal(queries.length, 1, 'the app ran the search itself');
+    assert.equal(tokensOf(events), 'Todavía no lo sé.');
+    assert.equal(events.find((e) => e.type === 'answer').data.text, 'Todavía no lo sé.');
+    assert.ok(events.some((e) => e.stage === 'agent' && /answering "Todavía no lo sé\."/.test(e.detail)));
+  } finally {
+    restore();
+  }
+  // same question in English -> English line
+  const en = setup(BASE_ENV, fakeHarness(ramble));
+  en.p.db = async () => ({ query: async () => ({ rows: [] }) });
+  try {
+    assert.equal((await en.p.ask('How many droplets does Acme have?')).answer, DONT_KNOW_TEXT);
+  } finally {
+    en.restore();
+  }
+});

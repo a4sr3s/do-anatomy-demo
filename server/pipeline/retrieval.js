@@ -6,9 +6,35 @@
  */
 import { embedLocal, LOCAL_DIM } from './embedding.js';
 
-export const SCORE_FLOOR = 0.08;
+/**
+ * Relevance floor for a hosted embedding model (tuned for bge-m3 cosine: unrelated
+ * text scores ~0.3-0.45, a real match > 0.55). pgvector `<=>` is true cosine
+ * distance, so the vectors need not be unit length (bge-m3's are not, norm ~26).
+ */
+export const SCORE_FLOOR = 0.52;
+/** Relevance floor for the local hashed bag-of-words embedder (sparse, so matches score low). */
+export const LOCAL_SCORE_FLOOR = 0.08;
+/** The floor that matches the configured embedder: `SCORE_FLOOR` for a hosted model, `LOCAL_SCORE_FLOOR` for the local hash. */
+export function scoreFloor(cfg) {
+  return cfg && cfg.embeddingModel ? SCORE_FLOOR : LOCAL_SCORE_FLOOR;
+}
 /** The one answer for "nothing stored matches": used by the MCP tool text, both prompts and the app-side guard. */
 export const DONT_KNOW_TEXT = 'I do not know that yet.';
+/** The same answer in Spanish; the prompts and the app-side guard pick it when the question looks Spanish. */
+export const DONT_KNOW_TEXT_ES = 'Todavía no lo sé.';
+const SPANISH_WORDS = ['qué', 'cuál', 'cuáles', 'cuánto', 'cuánta', 'cuántos', 'cuántas', 'dónde', 'cuándo', 'cómo', 'quién', 'quiénes', 'por qué', 'que', 'cual', 'cuales', 'cuanto', 'cuanta', 'cuantos', 'cuantas', 'donde', 'cuando', 'como', 'quien', 'quienes', 'el', 'la', 'los', 'las', 'una', 'unos', 'unas', 'del', 'es', 'está', 'están', 'hay', 'tiene', 'tienen', 'para', 'sobre', 'dime', 'cuéntame'];
+const SPANISH_WORD_RE = new RegExp(`(?:^|[^a-záéíóúñü])(?:${SPANISH_WORDS.join('|')})(?=$|[^a-záéíóúñü])`, 'gi');
+/** Cheap "is this Spanish?" heuristic: inverted punctuation, accented letters / ñ, or at least two common Spanish words. */
+export function looksSpanish(text) {
+  const t = String(text || '');
+  if (!t.trim()) return false;
+  if (/[¿¡]/.test(t) || /[áéíóúñü]/i.test(t)) return true;
+  return (t.match(SPANISH_WORD_RE) || []).length >= 2;
+}
+/** The "don't know" line in the language of `question`: Spanish or English (the default). */
+export function dontKnowText(question) {
+  return looksSpanish(question) ? DONT_KNOW_TEXT_ES : DONT_KNOW_TEXT;
+}
 /** search_facts result when no chunk clears SCORE_FLOOR: a plain marker the model can act on without reasoning. */
 export const NO_MATCHING_FACTS = `NO_MATCHING_FACTS: answer exactly "${DONT_KNOW_TEXT}"`;
 
@@ -49,7 +75,8 @@ export function embeddingConfig(env) {
   const embeddingModel = env.DO_EMBEDDING_MODEL || '';
   return {
     url: (env.DO_INFERENCE_URL || 'https://inference.do-ai.run/v1').replace(/\/$/, ''),
-    key: env.DO_INFERENCE_KEY,
+    // Model Access Key for /embeddings; the harness session's inference key works for the same endpoint
+    key: env.DO_INFERENCE_KEY || env.HARNESS_INFERENCE_API_KEY || '',
     embeddingModel,
     dim: Number(env.VECTOR_DIM) || (embeddingModel ? 1024 : LOCAL_DIM),
   };
@@ -74,17 +101,20 @@ export function toVector(arr) {
 
 /**
  * Cosine top-k search over `table`. `queryable` is anything with
- * `.query(sql, params)` (a pg.Pool or a stub). Rows below SCORE_FLOOR are
- * dropped. Returns [{ id, object_key, chunk, score }].
+ * `.query(sql, params)` (a pg.Pool or a stub). Rows at or below `floor` are
+ * dropped: callers pass `scoreFloor(cfg)` (SCORE_FLOOR for a hosted model,
+ * LOCAL_SCORE_FLOOR for the local hash embedder, which is also the default).
+ * Returns [{ id, object_key, chunk, score }].
  */
-export async function cosineSearch(queryable, table, qvec, k = 3) {
+export async function cosineSearch(queryable, table, qvec, k = 3, floor = LOCAL_SCORE_FLOOR) {
   const limit = Math.max(1, Math.min(Number(k) || 3, 5));
+  const min = Number.isFinite(Number(floor)) ? Number(floor) : LOCAL_SCORE_FLOOR;
   const r = await queryable.query(
     `SELECT id, chunk, object_key, 1 - (embedding <=> $1::vector) AS score FROM ${table} ORDER BY embedding <=> $1::vector LIMIT ${limit}`,
     [toVector(qvec)]
   );
   return r.rows
-    .filter((x) => x.score > SCORE_FLOOR)
+    .filter((x) => Number(x.score) > min)
     .map((x) => ({ id: x.id, object_key: x.object_key ?? null, chunk: x.chunk, score: Number(Number(x.score).toFixed(3)) }));
 }
 
