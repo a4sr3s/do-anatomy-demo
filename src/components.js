@@ -24,7 +24,7 @@ export const MACHINES = {
     label: 'APP PLATFORM · CHUNK & EMBED',
     title: 'App Platform · Chunk & Embed',
     stage: 'functions',
-    desc: 'The App Platform web service picks the stored object up right after the PUT and chunks and embeds it in-process. The gears mesh while it works; the press cuts the document into chunks, then stamps each chunk into a 128-dimension embedding vector before the rows are inserted into pgvector.',
+    desc: 'The App Platform web service picks the stored object up right after the PUT and chunks and embeds it in-process. The gears mesh while it works; the press cuts the document into chunks, then stamps each chunk into an embedding vector before the rows are inserted into pgvector. In Fast mode it also takes the question: the press stamps its query vector, the service searches pgvector itself and sends the prompt straight to Serverless Inference (no harness, no gateway).',
     color: '#ffb347',
   },
   vectordb: {
@@ -41,7 +41,7 @@ export const MACHINES = {
     sublabel: 'OpenCode · gpt-oss-20b',
     title: 'Harness Runtime',
     stage: 'agent',
-    desc: 'A DigitalOcean Managed Agents session: an OpenCode harness in a hardware-isolated microVM with gpt-oss-20b served by Serverless Inference. It receives the question, calls the search_facts tool through the Action Gateway, and composes the grounded answer. The dial needle points at the pgvector chambers the tool returned; the tray lights one slot per retrieved chunk. If the tool path is down, the app retrieves itself and passes the context in the prompt.',
+    desc: 'A DigitalOcean Managed Agents session: an OpenCode harness in a hardware-isolated microVM with gpt-oss-20b served by Serverless Inference. In Agent mode it receives the question, plans, calls the search_facts tool through the Action Gateway, and composes the grounded answer. The dial needle points at the pgvector chambers the tool returned; the tray lights one slot per retrieved chunk. If the tool path is down, the app retrieves itself and passes the context in the prompt. In Fast mode it stays idle (kept warm for the next agent question).',
     color: '#b77bff',
   },
   gateway: {
@@ -50,7 +50,7 @@ export const MACHINES = {
     sublabel: 'MCP · anatomy-data',
     title: 'Action Gateway · MCP tools',
     stage: 'gateway',
-    desc: 'The governed tool layer. The harness calls search_facts / get_document; the gateway checks the permission policy (allow lamps), routes the call to the anatomy-data MCP server and on to pgvector or Spaces (the selector swings to the target), and reports every call back to the app so you can watch it.',
+    desc: 'The governed tool layer, used in Agent mode. The harness calls search_facts / get_document; the gateway checks the permission policy (allow lamps), routes the call to the anatomy-data MCP server and on to pgvector or Spaces (the selector swings to the target), and reports every call back to the app so you can watch it. Fast mode never touches it.',
     color: '#ffd166',
   },
   inference: {
@@ -58,7 +58,7 @@ export const MACHINES = {
     label: 'SERVERLESS INFERENCE · gpt-oss-20b',
     title: 'Serverless Inference · gpt-oss-20b',
     stage: 'inference',
-    desc: 'An OpenAI-compatible endpoint serving gpt-oss-20b on GPUs; the model inside the harness session. The platters spin up, the arm seeks across the glowing track rings and every generated token leaves as a particle on the return track to the client.',
+    desc: 'An OpenAI-compatible endpoint serving gpt-oss-20b on GPUs. In Fast mode the App Platform calls it directly with the retrieved facts in the prompt (one streamed round, reasoning low); in Agent mode it is the model inside the harness session. The platters spin up, the arm seeks across the glowing track rings and every generated token leaves as a particle on the return track to the client.',
     color: '#ff6b8a',
   },
 };
@@ -93,7 +93,7 @@ export const PARTS = {
   'functions.gears': P('functions.gears', 'functions', 'Meshing gears', 'Turn while the app chunks and embeds; the drive for the press.'),
   'functions.press': P('functions.press', 'functions', 'Chunk & embed press', 'Slams down to cut the document into chunks, then once per chunk to stamp its embedding vector.'),
   'functions.anvil': P('functions.anvil', 'functions', 'Anvil', 'Where the document lands. Chunks appear here as small cubes before they leave for the vector store.'),
-  'functions.base': P('functions.base', 'functions', 'App Platform service', 'The same Express web service that serves the API. No separate Function: chunking and embedding run in-process, right after the Spaces PUT.'),
+  'functions.base': P('functions.base', 'functions', 'App Platform service', 'The same Express web service that serves the API. No separate Function: chunking and embedding run in-process, right after the Spaces PUT. On the fast answer path it embeds the question, searches pgvector and calls Serverless Inference itself (the two bridged pipes on its left and front).'),
 
   'vectordb.enclosure': P('vectordb.enclosure', 'vectordb', 'Vector enclosure', 'Glass case over twelve chambers. Each cube is one row: chunk text + embedding vector.'),
   'vectordb.chamber': P('vectordb.chamber', 'vectordb', 'Chamber', 'One of twelve chambers (rows fill them round-robin). The needle on the Harness Runtime dial points here when a cube in it is retrieved.'),

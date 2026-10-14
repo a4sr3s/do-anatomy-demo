@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { EventBus } from './bus.js';
 import { Recorder } from './recorder.js';
 import { createPipeline } from './pipeline/index.js';
+import { presetFor, ANSWER_PRESETS } from './pipeline/real.js';
 import { tokenEquals } from './auth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -117,16 +118,21 @@ export async function createApp(options = {}) {
   const toolEventToken = env.MCP_AUTH_TOKEN || '';
 
   // The answer path is configured by ANSWER_MODE / SEARCH_FIRST_BACKEND / SEARCH_FIRST_REASONING_EFFORT.
-  // For benchmarking, a caller holding the shared secret (x-tool-event-token) may override them per
-  // question with body fields {mode, backend, effort}; everyone else gets the configured path.
+  // Anyone may pick one of the two UI presets per question with body `mode: "fast" | "agent"` (see
+  // ANSWER_PRESETS); the raw knobs {mode: tool|search-first, backend, effort} stay reserved for callers
+  // holding the shared secret (x-tool-event-token), as used by the benchmarks. Everything else gets the
+  // configured path, so the server defaults are unchanged.
   app.post('/api/ask', (req, res) => {
     const question = String(req.body?.question || '').trim();
     if (!question) return res.status(400).json({ ok: false, error: 'question is required' });
     const { mode, backend, effort } = req.body || {};
+    const preset = presetFor(mode);
     const wantsOverride = mode !== undefined || backend !== undefined || effort !== undefined;
-    const opts = wantsOverride && tokenEquals(req.get('x-tool-event-token'), toolEventToken) ? { mode, backend, effort } : {};
+    const opts = preset ? preset : wantsOverride && tokenEquals(req.get('x-tool-event-token'), toolEventToken) ? { mode, backend, effort } : {};
     return runWithFallback('query', () => pipeline.ask(question, opts), res);
   });
+  // the presets the UI toggle offers, so the frontend and the docs share one definition
+  app.get('/api/ask/modes', (req, res) => res.json({ ok: true, modes: ANSWER_PRESETS, default: pipeline.describe().answerMode ?? null }));
   app.post('/api/internal/tool-event', (req, res) => {
     if (!tokenEquals(req.get('x-tool-event-token'), toolEventToken)) return res.status(401).json({ ok: false, error: 'unauthorized' });
     if (typeof pipeline.handleToolEvent !== 'function') return res.status(202).json({ ok: true, accepted: false, reason: `no tool events in ${pipeline.mode} mode` });
@@ -143,6 +149,14 @@ export async function createApp(options = {}) {
       res.json({ ok: true, ...pipeline.rotateSession(String(req.body?.reason || 'manual')) });
     });
   }
+  // ---- agent-mode readiness ---------------------------------------------------
+  // The UI calls this when the toggle switches to Agent: thaw a paused harness session, keep its
+  // event stream attached, run the idle-rotation check, prime the MCP health. No model run, throttled
+  // server-side, so it is public. Mock mode answers 202.
+  app.post('/api/harness/warm', async (req, res) => {
+    if (typeof pipeline.warmAgent !== 'function') return res.status(202).json({ ok: true, skipped: true, reason: `no harness in ${pipeline.mode} mode` });
+    res.json(await pipeline.warmAgent());
+  });
 
   // ---- recording / replay -------------------------------------------------
   const wrap = (fn) => async (req, res) => {

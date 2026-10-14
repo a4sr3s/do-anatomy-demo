@@ -9,8 +9,13 @@ import { Solid, box, dotTexture } from './kit.js';
 const PIPE_Y = 0.32;
 const LANE_GAP = 0.3;
 const PIPE_R = 0.11;
+/** Height of a bridge: a short raised hop where one track crosses another (pipe bottom 0.74 clears the 0.43 pipe top below). */
+export const BRIDGE_Y = 0.85;
 
-/** Track routes in board coordinates [x, z]. Lanes: 0 = forward, 1 = return. */
+/**
+ * Track routes in board coordinates [x, z] (an optional third value is the pipe height, used for the
+ * bridges of the fast path). Lanes: 0 = forward, 1 = return.
+ */
 export const ROUTES = {
   'client-spaces': { pts: [[-12.3, -0.45], [-11.5, -0.45], [-10.7, -1.25], [-10.7, -4.5], [-9.7, -4.5]], lanes: 2 },
   // question: client -> Harness Runtime left face (the harness sits at x -6.1..-1.5, z 2.6..6.4)
@@ -26,6 +31,13 @@ export const ROUTES = {
   'gateway-spaces': { pts: [[-0.1, -0.1], [-4.0, -0.1], [-4.9, -1.0], [-4.9, -3.4], [-5.3, -3.4]], lanes: 2 },
   // harness right face -> Serverless Inference left face
   'router-inference': { pts: [[-1.5, 5.4], [6, 5.4]], lanes: 2 },
+  // fast path (search-first on direct Serverless Inference; no harness, no gateway): the question goes from the client
+  // to the App Platform web service (left face), which embeds it and searches pgvector over the existing
+  // functions-vectordb track, then sends the prompt from its front face to Serverless Inference (left face, back half).
+  // Both routes hop over a tool-path pipe on a short bridge: client-functions over the gateway-spaces leg at x -4.9,
+  // functions-inference over the gateway-vectordb leg at x 2.4 (in the alley between the gateway and pgvector).
+  'client-functions': { pts: [[-12.4, 0.5], [-10.8, 0.5], [-9.3, -1.0], [-5.9, -1.0], [-5.4, -1.0, BRIDGE_Y], [-4.4, -1.0, BRIDGE_Y], [-3.95, -1.0], [-3.95, -3.3], [-3.3, -3.3]], lanes: 2 },
+  'functions-inference': { pts: [[1.0, -2.6], [1.0, -1.05], [1.4, -1.05], [1.9, -1.05, BRIDGE_Y], [2.9, -1.05, BRIDGE_Y], [3.4, -1.05], [5.3, -1.05], [5.3, 3.0], [6.0, 3.0]], lanes: 2 },
   'inference-client': { pts: [[11, 4.5], [12.2, 4.5], [12.2, 8.7], [-11.5, 8.7], [-13.2, 7], [-13.2, 2.6]], lanes: 3 },
 };
 
@@ -65,7 +77,7 @@ export function buildTracks(scene, parts) {
     for (let l = 0; l < laneCount; l++) {
       const off = (l - (laneCount - 1) / 2) * LANE_GAP;
       const p2 = offsetPolyline(r.pts, off);
-      const pts3 = p2.map(([x, z]) => new THREE.Vector3(x, PIPE_Y, z));
+      const pts3 = p2.map(([x, z], i) => new THREE.Vector3(x, r.pts[i][2] ?? PIPE_Y, z));
       // cumulative lengths
       const cum = [0];
       for (let i = 1; i < pts3.length; i++) cum.push(cum[i - 1] + pts3[i].distanceTo(pts3[i - 1]));
@@ -90,11 +102,23 @@ export function buildTracks(scene, parts) {
         }
       }
     }
-    // sleepers straddling all lanes every ~2.4 units along the centre line
+    // sleepers straddling all lanes every ~2.4 units along the centre line; a raised (bridge) segment gets
+    // a support post under each raised joint instead
     const centre = r.pts.map(([x, z]) => new THREE.Vector3(x, 0, z));
+    const raised = (i) => (r.pts[i][2] ?? PIPE_Y) > PIPE_Y;
     for (let i = 0; i < centre.length - 1; i++) {
       const a = centre[i];
       const b = centre[i + 1];
+      if (raised(i) || raised(i + 1)) {
+        if (raised(i)) {
+          const width = (laneCount - 1) * LANE_GAP + 2 * PIPE_R + 0.3;
+          const post = new Solid(box(0.16, r.pts[i][2] - PIPE_R, width), { fill: 0x121317, edge: 0x4a515a, opacity: 1, pick: false });
+          post.position.copy(a);
+          post.rotation.y = -Math.atan2(b.z - a.z, b.x - a.x);
+          group.add(post);
+        }
+        continue;
+      }
       const len = a.distanceTo(b);
       const count = Math.floor((len - 0.8) / 2.4);
       for (let k = 1; k <= count; k++) {

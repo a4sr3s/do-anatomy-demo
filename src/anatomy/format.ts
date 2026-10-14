@@ -31,13 +31,40 @@ export function describeEvent(e: any): { who: string; status: string; what: stri
   let what = '';
   if (e.type === 'hello') what = `connected · ${e.data?.mode} mode · ${e.data?.pipeline?.chunks ?? 0} rows`;
   else if (e.type === 'stage') what = e.detail || '';
-  else if (e.type === 'job') what = `${e.flow}${e.data?.input ? ` "${String(e.data.input).slice(0, 70)}"` : ''}${e.data?.message ? ` ${e.data.message}` : ''}`;
+  else if (e.type === 'job') what = describeJob(e);
   else if (e.type === 'answer') what = `${e.data?.sources?.length || 0} sources`;
   else if (e.type === 'tool') return describeTool(e);
   else if (e.type === 'fallback') what = e.data?.recording ? `${e.flow} → replaying ${e.data.recording}` : `${e.flow} → ${e.data?.to || 'fallback'} (${e.data?.reason || ''})`;
   else if (e.type === 'replay') what = e.data?.name || '';
   else what = e.detail || JSON.stringify(e.data || {}).slice(0, 80);
   return { who, status, what };
+}
+
+const PATH_LABEL: Record<string, string> = { fast: 'fast · direct inference', agent: 'agent · harness + gateway' };
+/** The answer path a question job took, from its own event data (`fast` / `agent` presets, else the raw mode/backend). */
+export function pathLabel(d: any = {}): string {
+  if (d.preset && PATH_LABEL[d.preset]) return PATH_LABEL[d.preset];
+  if (d.answerMode === 'tool') return PATH_LABEL.agent;
+  if (d.answerMode === 'search-first') return d.backend === 'direct' ? PATH_LABEL.fast : `search-first via ${d.backend || 'harness'}`;
+  return '';
+}
+
+const secs = (ms: number | null | undefined) => (ms == null ? '—' : `${(ms / 1000).toFixed(ms < 10000 ? 2 : 1)} s`);
+
+/** `query "…" · fast · direct inference` on start; `query · agent · first token 3.61 s · total 3.87 s · 1 tool call` on done */
+export function describeJob(e: any): string {
+  const d = e.data || {};
+  const parts = [`${e.flow}${d.input ? ` "${String(d.input).slice(0, 70)}"` : ''}${d.message ? ` ${d.message}` : ''}`];
+  if (e.flow === 'query') {
+    const label = pathLabel(d);
+    if (label) parts.push(label);
+    if (e.status === 'done' && d.timing) {
+      parts.push(`first token ${secs(d.timing.firstTokenMs)}`, `total ${secs(d.timing.totalMs)}`);
+      if (d.timing.toolCalls) parts.push(`${d.timing.toolCalls} tool call${d.timing.toolCalls === 1 ? '' : 's'}`);
+      if (d.fallback) parts.push(`fallback ${d.fallback}${d.reason ? ` (${d.reason})` : ''}`);
+    }
+  }
+  return parts.join(' · ');
 }
 
 /** `TOOL search_facts(query=…) → pgvector · 3 hits · 120 ms` */

@@ -125,11 +125,71 @@ export class MockPipeline {
     return result;
   }
 
-  async ask(question) {
+  /**
+   * Answer a question. `opts` are the same per-request options the real pipeline takes
+   * (POST /api/ask {mode: 'fast' | 'agent'} resolves to them in server/app.js):
+   *   mode 'search-first' (preset `fast`)  -> askFast: the app embeds + searches first, one model round, no harness
+   *   anything else (preset `agent`, the mock default) -> askTool: the Harness agent calls search_facts via the gateway
+   * Both emit exactly the stage events the real pipeline emits on that path, so the scene animates the same.
+   */
+  async ask(question, opts = {}) {
+    const mode = String(opts.mode || '').toLowerCase().replace(/_/g, '-') === 'search-first' || opts.preset === 'fast' ? 'search-first' : 'tool';
+    return mode === 'search-first' ? this.askFast(question, opts) : this.askTool(question);
+  }
+
+  /** Fast path (search-first on direct Serverless Inference): kb -> vectordb (op search) -> kb -> inference (via direct). */
+  async askFast(question, { effort = 'low' } = {}) {
     const jobId = randomUUID();
     const ev = this.bus.forJob(jobId, 'query');
     const t0 = Date.now();
-    ev.job('start', { input: question });
+    const preset = 'fast';
+    ev.job('start', { input: question, answerMode: 'search-first', preset, backend: 'direct', effort });
+    const tag = { mode: 'search-first', backend: 'direct', via: 'app' };
+
+    // 1. the App Platform web service embeds the question and searches pgvector itself
+    ev.stage('kb', 'start', 'App-side retrieval: embedding the question', { question, ...tag });
+    await this.wait(350);
+    const qvec = embedLocal(question);
+    ev.stage('kb', 'progress', `Query embedded (128 dims, ${Date.now() - t0} ms)`, { step: 'embed', cached: false, ms: Date.now() - t0, ...tag });
+    const tq = Date.now();
+    ev.stage('vectordb', 'start', 'pgvector cosine search, top 3', { op: 'search', ...tag });
+    await this.wait(450);
+    const hits = this.store.search(qvec, 3).filter((h) => h.score > 0.08);
+    const short = hits.map((h) => ({ id: h.id, score: Number(h.score.toFixed(3)) }));
+    const searchMs = Math.max(1, Date.now() - tq);
+    ev.stage('vectordb', 'done', `${hits.length} relevant chunk${hits.length === 1 ? '' : 's'} retrieved · ${searchMs} ms`, { count: this.store.size, hits: short, op: 'search', ms: searchMs, ...tag });
+    ev.stage('kb', 'done', `Context assembled from ${hits.length} chunk${hits.length === 1 ? '' : 's'} (${Date.now() - t0} ms)`, { hits: hits.length, ms: Date.now() - t0, cached: false, ...tag });
+
+    // 2. one streamed model round straight on Serverless Inference (no harness, no agent stage)
+    ev.stage('inference', 'start', `Serverless Inference direct: mock-llm (streaming, reasoning ${effort})`, { model: 'mock-llm', via: 'direct', mode: 'search-first', effort });
+    await this.wait(250);
+    const modelStartedMs = Date.now() - t0;
+    ev.stage('inference', 'progress', `Serverless Inference responded (+${modelStartedMs} ms, connection reused)`, { step: 'headers', ms: modelStartedMs, reused: true, via: 'direct' });
+    const answer = this.compose(question, hits);
+    const words = answer.split(' ');
+    let firstTokenMs = null;
+    for (let i = 0; i < words.length; i++) {
+      await this.wait(40);
+      if (firstTokenMs == null) firstTokenMs = Date.now() - t0;
+      ev.stage('inference', 'progress', '', { token: (i ? ' ' : '') + words[i], index: i, total: words.length });
+    }
+    const timing = { firstTokenMs, totalMs: Date.now() - t0, toolCalls: 0, reasoningTokens: 0, searchMs, embedCached: false, modelStartedMs, modelFirstMs: firstTokenMs, hits: hits.length };
+    ev.stage('inference', 'done', 'Completed (search-first, one model round)', { model: 'mock-llm', tokens: words.length, via: 'direct', mode: 'search-first', ...timing });
+
+    const sources = hits.map((h) => ({ id: h.id, chunk: h.chunk, score: Number(h.score.toFixed(3)), origin: 'search' }));
+    ev.answer(answer, sources);
+    const result = { answer, sources, timing, backend: 'direct', answerMode: 'search-first', preset, fallback: null, reason: null };
+    ev.job('done', result);
+    return { jobId, ...result };
+  }
+
+  /** Agent path (tool mode): the Harness Runtime agent calls search_facts through the Action Gateway, then streams the answer. */
+  async askTool(question) {
+    const jobId = randomUUID();
+    const ev = this.bus.forJob(jobId, 'query');
+    const t0 = Date.now();
+    const preset = 'agent';
+    ev.job('start', { input: question, answerMode: 'tool', preset, backend: 'harness' });
 
     // v4: the question goes straight to the Harness Runtime agent, which retrieves
     // through the anatomy-data MCP tools (search_facts) via the Action Gateway.
@@ -177,8 +237,9 @@ export class MockPipeline {
 
     const sources = hits.map((h) => ({ id: h.id, chunk: h.chunk, score: Number(h.score.toFixed(3)), origin: tool }));
     ev.answer(answer, sources);
-    ev.job('done', { answer, sources, timing, backend: 'harness' });
-    return { jobId, answer, sources, timing, backend: 'harness' };
+    const result = { answer, sources, timing, backend: 'harness', answerMode: 'tool', preset };
+    ev.job('done', result);
+    return { jobId, ...result };
   }
 
   compose(question, hits) {

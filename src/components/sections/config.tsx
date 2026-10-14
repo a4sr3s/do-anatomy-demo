@@ -76,6 +76,11 @@ function servicesFor(h: Health): Service[] {
         : 'needs the harness token',
       up: Boolean(p.inferenceVia),
     },
+    {
+      name: 'Answer paths',
+      detail: `server default ${p.answerMode === 'tool' ? 'agent (tool)' : `${p.searchFirstBackend === 'direct' ? 'fast' : 'search-first via harness'}`} · toggle: fast = direct inference, agent = harness + gateway`,
+      up: null,
+    },
     { name: 'Embeddings', detail: String(p.embedding ?? 'local-hash'), up: null },
   ];
 }

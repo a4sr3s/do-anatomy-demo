@@ -56,10 +56,12 @@ export function mountAnatomy(container, ui) {
   //  - the App Platform label is shifted left of its press (its CHUNK & EMBED sub-line would
   //    otherwise vanish behind the gateway turret) and slightly smaller; further back (z < -2.5)
   //    the press itself hides the name.
+  //  - the fast-path pipes (client-functions along z -1.0, functions-inference leaving the press front at x 1.0) run
+  //    past both labels: SPACES sits 0.3 further back and APP PLATFORM is centred between its two pipes at size 0.40.
   const LABELS = [
     ['CLIENT · APP / CLI', -16.2, 3.4],
-    [MACHINES.spaces.label, -7.5, -2.0],
-    [MACHINES.functions.label, -1.0, -2.25, { size: 0.46 }],
+    [MACHINES.spaces.label, -7.5, -2.3],
+    [MACHINES.functions.label, -1.5, -2.25, { size: 0.4 }],
     [MACHINES.vectordb.label, 7.8, -0.9],
     [MACHINES.gateway.label, 0.7, 1.7],
     [`${MACHINES.router.label} · ${MACHINES.router.sublabel.replace(' · ', ' / ').toUpperCase()}`, -3.8, 7.0],
@@ -93,6 +95,8 @@ export function mountAnatomy(container, ui) {
     functions: { runs: 0, chunks: 0, embeddings: 0, 'last run': '—' },
     vectordb: { rows: 0, inserts: 0, searches: 0, deletes: 0, 'last hits': '—', 'top score': '—', 'last query': '—' },
     router: { questions: 0, 'tool calls': 0, 'context chunks': 0, session: '—', 'first token': '—', 'last answer': '—', fallbacks: 0 },
+    // fast path: the web service also embeds questions and searches pgvector itself (stage kb, mode search-first)
+    app: { questions: 0, 'query embeds': 0, 'embed cached': 0, 'context chunks': 0, 'first token': '—', 'last answer': '—' },
     gateway: { 'tool calls': 0, searches: 0, documents: 0, errors: 0, 'last tool': '—', 'last latency': '—' },
     inference: { tokens: 0, model: '—', 'tok/s': '—', 'last generation': '—' },
   };
@@ -101,7 +105,7 @@ export function mountAnatomy(container, ui) {
     if (part.key === 'board') return { machines: 7, mode: baseMode, 'jobs seen': jobSeq };
     const m = part.machine?.key;
     if (!m) return {};
-    const s = { ...stats[m] };
+    const s = m === 'functions' ? { ...stats.functions, ...stats.app } : { ...stats[m] };
     if (part.key === 'vectordb.cube' || part.key === 'vectordb.chamber') s.chambers = 12;
     return s;
   });
@@ -137,7 +141,7 @@ export function mountAnatomy(container, ui) {
   function getJob(e) {
     let job = jobs.get(e.jobId);
     if (!job) {
-      job = { flow: e.flow, color: JOB_COLORS[jobSeq % JOB_COLORS.length], lane: jobSeq % 3, q: Promise.resolve(), input: '', stageStart: new Map(), tokens: 0, tokenAt: 0, pendingAnswer: null, landed: 0, text: '', answered: false, arrived: false, hits: 0 };
+      job = { flow: e.flow, color: JOB_COLORS[jobSeq % JOB_COLORS.length], lane: jobSeq % 3, q: Promise.resolve(), input: '', stageStart: new Map(), tokens: 0, tokenAt: 0, pendingAnswer: null, landed: 0, text: '', answered: false, arrived: false, hits: 0, path: 'harness', preset: null, meta: null };
       jobSeq++;
       jobs.set(e.jobId, job);
     }
@@ -148,15 +152,32 @@ export function mountAnatomy(container, ui) {
     job.q = job.q.then(fn).catch((err) => console.warn('step failed', err));
   }
 
-  /** the question packet travels client -> harness once, on whichever stage comes first (kb for app-side retrieval, agent for the tool path) */
+  /**
+   * Which machines a question job runs through, from the job's own events (never assumed):
+   *   fast     search-first on direct Serverless Inference (preset `fast`): client -> App Platform (embeds + searches
+   *            pgvector itself) -> Serverless Inference -> client; the Harness and the Gateway stay dark
+   *   agent    the tool path (preset `agent`): client -> Harness -> Gateway -> pgvector / Spaces -> inference -> client
+   *   harness  anything else (search-first on the harness backend, old recordings): client -> Harness, app-side
+   *            retrieval shown on the harness dial, then inference
+   */
+  function pathOf(d = {}) {
+    if (d.preset === 'fast' || (d.answerMode === 'search-first' && d.backend === 'direct')) return 'fast';
+    if (d.preset === 'agent' || d.answerMode === 'tool') return 'agent';
+    return 'harness';
+  }
+  /** is this kb / vectordb(search) event the App Platform searching on the fast path (rather than the harness-side fallback)? */
+  const appSide = (e, job) => job.path === 'fast' || (e.data?.mode === 'search-first' && e.data?.backend === 'direct');
+
+  /** the question packet leaves the client once: to the App Platform on the fast path, to the harness otherwise (kb for app-side retrieval, agent for the tool path) */
   function questionArrives(job) {
     if (job.arrived) return;
     job.arrived = true;
     machines.client.type([1, 3, 5, 7], 60);
-    machines.client.screen(`> ASK ${job.input.slice(0, 20)}`, 'question sent…', job.color);
+    machines.client.screen(`> ASK ${job.input.slice(0, 20)}`, job.path === 'fast' ? 'fast · to the app…' : 'agent · to the harness…', job.color);
+    const route = job.path === 'fast' ? 'client-functions' : 'client-router';
     enqueue(job, async () => {
       setActivity('client', true);
-      await tracks.send('client-router', { color: job.color, lane: 0, count: 46 });
+      await tracks.send(route, { color: job.color, lane: 0, count: 46 });
       setActivity('client', false);
     });
   }
@@ -229,9 +250,11 @@ export function mountAnatomy(container, ui) {
             machines.vectordb.startScan();
           });
         } else if (e.data?.op === 'search') {
+          // app-side search: from the App Platform on the fast path, from the harness dial on the context fallback
           stats.vectordb.searches++;
+          const route = appSide(e, job) ? 'functions-vectordb' : 'router-vectordb';
           enqueue(job, async () => {
-            await tracks.send('router-vectordb', { color: job.color, lane: 0, count: 34 });
+            await tracks.send(route, { color: job.color, lane: 0, count: 34 });
             setActivity('vectordb', true);
             machines.vectordb.startScan();
           });
@@ -244,7 +267,18 @@ export function mountAnatomy(container, ui) {
         }
         break;
       case 'kb':
-        // app-side retrieval (context-in-prompt fallback): the app embeds + searches itself
+        // app-side retrieval: on the fast path the App Platform web service receives the question and embeds it
+        // (the press takes the question like a document); on the context-in-prompt fallback the harness dial sweeps
+        if (appSide(e, job)) {
+          if (job.path !== 'fast') job.path = 'fast';
+          stats.app.questions++;
+          questionArrives(job);
+          enqueue(job, async () => {
+            setActivity('functions', true);
+            machines.functions.load(job.color);
+          });
+          break;
+        }
         questionArrives(job);
         enqueue(job, async () => {
           setActivity('kb', true);
@@ -281,16 +315,22 @@ export function mountAnatomy(container, ui) {
         });
         break;
       }
-      case 'inference':
+      case 'inference': {
         stats.inference.model = e.data?.model || stats.inference.model;
         job.tokens = 0;
         job.tokenAt = e.ts;
+        // the prompt leaves the App Platform on the fast path (direct Serverless Inference), the harness otherwise
+        // (a fast question whose direct round failed before its first token retries in the harness: that second
+        // inference start says via "harness" and is drawn from the harness)
+        const direct = e.data?.via === 'direct' || (e.data?.via == null && job.path === 'fast');
+        if (direct && job.path !== 'fast') job.path = 'fast';
         enqueue(job, async () => {
-          await tracks.send('router-inference', { color: job.color, lane: 0, count: 40 });
+          await tracks.send(direct ? 'functions-inference' : 'router-inference', { color: job.color, lane: 0, count: 40 });
           setActivity('inference', true);
           machines.inference.spinUp(job.color);
         });
         break;
+      }
     }
   }
 
@@ -306,7 +346,14 @@ export function mountAnatomy(container, ui) {
         }
         break;
       case 'kb':
-        if (e.data?.step === 'embed') enqueue(job, () => machines.router.turnKnob());
+        if (e.data?.step === 'embed') {
+          if (appSide(e, job)) {
+            // the press stamps the question into its query vector (one cube), cached embeddings included
+            stats.app['query embeds']++;
+            if (e.data.cached) stats.app['embed cached']++;
+            enqueue(job, () => machines.functions.chunk(1, job.color));
+          } else enqueue(job, () => machines.router.turnKnob());
+        }
         break;
       case 'inference':
         if (e.data?.token !== undefined) {
@@ -402,6 +449,7 @@ export function mountAnatomy(container, ui) {
         }
         if (e.data?.op === 'search' || e.data?.op === 'tool') {
           const viaTool = e.data.op === 'tool';
+          const viaApp = !viaTool && appSide(e, job);
           const hits = e.data?.hits || [];
           job.hits = hits.length;
           stats.vectordb['last hits'] = hits.length;
@@ -411,8 +459,8 @@ export function mountAnatomy(container, ui) {
             await wait(900); // let the scanner make a visible sweep even when the search is instant
             machines.vectordb.stopScan();
             const found = machines.vectordb.hit(hits.map((h) => h.id));
-            machines.router.pointAt(found.map((f) => f.pos));
-            await tracks.send(viaTool ? 'gateway-vectordb' : 'router-vectordb', { color: job.color, lane: 1, count: viaTool ? 24 : 30, speed: viaTool ? 10 : 14, reverse: true });
+            if (!viaApp) machines.router.pointAt(found.map((f) => f.pos)); // the harness dial only moves when the harness is in the loop
+            await tracks.send(viaTool ? 'gateway-vectordb' : viaApp ? 'functions-vectordb' : 'router-vectordb', { color: job.color, lane: 1, count: viaTool ? 24 : 30, speed: viaTool ? 10 : 14, reverse: true });
             if (viaTool) machines.gateway.port('pgvector');
             setActivity('vectordb', false);
           });
@@ -427,6 +475,16 @@ export function mountAnatomy(container, ui) {
         }
         break;
       case 'kb':
+        if (appSide(e, job)) {
+          stats.app['context chunks'] += e.data?.hits || 0;
+          stats.app['last retrieval'] = `${latencyMs(e.data?.ms ?? latency)} ms`;
+          enqueue(job, async () => {
+            await wait(250);
+            machines.functions.clear();
+            setActivity('functions', false);
+          });
+          break;
+        }
         stats.router['context chunks'] += e.data?.hits || 0;
         stats.router['last retrieval'] = `${latencyMs(latency)} ms`;
         enqueue(job, async () => {
@@ -514,7 +572,11 @@ export function mountAnatomy(container, ui) {
           else if (e.flow === 'delete') stats.client.deletes++;
           else stats.client.questions++;
           stats.client['last request'] = job.input.slice(0, 50);
-          if (e.flow === 'query') ui.answerReset(job.input);
+          if (e.flow === 'query') {
+            job.path = pathOf(e.data);
+            job.preset = e.data?.preset ?? (job.path === 'harness' ? null : job.path);
+            ui.answerReset(job.input, { path: job.path, preset: job.preset });
+          }
           if (e.flow === 'delete') {
             // the delete request leaves the client for the data plane; the vectordb / spaces stages do the rest
             machines.client.type([2, 6, 8], 60);
@@ -531,6 +593,18 @@ export function mountAnatomy(container, ui) {
         } else {
           job.finished = true;
           if (e.flow === 'ingest' || e.flow === 'delete') refreshFacts();
+          if (e.flow === 'query' && e.status === 'done' && e.data?.timing) {
+            // the measured latency of this answer (server-side: first visible token / total from the moment the
+            // question arrived), kept per path so the fast / agent contrast is visible side by side
+            const d = e.data;
+            job.meta = { path: job.path, preset: job.preset, backend: d.backend ?? null, answerMode: d.answerMode ?? null, fallback: d.fallback ?? null, reason: d.reason ?? null, timing: d.timing, at: e.ts };
+            ui.answerMeta?.(job.meta);
+            if (job.path === 'fast') {
+              stats.app['first token'] = d.timing.firstTokenMs != null ? `${latencyMs(d.timing.firstTokenMs)} ms` : '—';
+              stats.app['last answer'] = `${latencyMs(d.timing.totalMs)} ms`;
+            }
+            if (job.path !== 'harness') ui.setLatency?.(job.path, job.meta);
+          }
           if (e.status === 'error') {
             ui.toast(`Pipeline error: ${e.data?.message || 'unknown'}`, 'err');
             for (const k of Object.keys(activity)) setActivity(k, false);
@@ -634,7 +708,7 @@ export function mountAnatomy(container, ui) {
       const i = autoIdx++;
       try {
         if (i % 2 === 0) await api('/facts', { method: 'POST', body: { text: SAMPLE_FACTS[(i / 2) % SAMPLE_FACTS.length] } });
-        else await api('/ask', { method: 'POST', body: { question: SAMPLE_QUESTIONS[Math.floor(i / 2) % SAMPLE_QUESTIONS.length] } });
+        else await api('/ask', { method: 'POST', body: { question: SAMPLE_QUESTIONS[Math.floor(i / 2) % SAMPLE_QUESTIONS.length], mode: ui.askMode?.() || 'fast' } });
       } catch (err) {
         ui.toast(`auto traffic: ${err.message}`, 'err');
       }
@@ -646,7 +720,7 @@ export function mountAnatomy(container, ui) {
   // ---- wiring -----------------------------------------------------------------
   const events = connectEvents({ onEvent: handleEvent, onState: (s) => ui.setConn(s) });
   refreshRecordings();
-  ui.trackMachineStats?.(stats);
+  ui.trackMachineStats?.(stats, { functions: ['functions', 'app'] });
 
   // the sidebar changes the container size without a window resize
   let resizeRaf = 0;

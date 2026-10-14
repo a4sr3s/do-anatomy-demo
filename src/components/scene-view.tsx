@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { SendHorizonalIcon, UploadIcon } from 'lucide-react';
+import { BotIcon, SendHorizonalIcon, UploadIcon, ZapIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -7,10 +7,12 @@ import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput, InputGroupText } from '@/components/ui/input-group';
 import { SidebarTrigger } from '@/components/ui/sidebar';
 import { Spinner } from '@/components/ui/spinner';
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { mountAnatomy } from '@/anatomy/mount.js';
 import { createBridge } from '@/anatomy/bridge';
 import { setActions } from '@/anatomy/controller';
-import { useStore, type Tone } from '@/anatomy/store';
+import { setAskMode, store, useStore, type AnswerMeta, type AskMode, type Tone } from '@/anatomy/store';
+import { pathLabel } from '@/anatomy/format';
 import { api } from '@/events.js';
 
 /** Full-viewport three.js scene with the floating HUD, inspector and fact/ask dock. */
@@ -119,29 +121,90 @@ function InspectorCard() {
 
 type Kind = 'fact' | 'ask';
 
+/**
+ * The two answer paths (POST /api/ask {mode}); the server resolves `fast` to search-first on direct
+ * Serverless Inference with reasoning low and `agent` to the tool path in the Harness Runtime.
+ */
+const MODES: { key: AskMode; label: string; short: string; icon: typeof ZapIcon; hint: string }[] = [
+  {
+    key: 'fast',
+    label: 'Fast · direct inference',
+    short: 'fast',
+    icon: ZapIcon,
+    hint: 'Fixed retrieval, one model call: the App Platform embeds the question, searches pgvector itself and streams the answer from Serverless Inference (≈1 s). Use it for known look-ups; the Harness and the Gateway stay idle.',
+  },
+  {
+    key: 'agent',
+    label: 'Agent · Harness + Action Gateway',
+    short: 'agent',
+    icon: BotIcon,
+    hint: 'Agent planning with tools: the OpenCode agent in the Harness Runtime decides what to look up and calls search_facts / get_document through the Action Gateway, then answers (≈4 s). Use it when the model should choose which facts to fetch.',
+  },
+];
+
+const secs = (ms: number | null | undefined) => (ms == null ? '—' : `${(ms / 1000).toFixed(2)} s`);
+
+/** `first token 0.61 s · total 0.86 s` (+ tool calls on the agent path, + fallback when one happened) */
+function timingText(m: AnswerMeta | null) {
+  if (!m) return '—';
+  const parts = [`first token ${secs(m.timing.firstTokenMs)}`, `total ${secs(m.timing.totalMs)}`];
+  if (m.timing.toolCalls) parts.push(`${m.timing.toolCalls} tool call${m.timing.toolCalls === 1 ? '' : 's'}`);
+  if (m.fallback) parts.push(`fallback ${m.fallback}`);
+  return parts.join(' · ');
+}
+
+/** Wake the harness session when the presenter switches to Agent, so the first agent question is not the one that thaws it. */
+async function warmAgent() {
+  store.set({ agentReady: { state: 'warming', detail: 'waking the harness session…', at: Date.now() } });
+  try {
+    const r = await api('/harness/warm', { method: 'POST' });
+    if (r.skipped) store.set({ agentReady: { state: 'skipped', detail: r.reason || 'no harness', at: Date.now() } });
+    else if (r.ok === false) store.set({ agentReady: { state: 'error', detail: r.error || 'harness not ready', at: Date.now() } });
+    else store.set({ agentReady: { state: 'ready', detail: `${r.session || 'session'} ${String(r.status || '').replace(/^SESSION_STATUS_/, '').toLowerCase() || 'ready'}${r.resumed ? ' · resumed' : ''}${r.rotation ? ' · rotating' : ''}${r.throttled ? '' : r.ms != null ? ` · ${r.ms} ms` : ''}`, at: Date.now() } });
+  } catch (err) {
+    store.set({ agentReady: { state: 'error', detail: (err as Error).message, at: Date.now() } });
+  }
+}
+
 function AskDock() {
   const answer = useStore((s) => s.answer);
+  const askMode = useStore((s) => s.askMode);
+  const latency = useStore((s) => s.latency);
+  const agentReady = useStore((s) => s.agentReady);
   const [fact, setFact] = useState('');
   const [question, setQuestion] = useState('');
   const [busy, setBusy] = useState<Kind | null>(null);
   const [status, setStatus] = useState('');
   const [error, setError] = useState(false);
+  const mode = MODES.find((m) => m.key === askMode) ?? MODES[0];
+
+  // a page that loads in Agent mode (persisted toggle) warms the harness once too
+  useEffect(() => {
+    if (store.get().askMode === 'agent') warmAgent();
+  }, []);
+
+  function pickMode(v: string) {
+    if (v !== 'fast' && v !== 'agent') return;
+    setAskMode(v);
+    if (v === 'agent') warmAgent();
+  }
 
   async function submit(kind: Kind) {
     const text = (kind === 'fact' ? fact : question).trim();
     if (!text || busy) return;
     setBusy(kind);
     setError(false);
-    setStatus(kind === 'fact' ? 'uploading…' : 'asking…');
+    setStatus(kind === 'fact' ? 'uploading…' : `asking (${mode.short})…`);
     try {
-      const r = kind === 'fact' ? await api('/facts', { method: 'POST', body: { text } }) : await api('/ask', { method: 'POST', body: { question: text } });
+      const r = kind === 'fact' ? await api('/facts', { method: 'POST', body: { text } }) : await api('/ask', { method: 'POST', body: { question: text, mode: askMode } });
       const sources = (r.sources || []).length;
+      const t = r.timing;
       setStatus(
         r.fallback
           ? `replayed "${r.recording}" (fallback)`
           : kind === 'fact'
             ? `stored ${r.chunks} chunk${r.chunks === 1 ? '' : 's'} · ${r.total} rows`
-            : `${sources} source${sources === 1 ? '' : 's'}`
+            : `${pathLabel(r) || mode.short} · ${sources} source${sources === 1 ? '' : 's'}${t ? ` · first token ${secs(t.firstTokenMs)} · total ${secs(t.totalMs)}` : ''}`
       );
       if (kind === 'fact') setFact('');
       else setQuestion('');
@@ -160,9 +223,17 @@ function AskDock() {
   return (
     <div className="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center px-3">
       <div className="pointer-events-auto flex w-full max-w-2xl flex-col gap-2">
-        <Card size="sm" data-testid="answer-card">
+        <Card size="sm" data-testid="answer-card" data-path={answer.path ?? undefined}>
           <CardHeader>
-            <CardTitle className="text-xs tracking-wider text-muted-foreground uppercase">answer</CardTitle>
+            <CardTitle className="flex items-center gap-2 text-xs tracking-wider text-muted-foreground uppercase">
+              answer
+              {answer.path && answer.path !== 'harness' && (
+                <Badge variant="outline" data-testid="answer-path" className={cn('normal-case tracking-normal', answer.path === 'fast' ? 'text-stage-functions' : 'text-stage-agent')}>
+                  {answer.path === 'fast' ? <ZapIcon data-icon="inline-start" /> : <BotIcon data-icon="inline-start" />}
+                  {pathLabel(answer.meta ?? { preset: answer.preset })}
+                </Badge>
+              )}
+            </CardTitle>
             {answer.question && <CardDescription className="truncate">? {answer.question}</CardDescription>}
             {answer.done && (
               <CardAction>
@@ -172,16 +243,61 @@ function AskDock() {
               </CardAction>
             )}
           </CardHeader>
-          <CardContent>
+          <CardContent className="flex flex-col gap-1.5">
             <p className={cn('max-h-20 overflow-y-auto text-sm', answer.text || answer.streaming ? 'text-success' : 'text-muted-foreground', answer.streaming && 'answer-caret')}>
               {answer.text || (answer.streaming ? '' : 'ask a question and the tokens land here as they arrive')}
             </p>
+            {answer.meta && (
+              <p data-testid="answer-timing" className="text-[11px] tabular-nums text-warning">
+                measured · {timingText(answer.meta)}
+                {answer.meta.reason && answer.meta.fallback ? ` (${answer.meta.reason})` : ''}
+              </p>
+            )}
+            {(latency.fast || latency.agent) && (
+              <dl data-testid="latency-compare" className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-0.5 text-[11px] tabular-nums">
+                {MODES.map((m) => (
+                  <div key={m.key} className="contents">
+                    <dt className={cn('flex items-center gap-1', m.key === 'fast' ? 'text-stage-functions' : 'text-stage-agent')}>
+                      <m.icon className="size-3" />
+                      last {m.short}
+                    </dt>
+                    <dd className="truncate text-muted-foreground" data-testid={`latency-${m.key}`}>
+                      {timingText(latency[m.key])}
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            )}
           </CardContent>
         </Card>
 
         <Card size="sm">
           <CardContent>
             <FieldGroup className="gap-2">
+              <Field>
+                <FieldLabel id="ask-mode-label" className="sr-only">
+                  Answer path
+                </FieldLabel>
+                <div className="flex flex-wrap items-center gap-2">
+                  <ToggleGroup type="single" variant="outline" size="sm" spacing={0} aria-labelledby="ask-mode-label" value={askMode} onValueChange={pickMode} data-testid="ask-mode">
+                    {MODES.map((m) => (
+                      <ToggleGroupItem key={m.key} value={m.key} data-testid={`ask-mode-${m.key}`} aria-label={m.label} className={cn('gap-1.5 text-xs', askMode === m.key && (m.key === 'fast' ? 'text-stage-functions' : 'text-stage-agent'))}>
+                        <m.icon className="size-3.5" />
+                        {m.label}
+                      </ToggleGroupItem>
+                    ))}
+                  </ToggleGroup>
+                  {askMode === 'agent' && agentReady && (
+                    <Badge variant="outline" data-testid="agent-ready" className={cn('max-w-[18rem] truncate', agentReady.state === 'ready' ? 'text-success' : agentReady.state === 'error' ? 'text-destructive' : 'text-muted-foreground')}>
+                      {agentReady.state === 'warming' ? <Spinner data-icon="inline-start" /> : null}
+                      harness {agentReady.detail}
+                    </Badge>
+                  )}
+                </div>
+                <FieldDescription data-testid="ask-mode-hint" className="text-xs">
+                  {mode.hint}
+                </FieldDescription>
+              </Field>
               <Field>
                 <FieldLabel htmlFor="fact-input" className="sr-only">
                   Fact

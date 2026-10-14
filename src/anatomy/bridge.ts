@@ -4,7 +4,7 @@
  */
 import { toast } from 'sonner';
 import { MACHINES } from '@/components.js';
-import { store, MAX_LOG, type InspectorPart, type Stats, type Tone, type ConnState, type LegendJob, type Recording, type RecorderStatus, type Fact } from './store';
+import { store, MAX_LOG, type InspectorPart, type Stats, type Tone, type ConnState, type LegendJob, type Recording, type RecorderStatus, type Fact, type AnswerMeta, type AnswerPath, type AskMode } from './store';
 import { describeEvent } from './format';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -55,27 +55,46 @@ export function createBridge() {
     setStatsProvider(fn: (part: Part) => Stats) {
       statsProvider = fn;
     },
-    /** publish a snapshot of every machine's live stats for the Architecture section */
-    trackMachineStats(stats: Record<string, Stats>) {
+    /**
+     * publish a snapshot of every machine's live stats for the Architecture section; `merge` folds extra
+     * stat groups into a machine card (the App Platform shows its ingest and its fast-path counters together)
+     */
+    trackMachineStats(stats: Record<string, Stats>, merge: Record<string, string[]> = {}) {
       let last = '';
       timers.push(
         setInterval(() => {
           const json = JSON.stringify(stats);
           if (json === last) return;
           last = json;
-          store.set({ machineStats: JSON.parse(json) });
+          const snap: Record<string, Stats> = JSON.parse(json);
+          for (const [machine, groups] of Object.entries(merge)) snap[machine] = Object.assign({}, ...groups.map((g) => snap[g] || {}));
+          for (const groups of Object.values(merge)) for (const g of groups) if (!(g in merge)) delete snap[g];
+          store.set({ machineStats: snap });
         }, 500)
       );
     },
 
-    answerReset(question: string) {
-      store.set({ answer: { question: question || '', text: '', sources: 0, streaming: true, done: false } });
+    answerReset(question: string, { path = null, preset = null }: { path?: AnswerPath | null; preset?: string | null } = {}) {
+      store.set({ answer: { question: question || '', text: '', sources: 0, streaming: true, done: false, path, preset, meta: null } });
     },
     answerAppend(token: string) {
       store.set((s) => ({ answer: { ...s.answer, text: s.answer.text + token, streaming: true } }));
     },
     answerSet(text: string, sources: unknown[] = []) {
       store.set((s) => ({ answer: { ...s.answer, text, sources: sources.length, streaming: false, done: true } }));
+    },
+    /** the measured outcome of the current question (job done: timing, backend, fallback) */
+    answerMeta(meta: AnswerMeta) {
+      store.set((s) => ({ answer: { ...s.answer, meta, path: meta.path, preset: meta.preset ?? s.answer.preset } }));
+    },
+    /** remember the last measured answer per path (fast / agent) for the side-by-side readout */
+    setLatency(path: AnswerPath, meta: AnswerMeta) {
+      if (path !== 'fast' && path !== 'agent') return;
+      store.set((s) => ({ latency: { ...s.latency, [path]: meta } }));
+    },
+    /** the ask box toggle, read by the auto-traffic loop */
+    askMode(): AskMode {
+      return store.get().askMode;
     },
 
     log(e: any, { latency, stale }: { latency?: number | string; stale?: boolean } = {}) {

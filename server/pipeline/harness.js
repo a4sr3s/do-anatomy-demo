@@ -791,6 +791,43 @@ export class HarnessClient {
     return json.session || json;
   }
 
+  /**
+   * POST /sessions/{id}/resume: thaw a PAUSED microVM session now instead of on the next input
+   * (the API answers 204 once the sandbox is ready). Resolves true when it was accepted.
+   */
+  async resumeSession(id) {
+    const res = await this.fetch(`${this.cfg.apiUrl}/${id}/resume`, { method: 'POST', headers: this.headers() });
+    if (res.ok || res.status === 204) return true;
+    throw new Error(`Harness resume session failed: ${res.status} ${await res.text()}`);
+  }
+
+  /**
+   * Keep the agent path ready: make sure the session exists and its event stream is attached, thaw it
+   * when it idled into PAUSED, and run the idle-rotation check (a session that sat idle longer than
+   * HARNESS_ROTATE_IDLE_MS is rotated in the background, as it would be after a question). Never
+   * creates a session beyond the one the app owns. Resolves { session, status, resumed, rotation }.
+   */
+  async wakeUp() {
+    const t0 = Date.now();
+    const s = await this.ensureSession();
+    let status = 'unknown';
+    let resumed = false;
+    try {
+      status = String((await this.getSession(s.id)).status || 'unknown');
+      if (/PAUSED/.test(status)) {
+        await this.resumeSession(s.id);
+        resumed = true;
+        status = String((await this.getSession(s.id)).status || status);
+      }
+    } catch (err) {
+      this.log.error?.(`[harness] wake-up of ${s.name}: ${err.message}`);
+      status = `error: ${err.message}`;
+    }
+    const idle = this.lastUsedAt ? Date.now() - this.lastUsedAt : 0;
+    const rotation = this.maybeRotate(idle);
+    return { session: s.name, sessionId: s.id, created: s.created, status, resumed, rotation: rotation ? 'started' : null, ms: Date.now() - t0 };
+  }
+
   /** Best effort DELETE; never throws, resolves true when the API accepted it. */
   async deleteSession(id, name = id) {
     if (!id) return false;

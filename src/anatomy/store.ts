@@ -7,6 +7,32 @@
 import { useSyncExternalStore } from 'react';
 
 export type Section = 'architecture' | 'facts' | 'logs' | 'config';
+/** The two answer paths the ask box offers (POST /api/ask {mode}); see ANSWER_PRESETS on the server. */
+export type AskMode = 'fast' | 'agent';
+/** How a question job ran, from its own events: `harness` = search-first on the harness backend / old recordings. */
+export type AnswerPath = AskMode | 'harness';
+
+export interface AnswerTiming {
+  firstTokenMs: number | null;
+  totalMs: number;
+  toolCalls?: number;
+  reasoningTokens?: number;
+  searchMs?: number;
+  embedCached?: boolean;
+  hits?: number;
+}
+
+/** Measured outcome of one answered question (the `job done` event), kept per path for the fast / agent contrast. */
+export interface AnswerMeta {
+  path: AnswerPath;
+  preset: string | null;
+  backend: string | null;
+  answerMode: string | null;
+  fallback: string | null;
+  reason: string | null;
+  timing: AnswerTiming;
+  at: number;
+}
 export type Tone = '' | 'ok' | 'warn' | 'err';
 export type ConnState = 'connecting' | 'open' | 'reconnecting';
 
@@ -79,7 +105,13 @@ export interface State {
   legend: LegendJob[];
   logs: LogEntry[];
   logTotal: number;
-  answer: { question: string; text: string; sources: number; streaming: boolean; done: boolean };
+  answer: { question: string; text: string; sources: number; streaming: boolean; done: boolean; path: AnswerPath | null; preset: string | null; meta: AnswerMeta | null };
+  /** the ask box toggle (persisted in localStorage) */
+  askMode: AskMode;
+  /** last measured answer per path, so both latencies can be shown side by side */
+  latency: Record<AskMode, AnswerMeta | null>;
+  /** agent-mode readiness as reported by POST /api/harness/warm (null = not asked yet) */
+  agentReady: { state: 'warming' | 'ready' | 'error' | 'skipped'; detail: string; at: number } | null;
   inspector: { part: InspectorPart | null; pinned: boolean; stats: Stats };
   machineStats: Record<string, Stats>;
   recordings: Recording[];
@@ -92,6 +124,25 @@ export interface State {
   bloom: boolean;
 }
 
+const ASK_MODE_KEY = 'anatomy.askMode';
+function readAskMode(): AskMode {
+  try {
+    const v = globalThis.localStorage?.getItem(ASK_MODE_KEY);
+    return v === 'agent' ? 'agent' : 'fast';
+  } catch {
+    return 'fast';
+  }
+}
+/** Persist the toggle so a page reload (or the replay safety net) keeps the presenter's choice. */
+export function setAskMode(mode: AskMode) {
+  store.set({ askMode: mode });
+  try {
+    globalThis.localStorage?.setItem(ASK_MODE_KEY, mode);
+  } catch {
+    /* private mode: the toggle still works for the session */
+  }
+}
+
 const initial: State = {
   section: 'architecture',
   mode: 'connecting…',
@@ -101,7 +152,10 @@ const initial: State = {
   legend: [],
   logs: [],
   logTotal: 0,
-  answer: { question: '', text: '', sources: 0, streaming: false, done: false },
+  answer: { question: '', text: '', sources: 0, streaming: false, done: false, path: null, preset: null, meta: null },
+  askMode: readAskMode(),
+  latency: { fast: null, agent: null },
+  agentReady: null,
   inspector: { part: null, pinned: false, stats: {} },
   machineStats: {},
   recordings: [],

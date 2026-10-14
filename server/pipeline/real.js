@@ -12,8 +12,33 @@ const MCP_HEALTH_TIMEOUT_MS = 1500;
 /** A health result younger than this is reused; a stale one is reused while a refresh runs in the background. */
 const DEFAULT_MCP_HEALTH_TTL_MS = 30000;
 const SEARCH_K = 3;
+/** POST /api/harness/warm wakes the harness session at most this often (the UI calls it on every switch to Agent). */
+const WARM_THROTTLE_MS = 10000;
 export const ANSWER_MODES = ['tool', 'search-first'];
 export const SEARCH_FIRST_BACKENDS = ['harness', 'direct'];
+/**
+ * The two answer paths the UI toggle offers (POST /api/ask {question, mode: 'fast' | 'agent'}, no secret needed):
+ *   fast   search-first on direct Serverless Inference with reasoning low: the app embeds the question, searches
+ *          pgvector and asks the model once (App Platform -> pgvector -> Serverless Inference; Harness and Gateway idle)
+ *   agent  the tool path: the OpenCode agent in the Harness Runtime calls search_facts / get_document itself through
+ *          the Action Gateway (Harness -> model -> Gateway -> pgvector / Spaces -> model)
+ * Neither changes the server default (ANSWER_MODE & co.), which a request without `mode` still gets.
+ */
+export const ANSWER_PRESETS = Object.freeze({
+  fast: Object.freeze({ mode: 'search-first', backend: 'direct', effort: 'low' }),
+  agent: Object.freeze({ mode: 'tool' }),
+});
+/** The preset named by a request body `mode` (`fast` | `agent`, any case), or null for anything else. */
+export function presetFor(mode) {
+  const key = String(mode ?? '').trim().toLowerCase();
+  return Object.hasOwn(ANSWER_PRESETS, key) ? { ...ANSWER_PRESETS[key], preset: key } : null;
+}
+/** The preset name a resolved path corresponds to (`fast` | `agent`), or null (e.g. search-first on the harness). */
+export function presetName({ mode, backend }) {
+  if (mode === 'tool') return 'agent';
+  if (mode === 'search-first' && backend === 'direct') return 'fast';
+  return null;
+}
 // Defaults from the live benchmark of 2026-10-14 (bench/SEARCH_FIRST.md): search-first on direct Serverless
 // Inference with reasoning_effort low gave a 0.6 s (cached embedding) / 0.9 s (cold) median first token,
 // 71/71 correct answers (EN, ES and unknown) and no stalls; the tool path stays one flag away (ANSWER_MODE=tool).
@@ -47,11 +72,14 @@ export function answerConfig(env) {
 /** Normalise per-request overrides (POST /api/ask body, authorised callers only): unknown values fall back to the config. */
 export function answerOptions(cfg, opts = {}) {
   const pick = (v, list, dflt) => { const x = String(v ?? '').trim().toLowerCase().replace(/_/g, '-'); return list.includes(x) ? x : dflt; };
-  return {
+  const o = {
     mode: pick(opts.mode, ANSWER_MODES, cfg.mode),
     backend: pick(opts.backend, SEARCH_FIRST_BACKENDS, cfg.backend),
     effort: pick(opts.effort, REASONING_EFFORTS, cfg.effort),
   };
+  // the UI's name for the path (`fast` | `agent`): what was asked for, else what the resolved path amounts to
+  o.preset = Object.hasOwn(ANSWER_PRESETS, String(opts.preset ?? '')) ? String(opts.preset) : presetName(o);
+  return o;
 }
 
 /** Short, log-safe rendering of tool arguments: search_facts(query=…) */
@@ -157,6 +185,8 @@ export class RealPipeline {
     this.askQueue = Promise.resolve();
     this.mcpHealth = null; // last MCP health check { ok, reason?, at }; primed at warm-up, refreshed in the background (see mcpHealthy)
     this.mcpHealthRefresh = null;
+    this.warming = null; // in-flight warmAgent() (see there)
+    this.lastWarm = null; // { at, result } of the last warmAgent()
   }
 
   describe() {
@@ -185,6 +215,7 @@ export class RealPipeline {
       harnessStream: this.harness.streamStatus(),
       harnessFirstTokenTimeoutMs: h.firstTokenTimeoutMs,
       mcpHealth: this.mcpHealth,
+      harnessLastWarm: this.lastWarm ? { at: this.lastWarm.at, ...(this.lastWarm.result || {}) } : null,
       toolsMode: h.toolsMode,
       mcp: Boolean(h.mcpUrl),
       inferenceVia: this.inferenceVia(),
@@ -208,6 +239,33 @@ export class RealPipeline {
     if (this.cfg.harness.token) return 'harness';
     if (this.cfg.answer.mode === 'search-first' && this.cfg.answer.backend === 'direct' && this.direct.key) return 'direct';
     return null;
+  }
+
+  /**
+   * Agent-mode readiness (POST /api/harness/warm, called by the UI when the toggle switches to Agent):
+   * thaw a paused session, make sure its event stream is attached, run the idle-rotation check and
+   * prime the MCP health cache, so the first agent question does not pay for any of it. Cheap (no
+   * model run) and throttled: one wake-up per WARM_THROTTLE_MS, concurrent callers share it.
+   * Never throws; resolves { ok, skipped?, ...wakeUp() }.
+   */
+  warmAgent(log = console) {
+    if (!this.cfg.harness.token) return Promise.resolve({ ok: false, skipped: true, reason: 'HARNESS_API_TOKEN not set' });
+    const now = Date.now();
+    if (this.warming) return this.warming;
+    if (this.lastWarm && now - this.lastWarm.at < WARM_THROTTLE_MS) return Promise.resolve({ ...this.lastWarm.result, throttled: true });
+    if (this.cfg.harness.toolsMode !== 'none') this.mcpHealthy().catch(() => {});
+    this.warming = this.harness.wakeUp()
+      .then((r) => {
+        log.log(`[warm] harness session ${r.session} ${r.status}${r.resumed ? ' (resumed)' : ''}${r.rotation ? ' · rotation started' : ''} in ${r.ms} ms`);
+        return { ok: true, ...r };
+      })
+      .catch((err) => {
+        log.error(`[warm] harness session not ready: ${err.message}`);
+        return { ok: false, error: err.message };
+      })
+      .finally(() => { this.warming = null; });
+    this.lastWarm = { at: now, result: null };
+    return this.warming.then((r) => { this.lastWarm = { at: now, result: r }; return r; });
   }
 
   /**
@@ -506,7 +564,7 @@ export class RealPipeline {
     const ev = this.bus.forJob(jobId, 'query');
     const t0 = Date.now();
     const o = answerOptions(this.cfg.answer, opts);
-    ev.job('start', { input: question, answerMode: o.mode, ...(o.mode === 'search-first' ? { backend: o.backend, effort: o.effort } : {}) });
+    ev.job('start', { input: question, answerMode: o.mode, preset: o.preset, ...(o.mode === 'search-first' ? { backend: o.backend, effort: o.effort } : { backend: 'harness' }) });
     try {
       let run;
       if (o.mode === 'search-first') {
@@ -523,8 +581,8 @@ export class RealPipeline {
       const result = await run;
       const { answer, sources } = result;
       ev.answer(answer, sources);
-      ev.job('done', { answer, sources, timing: result.timing, backend: result.backend, answerMode: result.answerMode, fallback: result.fallback, reason: result.reason });
-      return { jobId, ...result };
+      ev.job('done', { answer, sources, timing: result.timing, backend: result.backend, answerMode: result.answerMode, preset: o.preset, fallback: result.fallback, reason: result.reason });
+      return { jobId, preset: o.preset, ...result };
     } catch (err) {
       ev.job('error', { message: err.message });
       throw Object.assign(err, { jobId, flow: 'query' });
@@ -560,7 +618,7 @@ export class RealPipeline {
     // 1. the search, at once (overlapping the warm session / connection checks, which cost nothing when warm)
     const warm = backend === 'harness' ? this.harness.ensureSession().catch(() => null) : null;
     const tSearch = Date.now();
-    const info = {};
+    const info = { mode: 'search-first', backend };
     const found = await this.retrieve(question, ev, info);
     const searchMs = Date.now() - tSearch;
     const embedCached = Boolean(info.cached);
@@ -715,7 +773,7 @@ export class RealPipeline {
       // context-in-prompt fallback: the app retrieves itself (unless the guard search already did) and passes the context in the prompt
       gate.enabled = false;
       gate.held.length = 0;
-      sources = found || (await this.retrieve(question, ev));
+      sources = found || (await this.retrieve(question, ev, { mode: 'context' }));
       const context = sources.map((s, i) => `[${i + 1}] ${s.chunk}`).join('\n');
       ev.stage('inference', 'start', `Serverless inference via harness: ${h.model}`, { model: h.model, via: 'harness', toolsMode: 'none' });
       harnessOut = await askHarness(buildPrompt(question, context, { effort: h.reasoningEffort }), hooks(detail));
@@ -918,16 +976,20 @@ export class RealPipeline {
    */
   async retrieve(question, ev, info = {}) {
     const t0 = Date.now();
-    ev.stage('kb', 'start', 'App-side retrieval: embedding the question', { question });
+    // `mode` tells the scene who is searching: `search-first` (the App Platform web service, before any model call;
+    // with backend `direct` no harness is involved at all) or `context` (the context-in-prompt fallback inside a harness
+    // question). The wire stage names stay the same.
+    const tag = { mode: info.mode || 'context', ...(info.backend ? { backend: info.backend } : {}), via: 'app' };
+    ev.stage('kb', 'start', 'App-side retrieval: embedding the question', { question, ...tag });
     const { vector: qvec, cached } = await this.embedQuery(question);
     info.cached = cached;
-    ev.stage('kb', 'progress', cached ? `Query embedding reused from the cache (${Date.now() - t0} ms)` : `Query embedded (${this.cfg.dim} dims, ${Date.now() - t0} ms)`, { step: 'embed', cached, ms: Date.now() - t0 });
+    ev.stage('kb', 'progress', cached ? `Query embedding reused from the cache (${Date.now() - t0} ms)` : `Query embedded (${this.cfg.dim} dims, ${Date.now() - t0} ms)`, { step: 'embed', cached, ms: Date.now() - t0, ...tag });
     const tq = Date.now();
-    ev.stage('vectordb', 'start', 'pgvector cosine search, top 3', { op: 'search' });
+    ev.stage('vectordb', 'start', 'pgvector cosine search, top 3', { op: 'search', ...tag });
     const pool = await this.db();
     const sources = await cosineSearch(pool, this.cfg.table, qvec, 3, this.cfg.scoreFloor);
-    ev.stage('vectordb', 'done', `${sources.length} relevant chunk${sources.length === 1 ? '' : 's'} retrieved · ${Date.now() - tq} ms`, { count: this.count, hits: sources.map((s) => ({ id: s.id, score: s.score })), op: 'search', ms: Date.now() - tq });
-    ev.stage('kb', 'done', `Context assembled from ${sources.length} chunk${sources.length === 1 ? '' : 's'} (${Date.now() - t0} ms)`, { hits: sources.length, ms: Date.now() - t0, cached });
+    ev.stage('vectordb', 'done', `${sources.length} relevant chunk${sources.length === 1 ? '' : 's'} retrieved · ${Date.now() - tq} ms`, { count: this.count, hits: sources.map((s) => ({ id: s.id, score: s.score })), op: 'search', ms: Date.now() - tq, ...tag });
+    ev.stage('kb', 'done', `Context assembled from ${sources.length} chunk${sources.length === 1 ? '' : 's'} (${Date.now() - t0} ms)`, { hits: sources.length, ms: Date.now() - t0, cached, ...tag });
     return sources;
   }
 }

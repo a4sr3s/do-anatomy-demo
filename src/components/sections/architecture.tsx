@@ -29,10 +29,12 @@ export function ArchitectureSection() {
         <SidebarGroupLabel>Pipeline</SidebarGroupLabel>
         <SidebarGroupContent className="flex flex-col gap-2 px-2">
           <p className="text-xs text-muted-foreground">
-            A fact goes CLIENT → SPACES → APP PLATFORM (chunk &amp; embed in the web service) → PGVECTOR. A question goes CLIENT → HARNESS RUNTIME,
-            where the OpenCode agent calls the search_facts tool: ACTION GATEWAY → MCP server → PGVECTOR (or SPACES for get_document) and back, then
-            SERVERLESS INFERENCE (gpt-oss-20b) streams the grounded answer to the CLIENT. If the tool path is down the app retrieves itself and passes the
-            context in the prompt. Every motion in the scene is a backend event.
+            A fact goes CLIENT → SPACES → APP PLATFORM (chunk &amp; embed in the web service) → PGVECTOR. A question takes one of two paths, picked
+            with the toggle above the ask box. <b>Fast</b>: CLIENT → APP PLATFORM (embeds the question, searches PGVECTOR itself) → SERVERLESS
+            INFERENCE (one streamed round, reasoning low) → CLIENT; the Harness and the Gateway stay dark. <b>Agent</b>: CLIENT → HARNESS RUNTIME, where
+            the OpenCode agent plans and calls search_facts: ACTION GATEWAY → MCP server → PGVECTOR (or SPACES for get_document) and back, then
+            SERVERLESS INFERENCE streams the grounded answer to the CLIENT. If the tool path is down the app retrieves itself and passes the context in
+            the prompt. Every motion in the scene is a backend event; the measured first-token / total latency of each answer is shown under the answer.
           </p>
           {machines.map((m) => (
             <MachineCard key={m.key} machine={m} stats={machineStats[m.key]} />

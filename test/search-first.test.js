@@ -73,9 +73,11 @@ test('answerConfig: defaults (search-first, direct backend, effort low, cache 25
   assert.deepEqual(answerConfig({ ANSWER_MODE: 'search_first', SEARCH_FIRST_BACKEND: 'Direct', SEARCH_FIRST_REASONING_EFFORT: 'LOW', EMBED_CACHE_SIZE: '0' }), { mode: 'search-first', backend: 'direct', effort: 'low', embedCacheSize: 0 });
   assert.deepEqual(answerConfig({ ANSWER_MODE: 'magic', SEARCH_FIRST_BACKEND: 'agent', SEARCH_FIRST_REASONING_EFFORT: 'max', EMBED_CACHE_SIZE: '-3' }), { mode: 'search-first', backend: 'direct', effort: 'low', embedCacheSize: 256 });
   const cfg = answerConfig({ ANSWER_MODE: 'search-first', SEARCH_FIRST_BACKEND: 'harness', SEARCH_FIRST_REASONING_EFFORT: 'off' });
-  assert.deepEqual(answerOptions(cfg, {}), { mode: 'search-first', backend: 'harness', effort: 'off' });
-  assert.deepEqual(answerOptions(cfg, { mode: 'tool', backend: 'direct', effort: 'low' }), { mode: 'tool', backend: 'direct', effort: 'low' });
-  assert.deepEqual(answerOptions(cfg, { mode: 'nope', backend: 7, effort: null }), { mode: 'search-first', backend: 'harness', effort: 'off' });
+  assert.deepEqual(answerOptions(cfg, {}), { mode: 'search-first', backend: 'harness', effort: 'off', preset: null }, 'search-first on the harness is neither UI preset');
+  assert.deepEqual(answerOptions(cfg, { mode: 'tool', backend: 'direct', effort: 'low' }), { mode: 'tool', backend: 'direct', effort: 'low', preset: 'agent' });
+  assert.deepEqual(answerOptions(cfg, { mode: 'nope', backend: 7, effort: null }), { mode: 'search-first', backend: 'harness', effort: 'off', preset: null });
+  assert.deepEqual(answerOptions(cfg, { mode: 'search-first', backend: 'direct' }), { mode: 'search-first', backend: 'direct', effort: 'off', preset: 'fast' }, 'the resolved path names its preset');
+  assert.deepEqual(answerOptions(cfg, { mode: 'search-first', backend: 'direct', effort: 'low', preset: 'fast' }), { mode: 'search-first', backend: 'direct', effort: 'low', preset: 'fast' });
   const d = new RealPipeline(new EventBus(), { ...ENV, ANSWER_MODE: 'search-first', SEARCH_FIRST_BACKEND: 'direct' }).describe();
   assert.equal(d.answerMode, 'search-first');
   assert.equal(d.searchFirstBackend, 'direct');
