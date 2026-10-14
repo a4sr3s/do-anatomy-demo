@@ -833,6 +833,14 @@ export class RealPipeline {
             // the agent never got a usable tool result: retry once with context in the prompt
             ev.stage('agent', 'progress', `No usable tool result (${run.toolDone} done, ${run.toolErrors} failed); retrying with context passed in prompt`, { fallback: 'context', via: 'harness' });
             await contextRun('context retry', 'context-retry');
+          } else if (isDontKnow(answer) && run.hits.length > 0) {
+            // GUARD (measured on gpt-oss-20b, Spanish questions above all): the tool returned matching facts and the
+            // agent still wrote the fixed "don't know" line. The hits are the ground truth, so exactly one more model
+            // run gets them in the prompt (no second search); that run is held to the same ANSWER-only rule and may
+            // well say "don't know" again, in which case that stands. Unknown questions have no hits and never retry.
+            const n = run.hits.length;
+            ev.stage('agent', 'progress', `Harness answered "${dontKnow}" although search_facts returned ${n} hit${n === 1 ? '' : 's'}; one model run with those facts passed in the prompt`, { fallback: 'context-retry', reason: 'dont-know despite hits', hits: n, via: 'harness' });
+            await contextRun(`context retry (${n} hit${n === 1 ? '' : 's'} ignored)`, 'context-retry', `don't know despite ${n} hit${n === 1 ? '' : 's'}`, run.hits.slice());
           }
         }
       } else {

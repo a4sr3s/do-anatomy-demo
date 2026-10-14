@@ -276,3 +276,48 @@ test('POST /api/harness/warm: thaws a PAUSED session (GET -> POST /resume -> GET
     server.close();
   }
 });
+
+test('agent path guard: "don\'t know" although search_facts returned hits -> one context run with those hits (fallback context-retry); no hits -> no retry', async () => {
+  const { p, events } = setup();
+  const prompts = [];
+  const spanish = 'Todavía no lo sé.';
+  p.harness.ask = async (prompt, hooks) => {
+    prompts.push(prompt);
+    hooks.onStarted?.(100);
+    if (prompts.length === 1) {
+      p.handleToolEvent({ tool: 'search_facts', phase: 'start', args: { query: 'faro', k: 3 }, target: 'pgvector', callId: 'c1' });
+      p.handleToolEvent({ tool: 'search_facts', phase: 'done', args: { query: 'faro', k: 3 }, target: 'pgvector', callId: 'c1', ms: 30, hits: [{ id: 7, chunk: FACT, score: 0.8 }], summary: '1 hit' });
+      hooks.onToken?.(spanish, 0);
+      return { text: spanish, tokens: 3, noMarker: false, reasoningTokens: 0, runId: 'r1' };
+    }
+    hooks.onToken?.(' Odalys Ferro cuida el faro y tiene tres gatos.', 0);
+    return { text: 'Odalys Ferro cuida el faro y tiene tres gatos.', tokens: 8, noMarker: false, reasoningTokens: 0, runId: 'r2' };
+  };
+  const out = await p.ask('¿Quién cuida el faro de Ravenwood?', presetFor('agent'));
+  assert.equal(out.answer, 'Odalys Ferro cuida el faro y tiene tres gatos.');
+  assert.equal(out.fallback, 'context-retry');
+  assert.match(out.reason, /don't know despite 1 hit/);
+  assert.equal(prompts.length, 2, 'exactly one more model run');
+  assert.match(prompts[1], /Context:\n\[1\] The Ravenwood lighthouse is kept by Odalys Ferro/, 'the tool\'s hits go in the prompt');
+  assert.ok(!events.some((e) => e.stage === 'kb'), 'no second search: the hits are reused');
+  assert.equal(out.timing.toolCalls, 1);
+  assert.deepEqual(out.sources.map((x) => x.id), [7]);
+  const guard = events.find((e) => e.stage === 'agent' && e.status === 'progress' && e.data.fallback === 'context-retry');
+  assert.equal(guard.data.hits, 1);
+  assert.equal(events.find((e) => e.type === 'job' && e.status === 'done').data.fallback, 'context-retry');
+
+  // unknown question: the tool returns nothing, the fixed line stands, no retry
+  const { p: q } = setup({}, { rows: [] });
+  const calls = [];
+  q.harness.ask = async (prompt, hooks) => {
+    calls.push(prompt);
+    q.handleToolEvent({ tool: 'search_facts', phase: 'start', args: { query: 'z', k: 3 }, target: 'pgvector', callId: 'c2' });
+    q.handleToolEvent({ tool: 'search_facts', phase: 'done', args: { query: 'z', k: 3 }, target: 'pgvector', callId: 'c2', ms: 20, hits: [], summary: 'NO_MATCHING_FACTS' });
+    hooks.onToken?.('I do not know that yet.', 0);
+    return { text: 'I do not know that yet.', tokens: 6, noMarker: false, reasoningTokens: 0, runId: 'r3' };
+  };
+  const unk = await q.ask('What is the orbital period of the planet Zorblax-9?', presetFor('agent'));
+  assert.equal(unk.answer, 'I do not know that yet.');
+  assert.equal(unk.fallback, null);
+  assert.equal(calls.length, 1);
+});
