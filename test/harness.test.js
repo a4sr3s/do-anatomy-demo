@@ -7,7 +7,8 @@ import { createApp } from '../server/app.js';
 
 const FACT = 'Acme Robotics runs 40 GPU droplets in SFO3.';
 // HARNESS_CONFIG_ID=none: the manifest (YAML) path these tests were written for; the config path has its own tests below
-const BASE_ENV = { HARNESS_API_TOKEN: 'tok', HARNESS_INFERENCE_API_KEY: 'k', MCP_PUBLIC_URL: 'https://demo.example/mcp', MCP_AUTH_TOKEN: 'mcp-secret', HARNESS_CONFIG_ID: 'none' };
+// ANSWER_MODE=tool: these tests cover the agent-with-tools path; the default answer path is search-first (test/search-first.test.js)
+const BASE_ENV = { HARNESS_API_TOKEN: 'tok', HARNESS_INFERENCE_API_KEY: 'k', MCP_PUBLIC_URL: 'https://demo.example/mcp', MCP_AUTH_TOKEN: 'mcp-secret', HARNESS_CONFIG_ID: 'none', ANSWER_MODE: 'tool' };
 const CONFIG_ID = '01a132ee-ff11-7130-9d05-838874ecec77';
 /** Config path env: sessions come from the Environment Config, rotation polls fast and never backs off for long. */
 const CONFIG_ENV = { ...BASE_ENV, HARNESS_CONFIG_ID: CONFIG_ID, HARNESS_ROTATE_POLL_MS: '1', HARNESS_ROTATE_READY_TIMEOUT_MS: '2000' };

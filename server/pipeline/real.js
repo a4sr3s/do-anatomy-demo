@@ -14,9 +14,12 @@ const DEFAULT_MCP_HEALTH_TTL_MS = 30000;
 const SEARCH_K = 3;
 export const ANSWER_MODES = ['tool', 'search-first'];
 export const SEARCH_FIRST_BACKENDS = ['harness', 'direct'];
-const DEFAULT_ANSWER_MODE = 'tool';
-const DEFAULT_SEARCH_FIRST_BACKEND = 'harness';
-const DEFAULT_SEARCH_FIRST_EFFORT = 'off';
+// Defaults from the live benchmark of 2026-10-14 (bench/SEARCH_FIRST.md): search-first on direct Serverless
+// Inference with reasoning_effort low gave a 0.6 s (cached embedding) / 0.9 s (cold) median first token,
+// 71/71 correct answers (EN, ES and unknown) and no stalls; the tool path stays one flag away (ANSWER_MODE=tool).
+const DEFAULT_ANSWER_MODE = 'search-first';
+const DEFAULT_SEARCH_FIRST_BACKEND = 'direct';
+const DEFAULT_SEARCH_FIRST_EFFORT = 'low';
 const DEFAULT_EMBED_CACHE_SIZE = 256;
 
 /**

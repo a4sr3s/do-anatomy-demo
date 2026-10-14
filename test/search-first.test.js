@@ -8,7 +8,8 @@ import { DirectInference } from '../server/pipeline/direct.js';
 import { createApp } from '../server/app.js';
 
 const FACT = 'The Ravenwood lighthouse is kept by Odalys Ferro, who has three cats.';
-const ENV = { HARNESS_API_TOKEN: 'tok', HARNESS_INFERENCE_API_KEY: 'k', MCP_PUBLIC_URL: 'https://demo.example/mcp', MCP_AUTH_TOKEN: 'mcp-secret', HARNESS_CONFIG_ID: 'none', DATABASE_URL: 'postgres://stub' };
+// every knob pinned to its non-default value, so each test states the path it exercises explicitly
+const ENV = { HARNESS_API_TOKEN: 'tok', HARNESS_INFERENCE_API_KEY: 'k', MCP_PUBLIC_URL: 'https://demo.example/mcp', MCP_AUTH_TOKEN: 'mcp-secret', HARNESS_CONFIG_ID: 'none', DATABASE_URL: 'postgres://stub', ANSWER_MODE: 'tool', SEARCH_FIRST_BACKEND: 'harness', SEARCH_FIRST_REASONING_EFFORT: 'off' };
 const starts = (events) => events.filter((e) => e.type === 'stage' && e.status === 'start').map((e) => e.stage);
 const tokensOf = (events) => events.filter((e) => e.type === 'stage' && e.stage === 'inference' && e.status === 'progress' && e.data.token !== undefined).map((e) => e.data.token).join('');
 
@@ -66,11 +67,12 @@ function setup(env, { rows = [{ id: 7, chunk: FACT, score: 0.9, object_key: 'fac
   return { p, events, queries, embedded, fetches, inference, restore: () => (globalThis.fetch = realFetch) };
 }
 
-test('answerConfig: defaults (tool mode, harness backend, effort off, cache 256) and validation of every knob', () => {
-  assert.deepEqual(answerConfig({}), { mode: 'tool', backend: 'harness', effort: 'off', embedCacheSize: 256 });
+test('answerConfig: defaults (search-first, direct backend, effort low, cache 256) and validation of every knob', () => {
+  assert.deepEqual(answerConfig({}), { mode: 'search-first', backend: 'direct', effort: 'low', embedCacheSize: 256 });
+  assert.deepEqual(answerConfig({ ANSWER_MODE: 'tool' }), { mode: 'tool', backend: 'direct', effort: 'low', embedCacheSize: 256 });
   assert.deepEqual(answerConfig({ ANSWER_MODE: 'search_first', SEARCH_FIRST_BACKEND: 'Direct', SEARCH_FIRST_REASONING_EFFORT: 'LOW', EMBED_CACHE_SIZE: '0' }), { mode: 'search-first', backend: 'direct', effort: 'low', embedCacheSize: 0 });
-  assert.deepEqual(answerConfig({ ANSWER_MODE: 'magic', SEARCH_FIRST_BACKEND: 'agent', SEARCH_FIRST_REASONING_EFFORT: 'max', EMBED_CACHE_SIZE: '-3' }), { mode: 'tool', backend: 'harness', effort: 'off', embedCacheSize: 256 });
-  const cfg = answerConfig({ ANSWER_MODE: 'search-first' });
+  assert.deepEqual(answerConfig({ ANSWER_MODE: 'magic', SEARCH_FIRST_BACKEND: 'agent', SEARCH_FIRST_REASONING_EFFORT: 'max', EMBED_CACHE_SIZE: '-3' }), { mode: 'search-first', backend: 'direct', effort: 'low', embedCacheSize: 256 });
+  const cfg = answerConfig({ ANSWER_MODE: 'search-first', SEARCH_FIRST_BACKEND: 'harness', SEARCH_FIRST_REASONING_EFFORT: 'off' });
   assert.deepEqual(answerOptions(cfg, {}), { mode: 'search-first', backend: 'harness', effort: 'off' });
   assert.deepEqual(answerOptions(cfg, { mode: 'tool', backend: 'direct', effort: 'low' }), { mode: 'tool', backend: 'direct', effort: 'low' });
   assert.deepEqual(answerOptions(cfg, { mode: 'nope', backend: 7, effort: null }), { mode: 'search-first', backend: 'harness', effort: 'off' });
@@ -80,8 +82,9 @@ test('answerConfig: defaults (tool mode, harness backend, effort off, cache 256)
   assert.equal(d.searchFirstReasoningEffort, 'off');
   assert.equal(d.direct.host, 'inference.do-ai.run');
   assert.deepEqual(d.embedCache, { size: 0, max: 256, hits: 0, misses: 0 });
-  assert.equal(new RealPipeline(new EventBus(), { HARNESS_INFERENCE_API_KEY: 'k', ANSWER_MODE: 'search-first', SEARCH_FIRST_BACKEND: 'direct' }).describe().inferenceVia, 'direct', 'direct search-first needs no harness token');
-  assert.equal(new RealPipeline(new EventBus(), { HARNESS_INFERENCE_API_KEY: 'k' }).describe().inferenceVia, null, 'tool mode still needs the harness');
+  const dflt = new RealPipeline(new EventBus(), { HARNESS_INFERENCE_API_KEY: 'k' }).describe();
+  assert.deepEqual({ m: dflt.answerMode, b: dflt.searchFirstBackend, e: dflt.searchFirstReasoningEffort, via: dflt.inferenceVia }, { m: 'search-first', b: 'direct', e: 'low', via: 'direct' }, 'the default path answers with the inference key alone');
+  assert.equal(new RealPipeline(new EventBus(), { HARNESS_INFERENCE_API_KEY: 'k', ANSWER_MODE: 'tool' }).describe().inferenceVia, null, 'tool mode still needs the harness');
 });
 
 test('search-first via direct Serverless Inference: search first (kb -> vectordb), one streamed model round, ANSWER-only, no harness and no agent stage', async () => {
@@ -368,8 +371,8 @@ test('POST /api/ask: {mode, backend, effort} overrides only count with the share
   }
 });
 
-test('tool mode is untouched by the search-first code: ANSWER_MODE=tool (default) never embeds app-side before the harness run and the result says mode "tool"', async () => {
-  const { p, embedded, inference, restore } = setup({});
+test('tool mode is untouched by the search-first code: ANSWER_MODE=tool never embeds app-side before the harness run and the result says mode "tool"', async () => {
+  const { p, embedded, inference, restore } = setup({ ANSWER_MODE: 'tool' });
   let prompt = '';
   p.harness.ask = async (text, hooks) => { prompt = text; hooks.onToolEvent?.({ type: 'run.tool_call_started', data: { tool: 'do_actions_anatomy-data_search_facts', call_id: 'c1', input: { query: 'q' } } }); hooks.onToken?.(' ok', 0); return { text: 'ok', tokens: 1, noMarker: false, reasoningTokens: 0, runId: 'r' }; };
   p.mcpHealth = { ok: true, at: Date.now() };

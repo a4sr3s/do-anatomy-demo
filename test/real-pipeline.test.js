@@ -37,18 +37,28 @@ test('real pipeline: describe() reports the harness as the only way to the model
     assert.ok(!('answerBackend' in d), 'no answerBackend');
   }
   assert.equal(new RealPipeline(bus, { DO_AGENT_ENDPOINT: 'https://x.agents.do-ai.run/', DO_AGENT_KEY: 'k', ANSWER_BACKEND: 'agent' }).describe().inferenceVia, null, 'DO_AGENT_* / ANSWER_BACKEND are ignored');
-  assert.equal(new RealPipeline(bus, { DO_INFERENCE_KEY: 'k' }).describe().inferenceVia, null, 'a Model Access Key alone does not answer questions');
+  assert.equal(new RealPipeline(bus, { DO_INFERENCE_KEY: 'k', ANSWER_MODE: 'tool' }).describe().inferenceVia, null, 'on the tool path a Model Access Key alone does not answer questions');
+  assert.equal(new RealPipeline(bus, { DO_INFERENCE_KEY: 'k' }).describe().inferenceVia, 'direct', 'the default search-first/direct path answers with the inference key alone');
   assert.equal(typeof RealPipeline.prototype.askAgent, 'undefined');
   assert.equal(typeof RealPipeline.prototype.streamChat, 'undefined');
 });
 
-test('real pipeline: without a harness token a question fails with a clear error that triggers replay fallback', async () => {
-  const { p, events, restore } = setup({ DO_AGENT_ENDPOINT: 'https://x.agents.do-ai.run/', DO_AGENT_KEY: 'k', DO_INFERENCE_KEY: 'k' });
+test('real pipeline: without a harness token a tool-path question fails with a clear error that triggers replay fallback; search-first needs its key too', async () => {
+  const { p, events, restore } = setup({ DO_AGENT_ENDPOINT: 'https://x.agents.do-ai.run/', DO_AGENT_KEY: 'k', DO_INFERENCE_KEY: 'k', ANSWER_MODE: 'tool' });
   try {
     await assert.rejects(p.ask('anything'), /HARNESS_API_TOKEN missing/);
     assert.equal(events.at(-1).type, 'job');
     assert.equal(events.at(-1).status, 'error');
     assert.equal(stageSeq(events, 'start').length, 0, 'fails before touching the database or any network');
+    // search-first via the harness: same requirement; direct: the inference key
+    await assert.rejects(p.ask('anything', { mode: 'search-first', backend: 'harness' }), /HARNESS_API_TOKEN missing .*SEARCH_FIRST_BACKEND=harness/);
+    const noKey = setup({});
+    try {
+      await assert.rejects(noKey.p.ask('anything'), /HARNESS_INFERENCE_API_KEY missing .*SEARCH_FIRST_BACKEND=direct/);
+      assert.equal(stageSeq(noKey.events, 'start').length, 0);
+    } finally {
+      noKey.restore();
+    }
   } finally {
     restore();
   }
