@@ -128,6 +128,16 @@ export async function createApp(options = {}) {
     res.json({ ok: true, ...out });
   });
 
+  // ---- harness session hygiene test hook -----------------------------------
+  // Starts a background rotation of the Harness Runtime session (real mode only); same shared
+  // secret as the tool-event endpoint. Responds at once; questions never wait on the rotation.
+  if (typeof pipeline.rotateSession === 'function') {
+    app.post('/api/harness/rotate', (req, res) => {
+      if (!tokenEquals(req.get('x-tool-event-token'), toolEventToken)) return res.status(401).json({ ok: false, error: 'unauthorized' });
+      res.json({ ok: true, ...pipeline.rotateSession(String(req.body?.reason || 'manual')) });
+    });
+  }
+
   // ---- recording / replay -------------------------------------------------
   const wrap = (fn) => async (req, res) => {
     try {

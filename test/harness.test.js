@@ -2,35 +2,68 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventBus } from '../server/bus.js';
 import { RealPipeline } from '../server/pipeline/real.js';
-import { MarkerFilter, HarnessClient, buildManifest, buildPrompt, buildToolPrompt, harnessConfig, manifestHash, isDontKnow, normalizeToolName, toolTarget, DONT_KNOW_TEXT } from '../server/pipeline/harness.js';
+import { MarkerFilter, HarnessClient, buildManifest, buildPrompt, buildToolPrompt, harnessConfig, manifestHash, isDontKnow, normalizeToolName, toolTarget, reasoningLine, rotatedName, isSessionOf, DEFAULT_CONFIG_ID, DONT_KNOW_TEXT } from '../server/pipeline/harness.js';
+import { createApp } from '../server/app.js';
 
 const FACT = 'Acme Robotics runs 40 GPU droplets in SFO3.';
 const sseFrame = (e) => `id: x\nevent: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`;
-const BASE_ENV = { HARNESS_API_TOKEN: 'tok', HARNESS_INFERENCE_API_KEY: 'k', MCP_PUBLIC_URL: 'https://demo.example/mcp', MCP_AUTH_TOKEN: 'mcp-secret' };
+// HARNESS_CONFIG_ID=none: the manifest (YAML) path these tests were written for; the config path has its own tests below
+const BASE_ENV = { HARNESS_API_TOKEN: 'tok', HARNESS_INFERENCE_API_KEY: 'k', MCP_PUBLIC_URL: 'https://demo.example/mcp', MCP_AUTH_TOKEN: 'mcp-secret', HARNESS_CONFIG_ID: 'none' };
+const CONFIG_ID = '01a132ee-ff11-7130-9d05-838874ecec77';
+/** Config path env: sessions come from the Environment Config, rotation polls fast and never backs off for long. */
+const CONFIG_ENV = { ...BASE_ENV, HARNESS_CONFIG_ID: CONFIG_ID, HARNESS_ROTATE_POLL_MS: '1', HARNESS_ROTATE_READY_TIMEOUT_MS: '2000' };
+const quiet = { log() {}, error() {}, debug() {} };
 
 /**
  * Fake Harness Runtime API: list -> sessions (with labels), create -> new
  * session, events -> scripted stream, input -> run id. `onInput` lets a test
  * react to the prompt (e.g. simulate the MCP server reporting tool events).
  */
-function fakeHarness(deltas, { fail = false, sessions, extraEvents = [], onInput, hang = false, name = 'alexis-anatomy-harness-v4b' } = {}) {
+function fakeHarness(deltas, { fail = false, sessions, extraEvents = [], onInput, hang = false, name = 'alexis-anatomy-harness-v4b', perPage = 100, createdStatus = 'SESSION_STATUS_READY', usage = null } = {}) {
   const calls = [];
   const runId = 'run-1';
-  const state = { sessions: sessions || [{ session_id: 'sess-1', name, status: 'SESSION_STATUS_PAUSED', labels: { manifest: '__match__' } }] };
+  const state = { sessions: sessions || [{ session_id: 'sess-1', name, status: 'SESSION_STATUS_PAUSED', labels: { manifest: '__match__' } }], nextId: 0, createdStatus };
   const impl = async (url, init = {}) => {
-    calls.push({ url: String(url), method: init.method || 'GET', body: init.body });
+    calls.push({ url: String(url), method: init.method || 'GET', body: init.body, headers: init.headers });
     const u = String(url);
     if (u.includes('?name=')) {
       const want = decodeURIComponent(u.split('?name=')[1]);
       return Response.json({ sessions: state.sessions.filter((s) => s.name === want) });
     }
+    if (u.includes('?per_page=')) {
+      // paged listing like the live API (the fake's own page size, so a small `perPage` forces paging via meta.total)
+      const q = new URL(u).searchParams;
+      const size = Math.min(perPage, Number(q.get('per_page')) || perPage);
+      const page = Number(q.get('page')) || 1;
+      const live = state.sessions;
+      return Response.json({ sessions: live.slice((page - 1) * size, page * size), meta: { total: live.length } });
+    }
     if (init.method === 'POST' && u.endsWith('/sessions')) {
-      const created = { session_id: `sess-${state.sessions.length + 1}`, name: /^name: (.*)$/m.exec(init.body)[1], status: 'SESSION_STATUS_RUNNING' };
+      const json = init.headers?.['content-type'] === 'application/json' ? JSON.parse(init.body) : null;
+      const created = {
+        session_id: `sess-${state.sessions.length + 1 + state.nextId++}`,
+        name: json ? json.name : /^name: (.*)$/m.exec(init.body)[1],
+        status: json ? state.createdStatus : 'SESSION_STATUS_RUNNING',
+        created_at: new Date().toISOString(),
+        ...(json ? { config_id: json.config_id } : {}),
+      };
       state.sessions.push(created);
       return Response.json({ session: created });
     }
+    if (init.method === 'DELETE') {
+      const id = u.split('/').pop();
+      const s = state.sessions.find((x) => x.session_id === id);
+      if (!s) return new Response('not found', { status: 404 });
+      s.status = 'SESSION_STATUS_DESTROYED';
+      return new Response(null, { status: 204 });
+    }
+    if (!init.method && /\/sessions\/[^/?]+$/.test(u)) {
+      const s = state.sessions.find((x) => x.session_id === u.split('/').pop());
+      return s ? Response.json({ session: s }) : new Response('not found', { status: 404 });
+    }
     if (u.endsWith('/input')) {
-      onInput?.(JSON.parse(init.body).text);
+      const text = JSON.parse(init.body).text;
+      if (onInput?.(text, u) === false) return new Response('gone', { status: 404 });
       return Response.json({ run_id: runId });
     }
     if (u.endsWith('/events')) {
@@ -46,7 +79,7 @@ function fakeHarness(deltas, { fail = false, sessions, extraEvents = [], onInput
         ...extraEvents.map((e) => ({ ...e, run_id: runId })),
         ...deltas.map((t) => ({ type: 'run.token_delta', run_id: runId, data: { text: t, is_reasoning: false } })),
         { type: 'run.token_delta', run_id: runId, data: { text: 'hidden', is_reasoning: true } },
-        { type: 'run.usage_recorded', run_id: runId, data: { model_id: 'openai-gpt-oss-20b' } },
+        { type: 'run.usage_recorded', run_id: runId, data: { model_id: 'openai-gpt-oss-20b', ...(usage ? { usage } : {}) } },
         fail ? { type: 'run.failed', run_id: runId, data: { message: 'boom' } } : { type: 'run.completed', run_id: runId, data: { total_tokens_in: 10, total_tokens_out: 3 } },
       ];
       return new Response(evs.map(sseFrame).join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } });
@@ -167,6 +200,22 @@ test('harness: config defaults (v4 session name, gateway tools, DIGITALOCEAN_ACC
   assert.deepEqual(harnessConfig({ HARNESS_GATEWAY_TOOLS: 'custom_search_facts, custom_get_document' }).gatewayTools, ['custom_search_facts', 'custom_get_document']);
   assert.equal(harnessConfig({ HARNESS_TOOLS_MODE: 'inline' }).toolsMode, 'inline');
   assert.equal(harnessConfig({ HARNESS_TOOLS_MODE: 'bogus' }).toolsMode, 'gateway');
+  // session hygiene + reasoning effort defaults
+  assert.equal(cfg.configId, DEFAULT_CONFIG_ID);
+  assert.equal(cfg.configId, '01a132ee-ff11-7130-9d05-838874ecec77');
+  assert.equal(cfg.rotateAfter, 15);
+  assert.equal(cfg.rotateIdleMs, 20 * 60 * 1000);
+  assert.equal(cfg.reasoningEffort, 'low');
+  assert.equal(harnessConfig({ HARNESS_CONFIG_ID: 'none' }).configId, '');
+  assert.equal(harnessConfig({ HARNESS_CONFIG_ID: '' }).configId, '');
+  assert.equal(harnessConfig({ HARNESS_CONFIG_ID: ' abc ' }).configId, 'abc');
+  assert.equal(harnessConfig({ HARNESS_ROTATE_AFTER: '0' }).rotateAfter, 0, '0 disables');
+  assert.equal(harnessConfig({ HARNESS_ROTATE_IDLE_MS: '0' }).rotateIdleMs, 0);
+  assert.equal(harnessConfig({ HARNESS_ROTATE_AFTER: 'x' }).rotateAfter, 15, 'invalid -> default');
+  assert.equal(harnessConfig({ HARNESS_REASONING_EFFORT: 'High' }).reasoningEffort, 'high');
+  assert.equal(harnessConfig({ HARNESS_REASONING_EFFORT: 'off' }).reasoningEffort, 'off');
+  assert.equal(harnessConfig({ HARNESS_REASONING_EFFORT: 'bogus' }).reasoningEffort, 'low');
+  assert.equal(harnessConfig({ HARNESS_REASONING_EFFORT: '' }).reasoningEffort, 'low');
 });
 
 test('harness: inline manifest declares the anatomy-data MCP server, its secret slot and allow rules', () => {
@@ -1012,5 +1061,444 @@ test('harness: the app-side guard answers "Todavía no lo sé." for a Spanish qu
     assert.equal((await en.p.ask('How many droplets does Acme have?')).answer, DONT_KNOW_TEXT);
   } finally {
     en.restore();
+  }
+});
+
+// ---- reasoning effort (gpt-oss Harmony "Reasoning: low" line) ----------------------------------
+
+test('harness: prompts start with "Reasoning: <effort>" when an effort is given and have no such line when off/empty', () => {
+  assert.equal(reasoningLine('low'), 'Reasoning: low');
+  assert.equal(reasoningLine('High'), 'Reasoning: high');
+  assert.equal(reasoningLine('off'), '');
+  assert.equal(reasoningLine(''), '');
+  assert.equal(reasoningLine(undefined), '');
+  for (const effort of ['low', 'medium', 'high']) {
+    assert.equal(buildToolPrompt('q', { effort }).split('\n')[0], `Reasoning: ${effort}`);
+    assert.equal(buildToolPrompt('q', { gateway: true, effort }).split('\n')[0], `Reasoning: ${effort}`);
+    assert.equal(buildPrompt('q', '[1] ctx', { effort }).split('\n')[0], `Reasoning: ${effort}`);
+  }
+  // the very first line, exactly once, and the rest of the prompt is unchanged
+  const withLine = buildToolPrompt('Where does Acme run?', { effort: 'low' });
+  const without = buildToolPrompt('Where does Acme run?', { effort: 'off' });
+  assert.equal(withLine, `Reasoning: low\n${without}`);
+  assert.equal((withLine.match(/^Reasoning:/gm) || []).length, 1);
+  for (const prompt of [without, buildToolPrompt('q'), buildPrompt('q', ''), buildPrompt('q', '', { effort: 'off' }), buildPrompt('q', '', { effort: '' })]) {
+    assert.doesNotMatch(prompt, /^Reasoning:/m);
+    assert.match(prompt, /^You are the answering step of a retrieval pipeline/);
+  }
+  // the ANSWER: marker rule and the language rule are untouched
+  assert.match(withLine, /starts with "ANSWER:"/);
+  assert.match(withLine, /Write the answer in the same language as the question/);
+  assert.match(buildPrompt('q', '', { effort: 'low' }), /reply exactly "ANSWER: I do not know that yet\."/);
+});
+
+test('harness: the pipeline sends the configured reasoning effort as the first prompt line (default low; off sends none) and sums reasoning tokens into timing', async () => {
+  const prompts = [];
+  const usage = { input_tokens: 100, output_tokens: 5, cached_input_tokens: 0, reasoning_tokens: 42 };
+  let h = fakeHarness(['ANSWER: 40 droplets.'], { onInput: (t) => prompts.push(t), usage });
+  let { p, events, restore } = setup({ ...BASE_ENV, HARNESS_TOOLS_MODE: 'none' }, h);
+  try {
+    const out = await p.ask('How many droplets?');
+    assert.equal(out.answer, '40 droplets.');
+    assert.equal(prompts.length, 1);
+    assert.equal(prompts[0].split('\n')[0], 'Reasoning: low');
+    assert.equal(out.timing.reasoningTokens, 42);
+    assert.equal(out.timing.toolCalls, 0);
+    assert.equal(events.find((e) => e.stage === 'agent' && e.status === 'done').data.reasoningTokens, 42);
+    assert.match(events.find((e) => e.stage === 'agent' && e.status === 'done').detail, /42 reasoning tokens/);
+    assert.equal(events.at(-1).data.timing.reasoningTokens, 42);
+    assert.equal(p.describe().harnessReasoningEffort, 'low');
+  } finally {
+    restore();
+  }
+  // tool path too, with a high effort
+  prompts.length = 0;
+  let pipeline;
+  h = fakeHarness(['ANSWER: 40 droplets.'], {
+    usage,
+    onInput: (t) => {
+      prompts.push(t);
+      pipeline.handleToolEvent({ phase: 'start', callId: 'c1', tool: 'search_facts', args: { query: 'q', k: 3 }, target: 'pgvector' });
+      pipeline.handleToolEvent({ phase: 'done', callId: 'c1', tool: 'search_facts', args: { query: 'q', k: 3 }, target: 'pgvector', ms: 5, summary: '1 hit', hits: [{ id: 7, score: 0.9, chunk: FACT, object_key: 'facts/1.txt' }] });
+    },
+  });
+  ({ p, events, restore } = setup({ ...BASE_ENV, HARNESS_REASONING_EFFORT: 'high' }, h));
+  pipeline = p;
+  try {
+    const out = await p.ask('How many droplets?');
+    assert.equal(out.answer, '40 droplets.');
+    assert.equal(prompts[0].split('\n')[0], 'Reasoning: high');
+    assert.match(prompts[0], /MUST call the search_facts tool/);
+    assert.equal(out.fallback, null, 'one grounded run');
+    assert.equal(out.timing.reasoningTokens, 42);
+  } finally {
+    restore();
+  }
+  // off -> no line at all, and no usage block -> 0 reasoning tokens
+  prompts.length = 0;
+  h = fakeHarness(['ANSWER: 40 droplets.'], { onInput: (t) => prompts.push(t) });
+  ({ p, events, restore } = setup({ ...BASE_ENV, HARNESS_TOOLS_MODE: 'none', HARNESS_REASONING_EFFORT: 'off' }, h));
+  try {
+    const out = await p.ask('How many droplets?');
+    assert.doesNotMatch(prompts[0], /^Reasoning:/m);
+    assert.match(prompts[0], /^You are the answering step/);
+    assert.equal(out.timing.reasoningTokens, 0);
+    assert.equal(p.describe().harnessReasoningEffort, 'off');
+  } finally {
+    restore();
+  }
+});
+
+// ---- session hygiene: config-based creation, resolution by name prefix, rotation ----------------
+
+test('harness: with HARNESS_CONFIG_ID the session is created with the JSON form {name, config_id}: no YAML, no new config, no inference key needed', async () => {
+  const cfg = harnessConfig({ HARNESS_API_TOKEN: 'tok', HARNESS_CONFIG_ID: CONFIG_ID });
+  assert.equal(cfg.inferenceKey, '');
+  const h = fakeHarness([], { sessions: [] });
+  const c = new HarnessClient(cfg, h.impl, quiet);
+  const s = await c.ensureSession();
+  assert.equal(s.created, true);
+  assert.match(s.name, /^alexis-anatomy-harness-v4b-r[0-9a-z]+$/, 'a fresh session gets the -r<ts> suffix');
+  assert.equal(c.sessionId, 'sess-1');
+  const create = h.calls.find((x) => x.method === 'POST' && x.url.endsWith('/sessions'));
+  assert.equal(create.headers['content-type'], 'application/json');
+  assert.deepEqual(JSON.parse(create.body), { name: s.name, config_id: CONFIG_ID });
+  assert.doesNotMatch(create.body, /agent:|secrets:|HARNESS_INFERENCE_API_KEY|tools:/);
+  // the lookup paged through the full list (no ?name= filter: rotated names vary)
+  assert.ok(h.calls.some((x) => x.url.includes('?per_page=')));
+  assert.ok(!h.calls.some((x) => x.url.includes('?name=')));
+  // naming helpers
+  assert.equal(rotatedName('base', 35), 'base-rz');
+  assert.ok(isSessionOf('base', 'base'));
+  assert.ok(isSessionOf('base', 'base-rabc'));
+  assert.ok(!isSessionOf('base', 'base-deadbeef'), 'manifest-hash variants are not rotations');
+  assert.ok(!isSessionOf('base', 'base2'));
+  // the YAML path is still used when the config id is explicitly off
+  const y = fakeHarness([], { sessions: [] });
+  const yc = new HarnessClient(harnessConfig({ ...BASE_ENV, HARNESS_CONFIG_ID: 'none' }), y.impl, quiet);
+  await yc.ensureSession();
+  const yCreate = y.calls.find((x) => x.method === 'POST' && x.url.endsWith('/sessions'));
+  assert.equal(yCreate.headers['content-type'], 'application/x-yaml');
+  assert.match(yCreate.body, /^name: alexis-anatomy-harness-v4b$/m);
+});
+
+test('harness: boot resolution picks the newest live session named <base> or <base>-r<ts> from the config and deletes older duplicates', async () => {
+  const base = 'alexis-anatomy-harness-v4b';
+  const at = (d) => new Date(Date.UTC(2026, 9, d)).toISOString();
+  const sessions = [
+    { session_id: 'other', name: 'someone-else', status: 'SESSION_STATUS_READY', config_id: CONFIG_ID, created_at: at(9) },
+    { session_id: 'base', name: base, status: 'SESSION_STATUS_PAUSED', config_id: CONFIG_ID, created_at: at(1) },
+    { session_id: 'dead', name: `${base}-rzzz`, status: 'SESSION_STATUS_DESTROYED', config_id: CONFIG_ID, created_at: at(8) },
+    { session_id: 'failed', name: `${base}-ryyy`, status: 'SESSION_STATUS_FAILED', config_id: CONFIG_ID, created_at: at(7) },
+    { session_id: 'otherCfg', name: `${base}-rxxx`, status: 'SESSION_STATUS_READY', config_id: 'another-config', created_at: at(6) },
+    { session_id: 'hashVariant', name: `${base}-deadbeef`, status: 'SESSION_STATUS_READY', config_id: CONFIG_ID, created_at: at(6) },
+    { session_id: 'r2', name: `${base}-raaa`, status: 'SESSION_STATUS_PAUSED', config_id: CONFIG_ID, created_at: at(3) },
+    { session_id: 'r3', name: `${base}-rbbb`, status: 'SESSION_STATUS_READY', created_at: at(5) }, // config_id not returned -> trusted
+    { session_id: 'r1', name: `${base}-rccc`, status: 'SESSION_STATUS_READY', config_id: CONFIG_ID, created_at: at(2) },
+  ];
+  // page size 2 forces paging through the whole list
+  const h = fakeHarness([], { sessions: sessions.map((s) => ({ ...s })), perPage: 2 });
+  const { p, events, restore } = setup(CONFIG_ENV, h);
+  p.harness.log = quiet;
+  try {
+    const logs = [];
+    const out = await p.warmUp({ log: (m) => logs.push(m), error: (m) => logs.push(`ERR ${m}`) });
+    assert.equal(out.ok, true);
+    assert.equal(out.created, false);
+    assert.equal(out.session, `${base}-rbbb`);
+    assert.equal(out.sessionId, 'r3');
+    assert.match(logs[0], /\[warm-up\] harness session alexis-anatomy-harness-v4b-rbbb resumed \(r3\)/);
+    assert.equal(events.length, 0, 'warm-up is silent on the SSE bus');
+    // paged: ?per_page=…&page=1..N, no POST
+    const pages = h.calls.filter((c) => c.url.includes('?per_page=')).map((c) => Number(new URL(c.url).searchParams.get('page')));
+    assert.deepEqual(pages, [1, 2, 3, 4, 5]);
+    assert.ok(!h.calls.some((c) => c.method === 'POST'));
+    // the older candidates (base, r1, r2) are deleted in the background; nothing else is touched
+    await p.harness.cleanup;
+    const deleted = h.calls.filter((c) => c.method === 'DELETE').map((c) => c.url.split('/').pop()).sort();
+    assert.deepEqual(deleted, ['base', 'r1', 'r2']);
+    for (const id of ['other', 'otherCfg', 'hashVariant', 'r3']) assert.notEqual(h.state.sessions.find((s) => s.session_id === id).status, 'SESSION_STATUS_DESTROYED', id);
+    const d = p.describe();
+    assert.equal(d.harnessSession, `${base}-rbbb`);
+    assert.equal(d.harnessSessionId, 'r3');
+    assert.equal(d.harnessConfigId, CONFIG_ID);
+    assert.equal(d.harnessQuestions, 0);
+    assert.equal(d.harnessRotateAfter, 15);
+    assert.equal(d.harnessRotateIdleMs, 20 * 60 * 1000);
+    assert.equal(d.harnessRotations, 0);
+    assert.equal(d.harnessRotating, false);
+    assert.equal(d.harnessLastRotation, null);
+    assert.equal(d.harnessLastRotationError, null);
+    assert.equal(d.harnessReasoningEffort, 'low');
+  } finally {
+    restore();
+  }
+  // a single candidate: nothing deleted; none at all: a suffixed session is created from the config
+  let one = fakeHarness([], { sessions: [{ session_id: 'only', name: base, status: 'SESSION_STATUS_READY', config_id: CONFIG_ID }] });
+  let c = new HarnessClient(harnessConfig(CONFIG_ENV), one.impl, quiet);
+  assert.deepEqual(await c.ensureSession(), { id: 'only', name: base, created: false, stale: false });
+  await c.cleanup;
+  assert.ok(!one.calls.some((x) => x.method === 'DELETE' || x.method === 'POST'));
+  one = fakeHarness([], { sessions: [{ session_id: 'dead', name: base, status: 'SESSION_STATUS_DESTROYED', config_id: CONFIG_ID }] });
+  c = new HarnessClient(harnessConfig(CONFIG_ENV), one.impl, quiet);
+  const made = await c.ensureSession();
+  assert.equal(made.created, true);
+  assert.match(made.name, new RegExp(`^${base}-r[0-9a-z]+$`));
+  assert.deepEqual(JSON.parse(one.calls.find((x) => x.method === 'POST').body), { name: made.name, config_id: CONFIG_ID });
+});
+
+test('harness: rotation after N questions creates, warms, switches between questions and deletes the old session; a question asked meanwhile is served by the old session', async () => {
+  const base = 'alexis-anatomy-harness-v4b';
+  const inputs = []; // [sessionId, prompt]
+  const h = fakeHarness(['ANSWER: ok.'], {
+    sessions: [{ session_id: 'old', name: base, status: 'SESSION_STATUS_READY', config_id: CONFIG_ID }],
+    createdStatus: 'SESSION_STATUS_STARTING', // the new session is not READY until the test says so
+    onInput: (text, url) => inputs.push([url.split('/').at(-2), text]),
+  });
+  const env = { ...CONFIG_ENV, HARNESS_TOOLS_MODE: 'none', HARNESS_ROTATE_AFTER: '2', HARNESS_ROTATE_IDLE_MS: '0' };
+  const { p, restore } = setup(env, h);
+  const logs = [];
+  p.harness.log = { log: (m) => logs.push(m), error: (m) => logs.push(`ERR ${m}`) };
+  try {
+    await p.warmUp(quiet);
+    assert.equal(p.harness.sessionId, 'old');
+    await p.ask('q1');
+    assert.equal(p.describe().harnessQuestions, 1);
+    assert.equal(p.harness.rotating, null, 'no rotation yet');
+    await p.ask('q2');
+    // the threshold was reached: a rotation started in the background, the question did not wait for it
+    assert.equal(p.describe().harnessQuestions, 2);
+    assert.ok(p.harness.rotating, 'rotation in flight');
+    assert.equal(p.describe().harnessRotating, true);
+    assert.equal(p.harness.sessionId, 'old', 'still serving from the old session');
+    const created = h.state.sessions.find((s) => s.session_id !== 'old');
+    assert.ok(created, 'new session created from the config');
+    assert.match(created.name, new RegExp(`^${base}-r[0-9a-z]+$`));
+    assert.equal(created.config_id, CONFIG_ID);
+    // a question asked while the new session is still starting is answered by the old one
+    const during = await p.ask('q3');
+    assert.equal(during.answer, 'ok.');
+    assert.deepEqual(inputs.map(([id]) => id), ['old', 'old', 'old']);
+    assert.ok(p.harness.rotating, 'rotation still in flight (new session not READY)');
+    assert.equal(p.describe().harnessQuestions, 3);
+    assert.ok(!h.calls.some((c) => c.method === 'DELETE'), 'old session not deleted before the switch');
+    // the new session becomes READY: warm-up run, switch, delete old
+    created.status = 'SESSION_STATUS_READY';
+    const result = await p.harness.rotating;
+    assert.deepEqual(result, { ok: true, from: base, to: created.name });
+    assert.equal(p.harness.rotating, null);
+    assert.equal(p.harness.sessionId, created.session_id);
+    assert.equal(p.harness.sessionName, created.name);
+    const warm = inputs.find(([id]) => id === created.session_id);
+    assert.ok(warm, 'the new session was warmed with one run');
+    assert.equal(warm[1], 'Reasoning: low\nReply with exactly: ANSWER: ready');
+    assert.ok(h.calls.some((c) => c.url.endsWith(`/sessions/${created.session_id}`) && c.method === 'GET'), 'polled GET /sessions/{id} until READY');
+    assert.deepEqual(h.calls.filter((c) => c.method === 'DELETE').map((c) => c.url.split('/').pop()), ['old']);
+    assert.equal(h.state.sessions.find((s) => s.session_id === 'old').status, 'SESSION_STATUS_DESTROYED');
+    const d = p.describe();
+    assert.equal(d.harnessSession, created.name);
+    assert.equal(d.harnessSessionId, created.session_id);
+    assert.equal(d.harnessQuestions, 0, 'count restarts on the new session');
+    assert.equal(d.harnessRotations, 1);
+    assert.equal(d.harnessRotating, false);
+    assert.equal(d.harnessLastRotation.from, base);
+    assert.equal(d.harnessLastRotation.to, created.name);
+    assert.equal(d.harnessLastRotation.deletedOld, true);
+    assert.equal(d.harnessLastRotation.reason, '2 questions answered');
+    assert.ok(typeof d.harnessLastRotation.at === 'number' && d.harnessLastRotation.ms >= 0);
+    assert.equal(d.harnessLastRotationError, null);
+    assert.ok(logs.some((m) => /rotating session alexis-anatomy-harness-v4b -> alexis-anatomy-harness-v4b-r/.test(m)));
+    assert.ok(logs.some((m) => /session switched/.test(m)));
+    // the next question goes to the new session
+    await p.ask('q4');
+    assert.equal(inputs.at(-1)[0], created.session_id);
+    assert.equal(p.describe().harnessQuestions, 1);
+    assert.equal(p.harness.rotating, null);
+    // the manual trigger works too and reports whether it started
+    const second = h.state.sessions.filter((s) => s.status !== 'SESSION_STATUS_DESTROYED').length;
+    const r = p.rotateSession();
+    assert.equal(r.started, true);
+    assert.deepEqual(p.rotateSession(), { started: false, skipped: 'rotation already in progress' }, 'only one at a time');
+    h.state.sessions.filter((s) => s.status === 'SESSION_STATUS_STARTING').forEach((s) => (s.status = 'SESSION_STATUS_READY'));
+    await p.harness.rotating;
+    assert.equal(h.state.sessions.filter((s) => s.status !== 'SESSION_STATUS_DESTROYED').length, second, 'one live session before and after');
+    assert.equal(p.describe().harnessRotations, 2);
+    assert.equal(p.describe().harnessLastRotation.reason, 'manual');
+  } finally {
+    restore();
+  }
+});
+
+test('harness: a failed rotation warm-up deletes the new session, keeps the old one serving, records the error and backs off', async () => {
+  const base = 'alexis-anatomy-harness-v4b';
+  const inputs = [];
+  const h = fakeHarness(['ANSWER: ok.'], {
+    sessions: [{ session_id: 'old', name: base, status: 'SESSION_STATUS_READY', config_id: CONFIG_ID }],
+    createdStatus: 'SESSION_STATUS_FAILED', // the new session never becomes READY
+    onInput: (text, url) => inputs.push(url.split('/').at(-2)),
+  });
+  const { p, restore } = setup({ ...CONFIG_ENV, HARNESS_TOOLS_MODE: 'none', HARNESS_ROTATE_AFTER: '1', HARNESS_ROTATE_IDLE_MS: '0' }, h);
+  p.harness.log = quiet;
+  try {
+    await p.warmUp(quiet);
+    await p.ask('q1');
+    assert.ok(p.harness.rotating);
+    const result = await p.harness.rotating;
+    assert.equal(result.ok, false);
+    assert.match(result.error, /SESSION_STATUS_FAILED/);
+    assert.equal(p.harness.sessionId, 'old', 'old session kept');
+    const created = h.state.sessions.find((s) => s.session_id !== 'old');
+    assert.equal(created.status, 'SESSION_STATUS_DESTROYED', 'the half-made session is deleted');
+    assert.deepEqual(h.calls.filter((c) => c.method === 'DELETE').map((c) => c.url.split('/').pop()), [created.session_id]);
+    const d = p.describe();
+    assert.equal(d.harnessSession, base);
+    assert.equal(d.harnessRotations, 0);
+    assert.equal(d.harnessRotating, false);
+    assert.equal(d.harnessLastRotation, null);
+    assert.match(d.harnessLastRotationError.message, /SESSION_STATUS_FAILED/);
+    assert.equal(d.harnessLastRotationError.from, base);
+    assert.equal(d.harnessLastRotationError.to, created.name);
+    assert.equal(d.harnessQuestions, 1, 'the count on the old session is kept');
+    // questions keep flowing on the old session; the threshold is still exceeded but the backoff holds
+    await p.ask('q2');
+    assert.deepEqual(inputs, ['old', 'old']);
+    assert.equal(p.harness.rotating, null, 'no retry during the backoff');
+    assert.equal(h.state.sessions.length, 2, 'no second session created');
+    assert.match(p.rotateSession().skipped, /backing off/);
+    // the backoff is over: the next question triggers a new attempt
+    p.harness.rotateBackoffUntil = 0;
+    await p.ask('q3');
+    assert.ok(p.harness.rotating, 'rotation retried after the backoff');
+    await p.harness.rotating;
+    assert.equal(h.state.sessions.length, 3);
+    // a timeout while polling is a failure too
+    p.harness.rotateBackoffUntil = 0;
+    h.state.createdStatus = 'SESSION_STATUS_STARTING';
+    p.harness.cfg.rotateReadyTimeoutMs = 5;
+    await p.harness.rotate('test').promise;
+    assert.match(p.describe().harnessLastRotationError.message, /not ready after 5 ms/);
+    assert.equal(p.harness.sessionId, 'old');
+  } finally {
+    restore();
+  }
+});
+
+test('harness: idle rotation triggers when the session sat unused longer than HARNESS_ROTATE_IDLE_MS before a question; 0 disables both triggers', async () => {
+  const base = 'alexis-anatomy-harness-v4b';
+  let h = fakeHarness(['ANSWER: ok.'], { sessions: [{ session_id: 'old', name: base, status: 'SESSION_STATUS_READY', config_id: CONFIG_ID }] });
+  let { p, restore } = setup({ ...CONFIG_ENV, HARNESS_TOOLS_MODE: 'none', HARNESS_ROTATE_AFTER: '0', HARNESS_ROTATE_IDLE_MS: '1000' }, h);
+  p.harness.log = quiet;
+  try {
+    await p.ask('q1');
+    assert.equal(p.harness.rotating, null, 'first question: no idle time known yet');
+    await p.ask('q2');
+    assert.equal(p.harness.rotating, null, 'answered back to back');
+    p.harness.lastUsedAt = Date.now() - 5000; // pretend the session sat idle
+    await p.ask('q3');
+    assert.ok(p.harness.rotating, 'idle threshold exceeded before q3');
+    await p.harness.rotating;
+    assert.equal(p.describe().harnessRotations, 1);
+    assert.match(p.describe().harnessLastRotation.reason, /^idle for 5 s/);
+  } finally {
+    restore();
+  }
+  // both disabled: never rotates on its own, manual still works
+  h = fakeHarness(['ANSWER: ok.'], { sessions: [{ session_id: 'old', name: base, status: 'SESSION_STATUS_READY', config_id: CONFIG_ID }] });
+  ({ p, restore } = setup({ ...CONFIG_ENV, HARNESS_TOOLS_MODE: 'none', HARNESS_ROTATE_AFTER: '0', HARNESS_ROTATE_IDLE_MS: '0' }, h));
+  p.harness.log = quiet;
+  try {
+    for (let i = 0; i < 20; i++) await p.ask(`q${i}`);
+    p.harness.lastUsedAt = Date.now() - 10 ** 9;
+    await p.ask('late');
+    assert.equal(p.harness.rotating, null);
+    assert.equal(p.describe().harnessQuestions, 21);
+    assert.equal(p.rotateSession().started, true);
+    await p.harness.rotating;
+    assert.equal(p.describe().harnessRotations, 1);
+  } finally {
+    restore();
+  }
+  // no config id: rotation is not available
+  const yaml = new HarnessClient(harnessConfig(BASE_ENV), fakeHarness([]).impl, quiet);
+  assert.deepEqual(yaml.rotate().started, false);
+  assert.match(yaml.rotate().skipped, /HARNESS_CONFIG_ID not set/);
+});
+
+test('harness: a session that is gone (404) is replaced by a new suffixed session from the config and the question is retried there', async () => {
+  const base = 'alexis-anatomy-harness-v4b';
+  const inputs = [];
+  const h = fakeHarness(['ANSWER: ok.'], {
+    sessions: [{ session_id: 'old', name: base, status: 'SESSION_STATUS_READY', config_id: CONFIG_ID }],
+    onInput: (text, url) => {
+      const id = url.split('/').at(-2);
+      inputs.push(id);
+      return id !== 'old'; // the old session has vanished: 404 on input
+    },
+  });
+  const { p, events, restore } = setup({ ...CONFIG_ENV, HARNESS_TOOLS_MODE: 'none' }, h);
+  p.harness.log = quiet;
+  try {
+    await p.warmUp(quiet);
+    const out = await p.ask('q');
+    assert.equal(out.answer, 'ok.');
+    assert.deepEqual(inputs, ['old', 'sess-2']);
+    const create = h.calls.find((c) => c.method === 'POST' && c.url.endsWith('/sessions'));
+    const body = JSON.parse(create.body);
+    assert.equal(body.config_id, CONFIG_ID);
+    assert.match(body.name, new RegExp(`^${base}-r[0-9a-z]+$`));
+    assert.equal(p.harness.sessionName, body.name);
+    assert.equal(p.describe().harnessQuestions, 1);
+    assert.ok(events.some((e) => e.stage === 'agent' && e.status === 'progress' && /created/.test(e.detail)));
+  } finally {
+    restore();
+  }
+});
+
+test('harness: POST /api/harness/rotate needs the tool-event token, starts a rotation in real mode and does not exist in mock mode', async () => {
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const path = await import('node:path');
+  const base = 'alexis-anatomy-harness-v4b';
+  // the new session stays STARTING until the test has observed the rotation in flight
+  const h = fakeHarness(['ANSWER: ok.'], { sessions: [{ session_id: 'old', name: base, status: 'SESSION_STATUS_READY', config_id: CONFIG_ID }], createdStatus: 'SESSION_STATUS_STARTING' });
+  const { p, restore } = setup({ ...CONFIG_ENV, HARNESS_TOOLS_MODE: 'none', MCP_AUTH_TOKEN: 'secret' }, h);
+  restore(); // no MCP health check with tools mode none: the real fetch reaches the local server below
+  p.harness.log = quiet;
+  const recordingsDir = mkdtempSync(path.join(tmpdir(), 'anatomy-rec-'));
+  const { app } = await createApp({ env: { MCP_AUTH_TOKEN: 'secret' }, pipeline: p, recordingsDir, autoCapture: false });
+  const server = app.listen(0);
+  const url = `http://127.0.0.1:${server.address().port}/api/harness/rotate`;
+  const post = (token) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', ...(token ? { 'x-tool-event-token': token } : {}) }, body: '{}' });
+  try {
+    await p.warmUp(quiet);
+    assert.equal((await post()).status, 401);
+    assert.equal((await post('wrong')).status, 401);
+    const ok = await post('secret');
+    assert.equal(ok.status, 200);
+    assert.deepEqual(await ok.json(), { ok: true, started: true });
+    const again = await (await post('secret')).json();
+    assert.deepEqual(again, { ok: true, started: false, skipped: 'rotation already in progress' });
+    const health = await (await fetch(`http://127.0.0.1:${server.address().port}/api/health`)).json();
+    assert.equal(health.pipeline.harnessRotating, true);
+    assert.equal(health.pipeline.harnessConfigId, CONFIG_ID);
+    h.state.sessions.filter((s) => s.status === 'SESSION_STATUS_STARTING').forEach((s) => (s.status = 'SESSION_STATUS_READY'));
+    await p.harness.rotating;
+    const after = await (await fetch(`http://127.0.0.1:${server.address().port}/api/health`)).json();
+    assert.equal(after.pipeline.harnessRotating, false);
+    assert.equal(after.pipeline.harnessRotations, 1);
+    assert.equal(after.pipeline.harnessLastRotation.from, base);
+    assert.notEqual(after.pipeline.harnessSessionId, 'old');
+  } finally {
+    server.close();
+    restore();
+  }
+  // mock mode: no pipeline.rotateSession -> the route is not mounted
+  const mock = await createApp({ env: { MCP_AUTH_TOKEN: 'secret', PIPELINE_MODE: 'mock', MOCK_DELAY_SCALE: '0' }, recordingsDir, autoCapture: false });
+  const ms = mock.app.listen(0);
+  try {
+    const res = await fetch(`http://127.0.0.1:${ms.address().port}/api/harness/rotate`, { method: 'POST', headers: { 'x-tool-event-token': 'secret' } });
+    assert.equal(res.status, 404);
+  } finally {
+    ms.close();
   }
 });

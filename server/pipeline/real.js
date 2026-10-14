@@ -107,6 +107,16 @@ export class RealPipeline {
       harnessModel: h.model,
       harnessSession: this.harness.sessionName || h.sessionName,
       harnessSessionId: this.harness.sessionId,
+      harnessConfigId: h.configId || null,
+      harnessReasoningEffort: h.reasoningEffort,
+      // session hygiene (see HarnessClient.rotate)
+      harnessQuestions: this.harness.questionCount,
+      harnessRotateAfter: h.rotateAfter,
+      harnessRotateIdleMs: h.rotateIdleMs,
+      harnessRotations: this.harness.rotations,
+      harnessRotating: Boolean(this.harness.rotating),
+      harnessLastRotation: this.harness.lastRotation,
+      harnessLastRotationError: this.harness.lastRotationError,
       toolsMode: h.toolsMode,
       mcp: Boolean(h.mcpUrl),
       inferenceVia: this.inferenceVia(),
@@ -119,6 +129,15 @@ export class RealPipeline {
   /** How the model is reached: `harness` (Serverless Inference inside the Harness Runtime session) or nothing configured. */
   inferenceVia() {
     return this.cfg.harness.token ? 'harness' : null;
+  }
+
+  /**
+   * Session hygiene test hook (POST /api/harness/rotate): start a background rotation of the
+   * harness session. Returns { started, skipped? } at once; questions never wait on it.
+   */
+  rotateSession(reason = 'manual') {
+    const { started, skipped } = this.harness.rotate(reason);
+    return { started, ...(skipped ? { skipped } : {}) };
   }
 
   /**
@@ -135,7 +154,9 @@ export class RealPipeline {
     const t0 = Date.now();
     try {
       const s = await this.harness.ensureSession();
-      log.log(`[warm-up] harness session ${s.name} ${s.created ? 'created' : 'resumed'} (${s.id}) in ${Date.now() - t0} ms${s.stale ? ' · base session has a stale manifest' : ''}`);
+      const h = this.cfg.harness;
+      const hygiene = h.configId ? ` · config ${h.configId} · rotate after ${h.rotateAfter || '∞'} questions / ${h.rotateIdleMs ? `${Math.round(h.rotateIdleMs / 60000)} min idle` : 'never idle'}` : '';
+      log.log(`[warm-up] harness session ${s.name} ${s.created ? 'created' : 'resumed'} (${s.id}) in ${Date.now() - t0} ms${s.stale ? ' · base session has a stale manifest' : ''}${hygiene}`);
       return { ok: true, session: s.name, sessionId: s.id, created: s.created, ms: Date.now() - t0 };
     } catch (err) {
       log.error(`[warm-up] harness session not ready: ${err.message}`);
@@ -370,7 +391,7 @@ export class RealPipeline {
    * Answer a question through the Harness Runtime: the agent retrieves through
    * the MCP tools itself (see class docs), falling back to context in the
    * prompt when the tool path is unavailable. Resolves
-   * { jobId, answer, sources, timing: {firstTokenMs, totalMs, toolCalls}, backend: 'harness', fallback?, reason? }.
+   * { jobId, answer, sources, timing: {firstTokenMs, totalMs, toolCalls, reasoningTokens}, backend: 'harness', fallback?, reason? }.
    */
   async ask(question) {
     const jobId = randomUUID();
@@ -421,6 +442,12 @@ export class RealPipeline {
     this.activeRun = run;
     let firstTokenMs = null;
     let streamed = 0;
+    let reasoningTokens = 0; // run.usage_recorded reasoning_tokens summed over this question's harness runs
+    const askHarness = async (prompt, hk) => {
+      const out = await this.harness.ask(prompt, hk);
+      reasoningTokens += out.reasoningTokens || 0;
+      return out;
+    };
     // A tool call "observed" for this run: reported by the MCP server (primary) or seen on the harness SSE stream.
     // Malformed / failed harness tool calls (tool `invalid`, run.tool_call_failed) are counted apart and never count as seen.
     const toolSeen = () => run.toolCalls > 0 || run.harnessToolEvents > 0;
@@ -444,7 +471,7 @@ export class RealPipeline {
       if (gate.held.length) flushHeld();
       forward(token, index);
     };
-    const timing = () => ({ firstTokenMs, totalMs: Date.now() - t0, toolCalls: run.toolCalls });
+    const timing = () => ({ firstTokenMs, totalMs: Date.now() - t0, toolCalls: run.toolCalls, reasoningTokens });
     let sources = [];
     let answer = '';
     const backend = 'harness';
@@ -469,7 +496,7 @@ export class RealPipeline {
       sources = found || (await this.retrieve(question, ev));
       const context = sources.map((s, i) => `[${i + 1}] ${s.chunk}`).join('\n');
       ev.stage('inference', 'start', `Serverless inference via harness: ${h.model}`, { model: h.model, via: 'harness', toolsMode: 'none' });
-      harnessOut = await this.harness.ask(buildPrompt(question, context), hooks(detail));
+      harnessOut = await askHarness(buildPrompt(question, context, { effort: h.reasoningEffort }), hooks(detail));
       fallback = why;
       reason = because || null;
       if (clean(harnessOut)) { answer = harnessOut.text; return; }
@@ -490,7 +517,7 @@ export class RealPipeline {
         ev.stage('agent', 'start', `Harness Runtime (OpenCode, ${h.model}) answering with tools (${h.toolsMode})`, { via: 'harness', session: h.sessionName, toolsMode: h.toolsMode, model: h.model });
         ev.stage('inference', 'start', `Serverless inference via harness: ${h.model}`, { model: h.model, via: 'harness', toolsMode: h.toolsMode });
         gate.enabled = true;
-        harnessOut = await this.harness.ask(buildToolPrompt(question, { gateway: h.toolsMode === 'gateway' }), hooks('tool path'));
+        harnessOut = await askHarness(buildToolPrompt(question, { gateway: h.toolsMode === 'gateway', effort: h.reasoningEffort }), hooks('tool path'));
         answer = harnessOut.text;
         sources = run.hits.slice();
         if (!toolSeen() || !clean(harnessOut)) {
@@ -534,7 +561,7 @@ export class RealPipeline {
       }
       const t = timing();
       ev.stage('inference', 'done', fallback === 'guard' ? 'Completed without a second model run (no matching facts)' : 'Completed', { model: harnessOut.model || h.model, tokens: fallback === 'guard' ? 1 : harnessOut.tokens, via: 'harness', ...t });
-      ev.stage('agent', 'done', `Harness answered (first token ${t.firstTokenMs ?? '—'} ms, total ${t.totalMs} ms, ${t.toolCalls} tool call${t.toolCalls === 1 ? '' : 's'})`, { via: 'harness', ...t, runId: harnessOut.runId, backend, fallback, reason });
+      ev.stage('agent', 'done', `Harness answered (first token ${t.firstTokenMs ?? '—'} ms, total ${t.totalMs} ms, ${t.toolCalls} tool call${t.toolCalls === 1 ? '' : 's'}${t.reasoningTokens ? `, ${t.reasoningTokens} reasoning tokens` : ''})`, { via: 'harness', ...t, runId: harnessOut.runId, backend, fallback, reason });
       if (!answer) answer = dontKnow;
       return { answer, sources, backend, timing: timing(), fallback, reason };
     } finally {
