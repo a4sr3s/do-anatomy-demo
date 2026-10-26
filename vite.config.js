@@ -12,6 +12,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': { target: `http://localhost:${process.env.PORT || 8080}`, changeOrigin: true },
+      '/auth': { target: `http://localhost:${process.env.PORT || 8080}`, changeOrigin: true },
     },
   },
   build: {

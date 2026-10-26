@@ -14,7 +14,8 @@
     "build": "vite build",
     "start": "node server/index.js",
     "start:mcp": "node mcp/index.js",
-    "test": "node --test test/mock-pipeline.test.js test/recorder.test.js test/real-pipeline.test.js test/harness.test.js test/search-first.test.js test/mcp.test.js test/tool-events.test.js test/retrieval.test.js test/migrate.test.js test/mode-toggle.test.js",
+    "mint:handoff": "node scripts/mint-handoff-token.js",
+    "test": "node --test test/handoff.test.js test/mock-pipeline.test.js test/recorder.test.js test/real-pipeline.test.js test/harness.test.js test/search-first.test.js test/mcp.test.js test/tool-events.test.js test/retrieval.test.js test/migrate.test.js test/mode-toggle.test.js",
     "migrate:embeddings": "node scripts/migrate-embeddings.js",
     "record:samples": "node scripts/record-samples.js"
   },
@@ -24,6 +25,7 @@
     "class-variance-authority": "^0.7.1",
     "cn": "^0.4.0",
     "express": "^4.21.2",
+    "jose": "^5.10.0",
     "lucide-react": "^1.55.0",
     "pg": "^8.13.1",
     "radix-ui": "^1.8.0",

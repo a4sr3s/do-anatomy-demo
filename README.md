@@ -30,7 +30,7 @@ npm install
 npm run dev        # Express API on :8080 + Vite dev server on :5173 (proxying /api)
 ```
 
-Open <http://localhost:5173>. No credentials needed in the default mock mode.
+Open <http://localhost:5173>. No credentials needed in the default mock mode (the demos hub gate is off unless `DEMO_HANDOFF_SECRET` is set).
 
 Production-style run (server serves the built frontend from `dist/`):
 
@@ -46,6 +46,7 @@ Other scripts:
 | `npm test` | `node:test` suite: mock pipeline round-trip, HTTP/SSE API, recorder/replay, real pipeline (ingest, tool events, harness-only answers, warm-up), Harness Runtime client (manifest modes, session fingerprint, config-based creation, session resolution and rotation, reasoning effort, tool path, context-in-prompt fallback), MCP server (auth, tools/list, tool calls, tool events) and the internal tool-event / rotate endpoints |
 | `npm run start:mcp` | Starts the `anatomy-data` MCP tool server (`mcp/index.js`) on `PORT` (default 8081) |
 | `npm run record:samples` | Regenerates `recordings/sample-ingest.json` and `sample-query.json` from the mock pipeline |
+| `npm run mint:handoff` | Prints a local `/auth/handoff?token=…` URL (needs `DEMO_HANDOFF_SECRET`) |
 
 ## Modes (`PIPELINE_MODE`)
 
@@ -172,7 +173,11 @@ doctl apps create --spec .do/app.yaml
 doctl apps update <APP_ID> --spec .do/app.yaml
 ```
 
-The committed spec targets `a4sr3s/do-anatomy-demo`, runs `PIPELINE_MODE=real` with `HARNESS_TOOLS_MODE=inline`, `MCP_PUBLIC_URL=https://do-anatomy-demo-lfmw4.ondigitalocean.app/mcp`, `REPLAY_FALLBACK=true`, Spaces bucket `alexis-anatomy-demo` in `nyc3`, and leaves every `SECRET` value empty. Fill the secrets in the control panel (or with `doctl apps update`): the Spaces key pair and `DATABASE_URL` on **both** services, `MCP_AUTH_TOKEN` on both (same value), and `HARNESS_API_TOKEN` + `HARNESS_INFERENCE_API_KEY` on web. If a real stage fails the server falls back to replaying a recording, so the stage demo never goes dark. You can also attach a Managed Postgres component in the spec and bind `DATABASE_URL` to `${db.DATABASE_URL}` on both services.
+The committed spec targets `a4sr3s/do-anatomy-demo`, runs `PIPELINE_MODE=real` with `HARNESS_TOOLS_MODE=inline`, `MCP_PUBLIC_URL=https://do-anatomy-demo-lfmw4.ondigitalocean.app/mcp`, `REPLAY_FALLBACK=true`, Spaces bucket `alexis-anatomy-demo` in `nyc3`, and leaves every `SECRET` value empty. Fill the secrets in the control panel (or with `doctl apps update`): the Spaces key pair and `DATABASE_URL` on **both** services, `MCP_AUTH_TOKEN` on both (same value), `DEMO_HANDOFF_SECRET` on **both** (same value as the [demos hub](https://demos.alexisreyes.com)), and `HARNESS_API_TOKEN` + `HARNESS_INFERENCE_API_KEY` on web. If a real stage fails the server falls back to replaying a recording, so the stage demo never goes dark. You can also attach a Managed Postgres component in the spec and bind `DATABASE_URL` to `${db.DATABASE_URL}` on both services.
+
+### Demos hub gate
+
+This app is not meant to be opened directly at its `*.ondigitalocean.app` URL. Visitors enter through [demos.alexisreyes.com](https://demos.alexisreyes.com), which redirects to `GET /auth/handoff?token=<jwt>` on this app. The JWT is HS256 with `DEMO_HANDOFF_SECRET`, `iss=demos.alexisreyes.com`, `aud=do-anatomy-demo`, `iat`, `exp` (60s), and `jti`. A valid handoff sets an httpOnly `demo_session` cookie (~12h) and redirects to `/`. In production, if `DEMO_HANDOFF_SECRET` is not set yet, the app **fails closed**: HTML redirects to the hub, APIs return `401`, but `/api/health` and `/mcp/health` still return `200` so App Platform deploys stay healthy. Machine traffic keeps working: the MCP service accepts `Authorization: Bearer <MCP_AUTH_TOKEN>` without a demo cookie, and `POST /api/internal/tool-event` accepts `x-tool-event-token` without a demo cookie. Pages and responses carry `noindex` (`meta` + `X-Robots-Tag`).
 
 Note: App Platform's filesystem is ephemeral, so recordings made in production live until the next deploy. Commit any recording you want to keep (the bundled `sample-*.json` files are committed; `auto-*.json` snapshots are git-ignored).
 
