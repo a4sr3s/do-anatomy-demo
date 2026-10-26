@@ -6,6 +6,7 @@ import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle }
 import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput, InputGroupText } from '@/components/ui/input-group';
 import { SidebarTrigger } from '@/components/ui/sidebar';
+import { Brand } from '@/components/brand';
 import { Spinner } from '@/components/ui/spinner';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { mountAnatomy } from '@/anatomy/mount.js';
@@ -49,10 +50,11 @@ function Hud() {
   const legend = useStore((s) => s.legend);
   return (
     <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between gap-4 p-3">
-      <div className="pointer-events-auto flex items-center gap-3">
+      <div className="pointer-events-auto flex min-w-0 items-center gap-3">
         <SidebarTrigger data-testid="sidebar-trigger" />
-        <span className="text-xs tracking-[0.12em]">Fig 1</span>
-        <span className="hidden text-xs tracking-[0.12em] text-muted-foreground xl:inline">
+        <Brand />
+        <span className="text-xs whitespace-nowrap tracking-[0.12em]">Fig 1</span>
+        <span className="hidden min-w-0 truncate text-xs tracking-[0.12em] text-muted-foreground xl:block">
           DRAG ORBIT · SCROLL ZOOM · RIGHT-DRAG PAN · HOVER / CLICK INSPECT · DOUBLE-CLICK FOCUS · ESC RESET
         </span>
       </div>
