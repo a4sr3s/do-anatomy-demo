@@ -7,6 +7,7 @@ import { Recorder } from './recorder.js';
 import { createPipeline } from './pipeline/index.js';
 import { presetFor, ANSWER_PRESETS } from './pipeline/real.js';
 import { tokenEquals } from './auth.js';
+import { handoffConfig, registerHandoffRoutes, createHandoffMiddleware } from './handoff.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -37,6 +38,22 @@ export async function createApp(options = {}) {
   const app = express();
   app.disable('x-powered-by');
   app.use(express.json({ limit: '64kb' }));
+
+  const handoff = handoffConfig(env, { handoffGate: options.handoffGate });
+  const toolEventToken = env.MCP_AUTH_TOKEN || '';
+  registerHandoffRoutes(app, handoff, env);
+  app.use(
+    createHandoffMiddleware(handoff, {
+      isPublic: (req) =>
+        req.path === '/auth/handoff' ||
+        req.path === '/api/health' ||
+        req.path === '/api/internal/tool-event' ||
+        req.path === '/api/harness/rotate',
+      allowRequest: (req) =>
+        (req.path === '/api/harness/rotate' || req.path === '/api/internal/tool-event') &&
+        tokenEquals(req.get('x-tool-event-token'), toolEventToken),
+    })
+  );
 
   // ---- health -------------------------------------------------------------
   app.get('/api/health', (req, res) => {
@@ -115,8 +132,6 @@ export async function createApp(options = {}) {
   // ---- internal: tool calls reported by the MCP server ----------------------
   // The mcp/ service POSTs here (TOOL_EVENT_URL) for every tool call; the event
   // is attributed to the question job currently running in the harness.
-  const toolEventToken = env.MCP_AUTH_TOKEN || '';
-
   // The answer path is configured by ANSWER_MODE / SEARCH_FIRST_BACKEND / SEARCH_FIRST_REASONING_EFFORT.
   // Anyone may pick one of the two UI presets per question with body `mode: "fast" | "agent"` (see
   // ANSWER_PRESETS); the raw knobs {mode: tool|search-first, backend, effort} stay reserved for callers

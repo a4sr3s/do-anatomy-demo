@@ -26,6 +26,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { cosineSearch, createPool, embedTexts, embeddingConfig, scoreFloor, DONT_KNOW_TEXT, NO_MATCHING_FACTS } from '../server/pipeline/retrieval.js';
 import { tokenEquals } from '../server/auth.js';
+import { handoffConfig, createHandoffMiddleware, registerHandoffRoutes } from '../server/handoff.js';
 
 export const SERVER_NAME = 'anatomy-data';
 export const MAX_DOC_BYTES = 8 * 1024;
@@ -169,6 +170,16 @@ export function createMcpApp({ env = process.env, deps, log = console } = {}) {
   const app = express();
   app.disable('x-powered-by');
   app.use(express.json({ limit: '256kb' }));
+
+  const handoff = handoffConfig(env);
+  registerHandoffRoutes(app, handoff, env);
+  app.use(
+    createHandoffMiddleware(handoff, {
+      isApiRequest: () => true,
+      isPublic: (req) => req.path === '/mcp/health' || req.path === '/health',
+      allowRequest: (req) => tokenMatches(req.get('authorization'), cfg.token),
+    })
+  );
 
   app.get('/mcp/health', (req, res) => res.json({ ok: true, server: SERVER_NAME, tools: ['search_facts', 'get_document'] }));
   app.get('/health', (req, res) => res.json({ ok: true, server: SERVER_NAME }));

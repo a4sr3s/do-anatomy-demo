@@ -105,6 +105,11 @@ services:
       - key: MCP_AUTH_TOKEN
         value: ""
         type: SECRET
+      # Shared with https://demos.alexisreyes.com for /auth/handoff JWTs and demo_session cookies.
+      # Until set, production fails closed (hub redirect / 401) but /api/health still passes.
+      - key: DEMO_HANDOFF_SECRET
+        value: ""
+        type: SECRET
 
   - name: mcp
     github:
@@ -157,6 +162,10 @@ services:
         value: https://inference.do-ai.run/v1
       # Same Model Access Key as the web service (needed to embed the query with bge-m3)
       - key: DO_INFERENCE_KEY
+        value: ""
+        type: SECRET
+      # Same value as on web (session cookie verification on /mcp when no bearer).
+      - key: DEMO_HANDOFF_SECRET
         value: ""
         type: SECRET
       # Internal App Platform URL of the web component: every tool call is reported here.
